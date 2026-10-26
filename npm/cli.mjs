@@ -170,8 +170,8 @@ export async function ensureRuntime({ root = packageRoot, home, release, python,
     const selected = await findPython({ explicit: python, env, platform, run, cwd: root })
     log(`[code-agent] 首次准备 ${release.version}，正在创建独立 Python 环境……`)
     await checkedRun(run, selected.command, [...selected.prefix, '-m', 'venv', paths.directory], { cwd: root, env }, '创建 Python 环境')
-    await checkedRun(run, paths.python, ['-I', '-m', 'pip', '--disable-pip-version-check', 'install', '--no-input', '--upgrade', '--progress-bar', 'off', root], { cwd: root, env }, '安装后端依赖')
-    await checkedRun(run, paths.python, ['-I', '-c', 'import code_agent.server'], { cwd: root, env }, '后端导入验证')
+    await checkedRun(run, paths.python, ['-I', '-X', 'utf8', '-m', 'pip', '--disable-pip-version-check', 'install', '--no-input', '--upgrade', '--progress-bar', 'off', root], { cwd: root, env }, '安装后端依赖')
+    await checkedRun(run, paths.python, ['-I', '-X', 'utf8', '-c', 'import code_agent.server'], { cwd: root, env }, '后端导入验证')
     if (!existsSync(paths.python)) throw new Error('Python 环境未生成可执行文件，请检查 Python venv 组件是否安装。')
     const temporary = `${paths.ready}.${process.pid}.tmp`
     await writeFile(temporary, JSON.stringify(release) + '\n', 'utf8')
@@ -285,7 +285,7 @@ export async function main(args = process.argv.slice(2), dependencies = {}) {
     await checkPort(options.host, options.port)
     env.CODE_AGENT_WEB_DIST = join(root, 'web', 'dist')
     if (!env.CODE_AGENT_ENV_FILE && existsSync(join(home, '.env'))) env.CODE_AGENT_ENV_FILE = join(home, '.env')
-    const serverArgs = ['-I', '-m', 'code_agent.server', '--host', options.host, '--port', String(options.port)]
+    const serverArgs = ['-I', '-X', 'utf8', '-m', 'code_agent.server', '--host', options.host, '--port', String(options.port)]
     if (options.provider) serverArgs.push('--provider', options.provider)
     const url = browserUrl(options.host, options.port)
     log(`[code-agent] 工作台：${url}，按 Ctrl+C 停止。`)

@@ -258,37 +258,33 @@ async def probe_local(*, timeout: float = 1.5, models: tuple[str, ...] | None = 
     返回第一个能拿到向量的 (base_url, model)——不猜、不写死，探到就用。
     `timeout` 刻意短：探测是"顺手确认"，不该让启动或首轮检索等一个不存在的服务。
     """
-    import httpx
-
     tried: list[dict[str, Any]] = []
-    for base in LOCAL_PRESETS:
-        for model in models or LOCAL_MODELS:
-            embedder = LocalEmbedder(
-                base_url=base,
-                model=model,
-                store=VectorStore(model, path=os.devnull),
-                transport=httpx.AsyncHTTPTransport(retries=0),
-            )
-            if not embedder.enabled:
-                continue
-            client = httpx.AsyncClient(timeout=timeout)
-            try:
-                resp = await client.post(
-                    f"{base}/embeddings", json={"model": model, "input": ["ping"]}
+    # All candidates are fixed loopback HTTP addresses. Do not send discovery
+    # through system proxies or repeatedly initialize environment CA bundles.
+    async with httpx.AsyncClient(timeout=timeout, trust_env=False) as client:
+        for base in LOCAL_PRESETS:
+            for model in models or LOCAL_MODELS:
+                connection_failed = False
+                try:
+                    resp = await client.post(
+                        f"{base}/embeddings", json={"model": model, "input": ["ping"]}
+                    )
+                    resp.raise_for_status()
+                    data = resp.json()
+                    vectors = [item["embedding"] for item in data.get("data") or []]
+                except (httpx.ConnectError, httpx.ConnectTimeout):
+                    vectors = []
+                    connection_failed = True
+                except Exception:  # noqa: BLE001 —— 模型不存在等错误可继续试下个模型
+                    vectors = []
+                tried.append(
+                    {"base_url": base, "model": model, "ok": bool(vectors), "dim": len(vectors[0]) if vectors else 0}
                 )
-                resp.raise_for_status()
-                data = resp.json()
-                vectors = [item["embedding"] for item in data.get("data") or []]
-            except Exception:  # noqa: BLE001 —— 探不到就是探不到，不抛
-                vectors = []
-            finally:
-                await client.aclose()
-                await embedder.aclose()
-            tried.append(
-                {"base_url": base, "model": model, "ok": bool(vectors), "dim": len(vectors[0]) if vectors else 0}
-            )
-            if vectors:
-                return {"found": True, "base_url": base, "model": model, "dim": len(vectors[0]), "tried": tried}
+                if vectors:
+                    return {"found": True, "base_url": base, "model": model, "dim": len(vectors[0]), "tried": tried}
+                if connection_failed:
+                    # Changing a model cannot make an absent port reachable.
+                    break
     return {"found": False, "tried": tried}
 
 
@@ -301,7 +297,11 @@ async def autodetect_local(*, timeout: float = 1.5) -> dict[str, Any]:
     自己显式构造即可，行为可追。
     """
     if os.environ.get("CODE_AGENT_EMBED_BASE_URL"):
-        return {"found": True, "skipped": "已显式配置端点", "base_url": os.environ["CODE_AGENT_EMBED_BASE_URL"]}
+        base = os.environ["CODE_AGENT_EMBED_BASE_URL"]
+        model = os.environ.get("CODE_AGENT_EMBED_MODEL") or (
+            DEFAULT_MODEL if is_local_url(base) else DEFAULT_MODEL_REMOTE
+        )
+        return {"found": True, "skipped": "已显式配置端点", "base_url": base, "model": model}
     return await probe_local(timeout=timeout)
 
 

@@ -358,35 +358,42 @@ def create_app(provider_name: str | None = None) -> FastAPI:
             watch_task = asyncio.create_task(_code_watch_loop())
         # M18 · P3：LSP 会话回收（空闲超时后杀进程，避免留下常驻语言服务器）
         lsp_task = asyncio.create_task(_lsp_reap_loop())
-        # M34：顺手探一次本地向量端点（Ollama/LM Studio/vLLM），探到就启用融合检索的向量路。
-        # **必须写在这里**：本项目用的是 `FastAPI(lifespan=...)`，Starlette 会忽略
-        # `@app.on_event("startup")`——挂在 on_event 上会"注册成功但永远不执行"，
-        # 症状是"配了本地模型却始终走关键词单路"，而且不报错。真机踩过一次，别改回去。
-        await _autodetect_embedding()
+        # Discovery is optional: UI and keyword search must be usable before a
+        # missing or cold local embedding server finishes responding.
+        app.state.embed_probe = {"status": "pending", "found": False}
+        embed_task = asyncio.create_task(_autodetect_embedding(), name="code-agent-embedding-probe")
+        app.state.embed_probe_task = embed_task
         # Clear obsolete saved settings without changing current model or permissions.
         with contextlib.suppress(Exception):
             settings.legacy_model_catalog_purge()
-        yield
-        await project_team.aclose()
-        from code_agent.codeintel import native_dialog
-        await native_dialog.aclose()
-        await app.state.ide_runtime.aclose()
-        await app.state.ide_debug.close()
-        change_reviews.close()
-        lsp_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError, Exception):
-            await lsp_task
-        with contextlib.suppress(Exception):
-            await lsp_manager.stop_all()
-        if watch_task is not None:
-            watch_task.cancel()
+        try:
+            yield
+        finally:
+            # Cancel discovery before knowledge closes: it must never install
+            # a replacement embedder after that resource has been shut down.
+            embed_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
-                await watch_task
-        await scheduler.stop()
-        await code_intel.aclose()
-        await mcp.stop_all()
-        await router.aclose()
-        await knowledge.aclose()
+                await embed_task
+            await project_team.aclose()
+            from code_agent.codeintel import native_dialog
+            await native_dialog.aclose()
+            await app.state.ide_runtime.aclose()
+            await app.state.ide_debug.close()
+            change_reviews.close()
+            lsp_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await lsp_task
+            with contextlib.suppress(Exception):
+                await lsp_manager.stop_all()
+            if watch_task is not None:
+                watch_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await watch_task
+            await scheduler.stop()
+            await code_intel.aclose()
+            await mcp.stop_all()
+            await router.aclose()
+            await knowledge.aclose()
 
     app = FastAPI(title="Code-agent", version=__version__, lifespan=lifespan)
     app.state.auth_enabled = requires_auth
@@ -412,7 +419,6 @@ def create_app(provider_name: str | None = None) -> FastAPI:
             from code_agent.retrieval.embed import LocalEmbedder, autodetect_local
 
             found = await autodetect_local()
-            app.state.embed_probe = found
             if found.get("found"):
                 # 显式构造：不走"写环境变量再重建"那条间接路（它依赖构造顺序，
                 # 出问题时表现为"配了却没生效"，是最难查的一类问题）
@@ -427,8 +433,12 @@ def create_app(provider_name: str | None = None) -> FastAPI:
                 )
             else:
                 logger.info("检索：未发现本地向量端点，走关键词单路（可用 CODE_AGENT_EMBED_BASE_URL 指定）")
+            app.state.embed_probe = {**found, "status": "completed"}
+        except asyncio.CancelledError:
+            app.state.embed_probe = {"status": "cancelled", "found": False}
+            raise
         except Exception as exc:  # noqa: BLE001 —— 探测失败只意味着"关键词单路"，不影响启动
-            app.state.embed_probe = {"found": False, "error": str(exc)[:200]}
+            app.state.embed_probe = {"status": "failed", "found": False, "error": str(exc)[:200]}
             logger.warning("检索：本地向量探测失败（不影响启动）：%s", exc)
     # 代码情报先建：代码模式工具（code_map/edit_file）需要它，注册表也要带上它
     code_service = ProjectService(projects_repo)

@@ -219,11 +219,64 @@ def test_vector_cache_file_is_jsonl_and_outside_repo(tmp_path: Path) -> None:
     assert lines and lines[0]["v"] == [1.0, 0.0] and len(lines[0]["h"]) == 40
 
 
-def test_probe_local_reports_not_found_when_nothing_listens() -> None:
+def test_probe_local_reports_not_found_when_nothing_listens(monkeypatch) -> None:
     """本地没起服务时明确报 found=False（列清试过哪些），而不是假装有。"""
+    import httpx
+    from code_agent.retrieval.embed import LOCAL_PRESETS
+
+    attempts, clients = [], set()
+
+    async def refuse(client, url, **kwargs):
+        attempts.append(url)
+        clients.add(id(client))
+        raise httpx.ConnectError("port closed")
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", refuse)
     result = asyncio.run(probe_local())
     assert set(result) >= {"found", "tried"}
-    assert isinstance(result["tried"], list)
+    assert result["found"] is False
+    assert attempts == [f"{base}/embeddings" for base in LOCAL_PRESETS]
+    assert len(result["tried"]) == len(LOCAL_PRESETS)
+    assert len(clients) == 1, "discovery recreated an HTTP client for every model"
+
+
+def test_probe_tries_other_models_after_an_http_model_error(monkeypatch):
+    import httpx
+    attempts = []
+
+    async def model_response(client, url, **kwargs):
+        attempts.append((url, kwargs["json"]["model"]))
+        request = httpx.Request("POST", url)
+        if len(attempts) == 1:
+            return httpx.Response(404, json={"error": "model not found"}, request=request)
+        return httpx.Response(200, json={"data": [{"embedding": [1.0, 2.0]}]}, request=request)
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", model_response)
+    result = asyncio.run(probe_local(models=("missing-model", "installed-model")))
+    assert result["found"] is True and result["model"] == "installed-model"
+    assert result["dim"] == 2
+    assert [model for _, model in attempts] == ["missing-model", "installed-model"]
+    assert attempts[0][0] == attempts[1][0]
+
+
+def test_loopback_probe_ignores_proxy_and_ca_environment(tmp_path, monkeypatch):
+    import httpx
+
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        monkeypatch.setenv(name, "http://proxy.invalid:3128")
+    monkeypatch.setenv("SSL_CERT_FILE", str(tmp_path / "missing-ca.pem"))
+    monkeypatch.setenv("SSL_CERT_DIR", str(tmp_path / "missing-ca-dir"))
+    clients = []
+
+    async def response(client, url, **kwargs):
+        clients.append(client)
+        return httpx.Response(200, json={"data": [{"embedding": [1.0]}]}, request=httpx.Request("POST", url))
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", response)
+    result = asyncio.run(probe_local())
+    assert result["found"] is True, "discovery incorrectly loaded a configured CA file"
+    assert clients[0]._mounts == {}, "local discovery inherited a system proxy"
+    assert clients[0].is_closed
 
 
 def test_knowledge_blocks_carry_provenance_and_why() -> None:
@@ -580,8 +633,16 @@ def test_startup_actually_probes_for_a_local_vector_model(agent_home, monkeypatc
 
     for name in ("CODE_AGENT_EMBED_BASE_URL", "CODE_AGENT_EMBED_API_KEY", "CODE_AGENT_EMBED_MODEL"):
         monkeypatch.delenv(name, raising=False)
+    async def detected():
+        return {"found": True, "base_url": "http://127.0.0.1:11434/v1", "model": "test-vector", "dim": 2}
+
+    monkeypatch.setattr("code_agent.retrieval.embed.autodetect_local", detected)
     app = create_app(provider_name="offline")
-    with TestClient(app):
+    async def finish_probe():
+        await app.state.embed_probe_task
+
+    with TestClient(app) as client:
+        client.portal.call(finish_probe)
         probe = getattr(app.state, "embed_probe", None)
     assert isinstance(probe, dict), "启动钩子没跑：embed_probe 没被写入"
     assert "found" in probe
