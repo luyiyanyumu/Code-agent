@@ -1,0 +1,51 @@
+# Code-agent 一键部署（M7）：app + nginx
+#
+# 用法：
+#   cp .env.example .env   # 填入模型 key；默认单用户免登录
+#   docker compose up -d --build
+#   浏览器打开 http://localhost:8080
+#
+# 数据（会话轨迹/记忆/审计库/交付物）全部落在 agent-data 卷，容器重建不丢。
+
+services:
+  app:
+    build: .
+    image: code-agent:0.7.0
+    environment:
+      CODE_AGENT_PROVIDER: ${CODE_AGENT_PROVIDER:-deepseek}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      CODE_AGENT_AUTH_ENABLED: ${CODE_AGENT_AUTH_ENABLED:-false}
+      # 认证模式可配置密钥；留空时随机密钥随数据卷持久化。
+      CODE_AGENT_SECRET: ${CODE_AGENT_SECRET:-}
+      CODE_AGENT_ADMIN_USER: ${CODE_AGENT_ADMIN_USER:-admin}
+      CODE_AGENT_ADMIN_PASSWORD: ${CODE_AGENT_ADMIN_PASSWORD:-admin123}
+      # 沙箱：容器内默认用 process 模式；宿主已装 Docker 可改 docker 套娃隔离
+      CODE_AGENT_SANDBOX_MODE: ${CODE_AGENT_SANDBOX_MODE:-process}
+      CODE_AGENT_WS_IDLE_TIMEOUT: ${CODE_AGENT_WS_IDLE_TIMEOUT:-120}
+      CODE_AGENT_APPROVAL_TIMEOUT: ${CODE_AGENT_APPROVAL_TIMEOUT:-120}
+    volumes:
+      - agent-data:/data
+    expose:
+      - "8765"
+    restart: unless-stopped
+    # 生产加固：限制容器资源，防单会话跑飞拖垮宿主
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 2g
+
+  nginx:
+    image: nginx:1.27-alpine
+    ports:
+      - "${CODE_AGENT_HTTP_PORT:-8080}:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      # 前端构建产物（npm run build 后生成）；不存在时仅 API 可用
+      - ./web/dist:/usr/share/nginx/html:ro
+    depends_on:
+      - app
+    restart: unless-stopped
+
+volumes:
+  agent-data:

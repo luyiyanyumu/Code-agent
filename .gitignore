@@ -1,0 +1,42 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.idea/
+.env
+*.egg-info/
+.tmp/
+
+# 前端
+web/node_modules/
+web/dist/
+web/.vite/
+chat-app/node_modules/
+chat-app/dist/
+chat-app/.vite/
+chat-app/.venv/
+chat-app/build/
+# 编译校验用的临时产物目录（每次换新名字，别删 dist 以免触发删除保护）
+web/.vite-check-*/
+# 一键启动脚本落盘的服务日志
+logs/
+
+# 本机环境、运行数据与公开发布时排除的参考/验收产物
+.venv-*/
+.ruff_cache/
+.deepeval/
+**/.tmp/
+*.log
+*.sqlite*
+*.db
+*.db-wal
+*.db-shm
+.env.*
+!.env.example
+/memory/
+/pkg/
+/_dsh_src/
+/_asar_tool.mjs
+/web/shots/
+/design-qa.md
+/pelican-*

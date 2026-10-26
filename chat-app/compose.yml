@@ -1,0 +1,18 @@
+services:
+  chat-agent:
+    build: .
+    ports:
+      - "127.0.0.1:8766:8766"
+    environment:
+      CHAT_AGENT_PROVIDER: offline
+      CHAT_AGENT_ACCESS_TOKEN: ${CHAT_AGENT_ACCESS_TOKEN:?Set a private CHAT_AGENT_ACCESS_TOKEN}
+    volumes:
+      - chat-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8766/healthz', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+volumes:
+  chat-data:

@@ -1,0 +1,7 @@
+Chat-agent
+Copyright 2026 Chat-agent contributors
+
+This standalone distribution is licensed under the Apache License, Version 2.0.
+Its conversation frontend was separated from the Code-agent workspace and its
+backend was implemented independently. Third-party dependencies retain their
+own licenses; see THIRD_PARTY_NOTICES.md and licenses/.

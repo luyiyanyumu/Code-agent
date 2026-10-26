@@ -1,0 +1,290 @@
+import test from 'node:test'
+import assert from 'node:assert/strict'
+import { documentKey, useWorkbench } from '../src/composables/useWorkbench.js'
+
+const STORAGE_KEY = 'test-workbench'
+function memoryStorage() {
+  const values = new Map()
+  return {
+    writes: 0,
+    getItem: (key) => values.get(key) ?? null,
+    setItem(key, value) { values.set(key, value); this.writes++ },
+    removeItem(key) { values.delete(key); this.writes++ },
+  }
+}
+function setup(t, options = {}) {
+  const storage = options.storage ?? memoryStorage()
+  const workbench = useWorkbench({ storageKey: STORAGE_KEY, storage, debounceMs: 60_000, ...options })
+  t.after(() => workbench.dispose())
+  return { workbench, storage }
+}
+const file = (path = 'src/main.js', text = 'original', sha1 = 'hash-original') => ({
+  path, text, sha1, lang: 'javascript', editable: true, total_lines: 1,
+})
+
+test('project, tree and exact normalized path isolate documents and active tabs', (t) => {
+  const { workbench: w } = setup(t)
+  w.activateProject('first')
+  const first = w.openFile(file('src\\main.js'))
+  assert.equal(w.documents.value.length, 1)
+  assert.equal(w.activeDocument.value, first)
+  const secondTab = w.openFile(file('README.md'))
+  assert.equal(first.key, documentKey('first', 'main', './src/main.js'))
+  w.update(first.key, { text: 'first draft' })
+  w.activateProject('second')
+  const second = w.openFile(file())
+  assert.notEqual(second.key, first.key)
+  w.activateProject('first', 'session:one')
+  const worktree = w.openFile(file())
+  assert.notEqual(worktree.key, first.key)
+  w.activateProject('first')
+  assert.deepEqual(w.documents.value.map((d) => d.key), [first.key, secondTab.key])
+  assert.equal(w.activeDocument.value.key, secondTab.key)
+  assert.equal(first.text, 'first draft')
+  assert.equal(w.allDirty.value.length, 1)
+  w.activateProject('second')
+  assert.equal(w.hasUnsaved.value, true)
+  w.markSaved(first.key, { text: 'first draft', sha1: 'saved-first' })
+  assert.equal(w.hasUnsaved.value, false)
+  w.close(second.key)
+  assert.equal(w.activeDocument.value, null)
+})
+
+test('reopening updates clean disk content but preserves a dirty draft and original hash', (t) => {
+  const { workbench: w } = setup(t)
+  w.activateProject('project')
+  const document = w.openFile(file())
+  assert.equal(w.openFile(file(undefined, 'new disk', 'new-hash')), document)
+  assert.equal(document.text, 'new disk')
+  assert.equal(document.sha1, 'new-hash')
+  w.update(document.key, { text: 'draft' })
+  w.openFile(file(undefined, 'external change', 'external-hash'))
+  assert.equal(document.text, 'draft')
+  assert.equal(document.savedText, 'new disk')
+  assert.equal(document.sha1, 'new-hash')
+  assert.equal(document.conflict.actualSha1, 'external-hash')
+  assert.equal(document.conflict.file.text, 'external change')
+})
+
+test('save completion records submitted text while retaining typing during the request', (t) => {
+  const { workbench: w, storage } = setup(t)
+  w.activateProject('project')
+  const document = w.openFile(file())
+  w.update(document.key, { text: 'submitted', viewState: { cursor: 12 } })
+  w.update(document.key, { text: 'submitted + continued typing' })
+  w.markSaved(document.key, { text: 'submitted', sha1: 'saved-hash', lines: 2, changed: true })
+  assert.equal(document.text, 'submitted + continued typing')
+  assert.equal(document.savedText, 'submitted')
+  assert.equal(document.file.text, 'submitted')
+  assert.equal(document.file.total_lines, 2)
+  assert.equal(document.sha1, 'saved-hash')
+  assert.equal(document.dirty, true)
+  assert.deepEqual(document.viewState, { cursor: 12 })
+  w.flush()
+  assert.equal(JSON.parse(storage.getItem(STORAGE_KEY)).scopes[0].documents[0].text, document.text)
+  w.update(document.key, { text: 'submitted' })
+  assert.equal(document.dirty, false)
+  w.flush()
+  const savedItem = JSON.parse(storage.getItem(STORAGE_KEY)).scopes[0].documents[0]
+  assert.equal(savedItem.dirty, false)
+  assert.equal(Object.hasOwn(savedItem, 'text'), false)
+})
+
+test('closing dirty tabs requires discard; closing the active tab selects its nearest neighbor', (t) => {
+  const { workbench: w, storage } = setup(t)
+  w.activateProject('project')
+  const first = w.openFile(file('first.js'))
+  const second = w.openFile(file('second.js'))
+  const third = w.openFile(file('third.js'))
+  w.activate(second.key)
+  w.update(second.key, { text: 'unsaved' })
+  w.flush()
+  const before = storage.getItem(STORAGE_KEY)
+  assert.equal(w.close(second.key), false)
+  assert.equal(w.documents.value.length, 3)
+  assert.equal(storage.getItem(STORAGE_KEY), before)
+  assert.equal(w.close(second.key, { discard: true }), true)
+  assert.equal(w.activeKey.value, third.key)
+  assert.equal(JSON.parse(storage.getItem(STORAGE_KEY)).scopes[0].documents.some((d) => d.path === 'second.js'), false)
+  w.close(third.key)
+  assert.equal(w.activeKey.value, first.key)
+  w.close(first.key)
+  assert.equal(storage.getItem(STORAGE_KEY), null)
+  assert.equal(w.hasUnsaved.value, false)
+})
+
+test('recovery keeps dirty text, reloads clean tabs, and remembers each scope active tab', (t) => {
+  const { workbench: w, storage } = setup(t)
+  w.activateProject('project')
+  const dirty = w.openFile(file('dirty.js'))
+  const clean = w.openFile(file('clean.js', 'disk text should not be serialized'))
+  w.update(dirty.key, { text: 'recovered draft', viewState: { cursorState: [{ lineNumber: 12 }], viewState: { scrollTop: 220 } }, selection: { start_line: 12, start_column: 3 } })
+  w.activate(dirty.key)
+  w.activateProject('other', 'session:a')
+  const other = w.openFile(file('other.js'))
+  w.flush()
+  const snapshot = storage.getItem(STORAGE_KEY)
+  assert.equal(snapshot.includes('disk text should not be serialized'), false)
+  const { workbench: restored } = setup(t, { storage })
+  restored.activateProject('project')
+  const restoredDirty = restored.activeDocument.value
+  assert.equal(restoredDirty.key, dirty.key)
+  assert.equal(restoredDirty.text, 'recovered draft')
+  assert.equal(restoredDirty.sha1, 'hash-original')
+  assert.equal(restoredDirty.savedText, null)
+  assert.equal(restoredDirty.needsReload, true)
+  assert.deepEqual(restoredDirty.viewState, { cursorState: [{ lineNumber: 12 }], viewState: { scrollTop: 220 } })
+  assert.deepEqual(restoredDirty.selection, { start_line: 12, start_column: 3 })
+  assert.equal(restored.documents.value.find((d) => d.key === clean.key).needsReload, true)
+  restored.openFile(file('dirty.js'), { activate: false })
+  assert.equal(restoredDirty.text, 'recovered draft')
+  assert.equal(restoredDirty.savedText, 'original')
+  assert.equal(restoredDirty.conflict, null)
+  assert.equal(restoredDirty.needsReload, false)
+  restored.openFile(file('clean.js', 'latest disk'), { activate: false })
+  assert.equal(restored.documents.value.find((d) => d.key === clean.key).text, 'latest disk')
+  assert.equal(restored.activeKey.value, dirty.key)
+  restored.activateProject('other', 'session:a')
+  assert.equal(restored.activeKey.value, other.key)
+})
+
+test('recovered draft over externally changed disk retains original optimistic-lock hash', (t) => {
+  const { workbench: w, storage } = setup(t)
+  w.activateProject('project')
+  const document = w.openFile(file())
+  w.update(document.key, { text: 'local draft' })
+  w.flush()
+  const { workbench: restored } = setup(t, { storage })
+  restored.activateProject('project')
+  restored.openFile(file(undefined, 'disk changed while closed', 'external-hash'))
+  assert.equal(restored.activeDocument.value.text, 'local draft')
+  assert.equal(restored.activeDocument.value.sha1, 'hash-original')
+  assert.equal(restored.activeDocument.value.conflict.file.sha1, 'external-hash')
+  assert.equal(restored.activeDocument.value.dirty, true)
+  restored.flush()
+  assert.equal(JSON.parse(storage.getItem(STORAGE_KEY)).scopes[0].documents[0].sha1, 'hash-original')
+})
+
+test('a disk version matching the draft resolves the draft without losing its text', (t) => {
+  const { workbench: w } = setup(t)
+  w.activateProject('project')
+  const document = w.openFile(file())
+  w.update(document.key, { text: 'draft already saved elsewhere' })
+  w.updateExternal(document.key, file(undefined, 'draft already saved elsewhere', 'new-hash'))
+  assert.equal(document.dirty, false)
+  assert.equal(document.sha1, 'new-hash')
+  assert.equal(document.text, 'draft already saved elsewhere')
+  assert.equal(document.conflict, null)
+})
+
+test('view and selection changes debounce with the next snapshot instead of writing per event', (t) => {
+  const { workbench: w, storage } = setup(t)
+  w.activateProject('project')
+  const document = w.openFile(file())
+  w.flush()
+  const writes = storage.writes
+  w.update(document.key, { viewState: { scrollTop: 240 }, selection: { startLineNumber: 3 } })
+  assert.equal(storage.writes, writes)
+  assert.equal(document.viewState.scrollTop, 240)
+  assert.equal(document.selection.startLineNumber, 3)
+  w.flush()
+  const snapshot = JSON.parse(storage.getItem(STORAGE_KEY)).scopes[0].documents[0]
+  assert.deepEqual(snapshot.viewState, { scrollTop: 240 })
+  assert.deepEqual(snapshot.selection, { startLineNumber: 3 })
+})
+
+test('older recovery snapshots without reading-position metadata still restore', (t) => {
+  const storage = memoryStorage()
+  const key = documentKey('project', 'main', 'old.js')
+  storage.setItem(STORAGE_KEY, JSON.stringify({ version: 1, scopes: [{ projectId: 'project', tree: 'main', activeKey: key, documents: [{ path: 'old.js', sha1: 'old-hash', dirty: true, text: 'old draft' }] }] }))
+  const { workbench: w } = setup(t, { storage })
+  w.activateProject('project')
+  assert.equal(w.activeDocument.value.text, 'old draft')
+  assert.equal(w.activeDocument.value.viewState, null)
+  assert.equal(w.activeDocument.value.selection, null)
+})
+
+test('oversize drafts keep the previous recovery snapshot and expose a visible error', (t) => {
+  const { workbench: w, storage } = setup(t, { maxDraftChars: 5 })
+  w.activateProject('project')
+  const document = w.openFile(file())
+  w.update(document.key, { text: 'safe' })
+  assert.equal(w.flush(), true)
+  const previous = storage.getItem(STORAGE_KEY)
+  w.update(document.key, { text: 'too long to persist' })
+  assert.equal(w.flush(), false)
+  assert.equal(document.text, 'too long to persist')
+  assert.equal(storage.getItem(STORAGE_KEY), previous)
+  assert.match(w.storageError.value, /超过.*5/)
+  w.markSaved(document.key, { text: document.text, sha1: 'saved' })
+  assert.equal(w.flush(), true)
+  assert.equal(w.storageError.value, '')
+})
+
+test('storage quota failures never discard editing and can recover on a later flush', (t) => {
+  const storage = memoryStorage()
+  const write = storage.setItem.bind(storage)
+  let fail = false
+  storage.setItem = (key, value) => { if (fail) throw new Error('QuotaExceededError'); write(key, value) }
+  const { workbench: w } = setup(t, { storage })
+  w.activateProject('project')
+  const document = w.openFile(file())
+  w.flush()
+  const previous = storage.getItem(STORAGE_KEY)
+  fail = true
+  w.update(document.key, { text: 'draft despite quota' })
+  assert.equal(w.flush(), false)
+  assert.equal(storage.getItem(STORAGE_KEY), previous)
+  assert.equal(document.text, 'draft despite quota')
+  assert.match(w.storageError.value, /QuotaExceededError/)
+  fail = false
+  assert.equal(w.flush(), true)
+  assert.equal(w.storageError.value, '')
+})
+
+test('unavailable browser storage reports recovery limitations while editing remains usable', (t) => {
+  const w = useWorkbench({ storage: null, debounceMs: 60_000 })
+  t.after(() => w.dispose())
+  w.activateProject('project')
+  const document = w.openFile(file())
+  w.update(document.key, { text: 'memory-only draft' })
+  assert.equal(w.flush(), false)
+  assert.equal(w.activeDocument.value.text, 'memory-only draft')
+  assert.equal(w.hasUnsaved.value, true)
+  assert.match(w.storageError.value, /本地存储不可用/)
+})
+
+test('malformed recovery data is left intact and does not partially restore tabs', (t) => {
+  const storage = memoryStorage()
+  const broken = JSON.stringify({ version: 1, scopes: [{ projectId: 'project', documents: [
+    { path: 'valid.js', dirty: true, text: 'recover me' }, { path: 'broken.js', dirty: true },
+  ] }] })
+  storage.setItem(STORAGE_KEY, broken)
+  const { workbench: w } = setup(t, { storage })
+  w.activateProject('project')
+  assert.equal(w.documents.value.length, 0)
+  const document = w.openFile(file())
+  w.update(document.key, { text: 'new memory draft' })
+  assert.equal(w.flush(), false)
+  assert.equal(storage.getItem(STORAGE_KEY), broken)
+  assert.equal(document.text, 'new memory draft')
+  assert.match(w.storageError.value, /恢复失败/)
+})
+
+test('persistence is debounced and dispose flushes the final edit', async (t) => {
+  const { workbench: w, storage } = setup(t, { debounceMs: 15 })
+  w.activateProject('project')
+  const document = w.openFile(file())
+  w.update(document.key, { text: 'one' })
+  w.update(document.key, { text: 'two' })
+  assert.equal(storage.writes, 0)
+  await new Promise((resolve) => setTimeout(resolve, 45))
+  assert.equal(storage.writes, 1)
+  assert.equal(JSON.parse(storage.getItem(STORAGE_KEY)).scopes[0].documents[0].text, 'two')
+  w.update(document.key, { text: 'final' })
+  w.dispose()
+  assert.equal(JSON.parse(storage.getItem(STORAGE_KEY)).scopes[0].documents[0].text, 'final')
+  const writes = storage.writes
+  await new Promise((resolve) => setTimeout(resolve, 45))
+  assert.equal(storage.writes, writes)
+})
