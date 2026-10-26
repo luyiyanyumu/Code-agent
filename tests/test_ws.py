@@ -64,7 +64,10 @@ def test_ws_approval_via_rest(client):
     runtime = client.app.state.sessions.get_runtime(sid, user["id"])
     runtime.router.provider_override = OfflineProvider(
         script=[
-            OfflineProvider.tool_call_turn("bash", {"command": "make all"}),
+            OfflineProvider.tool_call_turn("bash", {
+                "command": "make all",
+                "_approval": {"purpose": "构建当前项目", "effects": ["在工作区执行 make all 构建命令"]},
+            }),
             OfflineProvider.text_turn("approved run done"),
         ]
     )
@@ -107,7 +110,10 @@ def test_ws_denied_approval_fail_path(client):
     runtime = client.app.state.sessions.get_runtime(sid, user["id"])
     runtime.router.provider_override = OfflineProvider(
         script=[
-            OfflineProvider.tool_call_turn("bash", {"command": "make all"}),
+            OfflineProvider.tool_call_turn("bash", {
+                "command": "make all",
+                "_approval": {"purpose": "构建当前项目", "effects": ["在工作区执行 make all 构建命令"]},
+            }),
             OfflineProvider.text_turn("after deny"),
         ]
     )

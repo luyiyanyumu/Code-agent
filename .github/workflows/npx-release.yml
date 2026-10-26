@@ -1,0 +1,50 @@
+name: Publish npx release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing version tag, e.g. v0.10.1'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: npm ci --prefix web
+      - run: npm test
+      - run: python -m pip install '.[dev]'
+      - run: python -m pytest tests/test_static_web.py tests/test_env_loader.py tests/test_api.py
+      - run: npm pack --pack-destination .
+      - run: npm run test:package -- --tarball code-agent-$(node -p "require('./package.json').version").tgz
+      - name: Publish prebuilt tarball
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+        shell: bash
+        run: |
+          version=$(node -p "require('./package.json').version")
+          test "$RELEASE_TAG" = "v$version"
+          cp "code-agent-$version.tgz" code-agent.tgz
+          sha256sum code-agent.tgz > code-agent.tgz.sha256
+          if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            gh release create "$RELEASE_TAG" --verify-tag --title "Code-agent $version" --generate-notes
+          fi
+          gh release upload "$RELEASE_TAG" code-agent.tgz code-agent.tgz.sha256 --clobber

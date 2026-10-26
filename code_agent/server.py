@@ -9,6 +9,7 @@
     CODE_AGENT_ADMIN_USER      初始管理员用户名（默认 admin）
     CODE_AGENT_ADMIN_PASSWORD  认证模式的初始管理员密码（默认 admin123，启用认证时应配置）
     CODE_AGENT_SECRET          JWT 签名密钥（不设则落盘随机密钥）
+    CODE_AGENT_WEB_DIST        显式指定已构建的前端目录，同端口提供页面（默认只提供 API）
 
 openai_compat 用于内网网关 / vLLM / Ollama，配合 OPENAI_BASE_URL + OPENAI_API_KEY
 即可接入任何 /chat/completions 兼容后端。
@@ -20,7 +21,6 @@ import argparse
 
 import uvicorn
 
-from code_agent.api.app import create_app
 from code_agent.config import load_env_file
 
 
@@ -35,6 +35,9 @@ def main() -> None:
         choices=["offline", "deepseek", "openai", "openai_compat"],
     )
     args = parser.parse_args()
+
+    # Environment-controlled module defaults must see the loaded .env as well.
+    from code_agent.api.app import create_app
 
     app = create_app(provider_name=args.provider)
     if env_file:

@@ -60,7 +60,29 @@ Lead 可以独立读取代码、修改文件、运行工具并验证结果；适
 
 ## 快速开始
 
-### 1. 安装依赖
+### 使用 npx 下载并启动
+
+准备 **Node.js 20.11+** 和 **Python 3.11+**，运行：
+
+```bash
+npx --yes https://github.com/luyiyanyumu/Code-agent/releases/latest/download/code-agent.tgz
+```
+
+首次启动会下载应用、创建独立 Python 虚拟环境并安装后端依赖，然后自动打开 **[http://127.0.0.1:8765](http://127.0.0.1:8765)**。前端已随发行包构建，无需克隆仓库或执行 `npm ci`；之后启动会复用已安装的运行环境。
+
+下载并准备最新版，暂不启动：
+
+```bash
+npx --yes --prefer-online https://github.com/luyiyanyumu/Code-agent/releases/latest/download/code-agent.tgz install
+```
+
+更新后，在旧服务终端按 `Ctrl+C` 停止，再将上述安装命令末尾的 `install` 去掉启动新版。会话、配置和密钥保存在 `~/.code-agent`，更新程序不会覆盖它们。启动后可在 **设置 → 模型与连接** 中配置密钥；追加 `--provider offline` 可体验离线演示。
+
+当前发行渠道为 **GitHub Release**。更多命令、运行目录和自定义选项见 [npx 安装与更新](docs/npx.md)。
+
+### 从源码开发
+
+#### 1. 安装依赖
 
 准备 **Python 3.11+**、**Node.js** 和 **Git**，然后克隆项目：
 
@@ -91,7 +113,7 @@ npm ci
 cd ..
 ```
 
-### 2. 配置模型
+#### 2. 配置模型
 
 将 `.env.example` 复制为 `.env`，再填写自己的模型配置。也可以启动后在 **设置 → 模型与连接** 中配置。
 
@@ -102,7 +124,7 @@ DEEPSEEK_API_KEY=填写自己的密钥
 
 `.env` 不应提交到版本库。可用配置与默认值见 [.env.example](.env.example)。
 
-### 3. 启动工作台
+#### 3. 启动工作台
 
 第一个终端，在项目根目录启动后端：
 
@@ -185,4 +207,4 @@ scripts/             启动、检查和开发验证脚本
 docs/                功能说明与配图
 ```
 
-更多说明：[子智能体协作](docs/subagent-runtime.md) · [项目任务](docs/work-items.md) · [编码助手记忆](docs/memory.md) · [独立对话应用](chat-app/README.md)。
+更多说明：[npx 安装与更新](docs/npx.md) · [子智能体协作](docs/subagent-runtime.md) · [项目任务](docs/work-items.md) · [编码助手记忆](docs/memory.md) · [独立对话应用](chat-app/README.md)。

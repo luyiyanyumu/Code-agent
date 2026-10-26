@@ -30,7 +30,9 @@ from typing import Any
 
 from fastapi import Depends, FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 
+from code_agent import __version__
 from code_agent.agent.router import ModelRouter
+from code_agent.api.static_web import mount_workbench
 from code_agent.api.deps import CurrentUser, get_current_user, get_ws_user
 from code_agent.api.code_api import mount_code_api
 from code_agent.api.change_review_api import mount_change_review_api
@@ -386,7 +388,7 @@ def create_app(provider_name: str | None = None) -> FastAPI:
         await router.aclose()
         await knowledge.aclose()
 
-    app = FastAPI(title="Code-agent", version="0.10.0", lifespan=lifespan)
+    app = FastAPI(title="Code-agent", version=__version__, lifespan=lifespan)
     app.state.auth_enabled = requires_auth
 
     db = Database(workspace_root().parent / "code_agent.db")
@@ -2306,6 +2308,8 @@ def create_app(provider_name: str | None = None) -> FastAPI:
         finally:
             runtime.unsubscribe(queue)
 
+    # All API and WebSocket routes must precede the optional SPA catch-all.
+    mount_workbench(app)
     return app
 
 

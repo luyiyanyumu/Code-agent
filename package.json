@@ -1,0 +1,41 @@
+{
+  "name": "code-agent",
+  "version": "0.10.1",
+  "description": "本地 AI 编码工作台：代码编辑、智能体协作、项目地图与前端设计",
+  "type": "module",
+  "bin": {
+    "code-agent": "bin/code-agent.mjs"
+  },
+  "engines": {
+    "node": ">=20.11.0"
+  },
+  "files": [
+    "bin/*.mjs",
+    "npm/*.mjs",
+    "npm/release.json",
+    "code_agent/**/*.py",
+    "code_agent/skills/**/*.md",
+    "pyproject.toml",
+    "web/dist/**",
+    ".env.example"
+  ],
+  "scripts": {
+    "start": "node bin/code-agent.mjs",
+    "test": "node --test npm/tests/*.test.mjs",
+    "build": "node npm/build.mjs",
+    "prepack": "node npm/build.mjs",
+    "test:package": "node npm/smoke.mjs"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/luyiyanyumu/Code-agent.git"
+  },
+  "homepage": "https://github.com/luyiyanyumu/Code-agent#readme",
+  "bugs": {
+    "url": "https://github.com/luyiyanyumu/Code-agent/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  }
+}

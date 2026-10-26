@@ -40,3 +40,8 @@ logs/
 /web/shots/
 /design-qa.md
 /pelican-*
+
+# npm 发布产物；由 npm pack 构建，不保存运行环境和用户数据
+/npm/release.json
+/*.tgz
+/node_modules/
