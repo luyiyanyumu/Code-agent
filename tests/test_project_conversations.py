@@ -190,7 +190,8 @@ def test_live_chat_loop_observes_a_project_write_revocation_before_its_next_tool
             app.state.projects.set_flags(project["id"], allow_direct_write=False)
             resume.set()
             result = await asyncio.wait_for(running, 3)
-            assert result.stop_reason == "end_turn" and provider.calls == 4
+            assert result.stop_reason == "stalled" and provider.calls == 4
+            assert "权限" in result.text
             assert (root / "source.txt").read_text() == "first"
             assert len(approvals) == 1
             assert manager.get_meta(chat["id"], project["user_id"])["permission_mode"] == "workspace-write"

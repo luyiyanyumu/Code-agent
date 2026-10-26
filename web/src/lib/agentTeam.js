@@ -73,10 +73,6 @@ export function agentTreeRows(team) {
   return rows
 }
 
-export function nodeAgents(team) {
-  return new Map((team?.agents || []).filter(agent => agent.role === 'node' && agent.node_id && agent.state !== 'retired').map(agent => [agent.node_id, agent]))
-}
-
 // Each project/tree starts on Lead. Polling pauses on hidden panels and discards
 // late requests from a previous project without interrupting server-side jobs.
 export function useProjectAgentTeam({ projectId, tree, visible, leadSessionId, conversationId = leadSessionId, client, pollMs = 15000 }) {
@@ -87,7 +83,6 @@ export function useProjectAgentTeam({ projectId, tree, visible, leadSessionId, c
   const selectedId = computed(() => conversationId() || leadSessionId() || '')
   const selected = computed(() => team.value?.lead?.session_id === selectedId.value ? team.value.lead : null)
   const sessionId = selectedId
-  const assignments = computed(() => nodeAgents(team.value))
   const current = (pid, tid, version) => !disposed && projectId() === pid && tree() === tid && version === generation
   function stopTimer() { clearTimeout(timer); timer = null }
   function stopEventTimer() { clearTimeout(eventTimer); eventTimer = null }
@@ -160,5 +155,5 @@ export function useProjectAgentTeam({ projectId, tree, visible, leadSessionId, c
     else { requestId++; loading.value = false }
   }, { immediate: true, flush: 'sync' })
   onScopeDispose(() => { disposed = true; generation += 1; requestId += 1; stopTimer(); stopEventTimer() })
-  return { team, rows, selected, sessionId, assignments, selectedId, loading, error, acting, refresh, notify, select, returnLead, action }
+  return { team, rows, selected, sessionId, selectedId, loading, error, acting, refresh, notify, select, returnLead, action }
 }

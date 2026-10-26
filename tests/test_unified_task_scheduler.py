@@ -17,7 +17,6 @@ import pytest
 from code_agent.agent.project_team import ProjectTeam, TeamError
 from code_agent.codeintel.parallel import BatchService
 from code_agent.codeintel.parallel import BatchError
-from code_agent.codeintel.sop_workflow import WorkflowStore
 from code_agent.codeintel.tasks import TaskError, TaskService
 from code_agent.codeintel.vcs import git_env
 from code_agent.models.events import TokenUsage
@@ -141,7 +140,7 @@ def isolated(agent_home, tmp_path, monkeypatch):
     limits = {"max_depth": 3, "max_parallel": 1}
     monkeypatch.setattr("code_agent.agent.project_team.settings.agent_team_config", lambda: dict(limits))
     monkeypatch.setattr("code_agent.agent.project_team.settings.permission_mode", lambda: "workspace-write")
-    team = ProjectTeam(manager, WorkflowStore(db))
+    team = ProjectTeam(manager)
     manager.agent_team = team
     tasks = TaskRepo(db)
     batches = BatchRepo(db)

@@ -1012,7 +1012,7 @@ def _best_usage_line(read_text: Callable[[str], str], rel: str, name: str) -> tu
     """在候选文件里挑一行**真正的使用**：跳过 import，优先"构造/调用"那一行。
 
     返回 `(行号, 分数)`，分数越小越像"真的在用"：
-    0 = 构造/调用（`WorkflowStep(...)`）、1 = 其它真实出现（注解、比较、赋值）、
+    0 = 构造/调用（`TaskSpec(...)`）、1 = 其它真实出现（注解、比较、赋值）、
     2 = 只是被列在 import / `__all__` 里、3 = import 行本身。
 
     为什么必须挑：命中集里的第一行往往是 `from x import Name`（甚至是括号换行后的
@@ -1045,7 +1045,7 @@ def _best_usage_line(read_text: Callable[[str], str], rel: str, name: str) -> tu
 def _class_fields(index: Any, symbol_id: str) -> list[str]:
     """类体里的字段（`name: str` 这种原样一行）。
 
-    为什么要单独列：数据类"是干什么的"往往就写在字段上——`WorkflowStep(name, prompt)`
+    为什么要单独列：数据类"是干什么的"往往就写在字段上——`TaskSpec(name, prompt)`
     比"没有基类；含 0 个方法"有用得多。
     """
     rows = index.query_all(
@@ -1075,7 +1075,7 @@ def _usage_evidence(
     这是整张作用卡里最具体的一条：字段、继承、成员数都说明不了"什么时候用它"，
     而调用点/使用点是**看得到的证据**（本模块的底线：模板里不放想象）。
 
-    候选文件 = 导入了本模块的文件 + **它自己所在的文件**（`WorkflowStep` 最自然的用法
+    候选文件 = 导入了本模块的文件 + **它自己所在的文件**（`TaskSpec` 最自然的用法
     就在同一模块的 `parse_steps` 里，只在"外部文件"里找会得出"没人用它"的假结论）。
     挑行与排序：先看"是不是真的在用"（构造/调用 > 其它出现 > import），
     再看产品代码优先于测试代码、自己的文件排在最后。

@@ -6,7 +6,6 @@ import pytest
 
 from code_agent.agent.project_team import ProjectTeam
 from code_agent.agent.router import ModelRouter
-from code_agent.codeintel.sop_workflow import WorkflowStore
 from code_agent.context.prompt import build_history
 from code_agent.models.events import Event, EventType, ModelTurn, ToolCall
 from code_agent.providers.offline import OfflineProvider
@@ -34,7 +33,7 @@ def environment(agent_home, monkeypatch):
     manager = SessionManager(transcript=TranscriptStore(agent_home / "transcripts"), session_repo=SessionRepo(db),
                              approval_repo=ApprovalRepo(db), router=ModelRouter(provider_name="offline"),
                              registry=registry, project_repo=projects)
-    team = ProjectTeam(manager, WorkflowStore(db))
+    team = ProjectTeam(manager)
     manager.agent_team = team
     lead = manager.create_project_session(user, project["id"], permission_mode="read-only")
     roster = team.sync(project["id"], user)

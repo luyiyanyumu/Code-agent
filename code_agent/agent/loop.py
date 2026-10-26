@@ -1505,7 +1505,7 @@ class AgentLoop:
         self._pending_edit_views.pop(tc.id, None)
         self._pending_source_stats.pop(tc.id, None)
         # Approval can authorize an available operation; it cannot grant tools
-        # excluded by the role/workflow or invent an unregistered tool.
+        # excluded by the role/policy or invent an unregistered tool.
         try:
             tool = self.registry.get(tc.name)
         except Exception as exc:

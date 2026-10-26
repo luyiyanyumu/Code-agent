@@ -42,7 +42,7 @@ def test_reopening_project_reuses_promoted_chat_without_reconfiguring_cached_run
     assert (root / "source.txt").read_text() == "original"
 
 
-def test_default_roster_workflow_and_work_items_follow_the_promoted_root(integration):
+def test_default_roster_and_work_items_follow_the_promoted_root(integration):
     client, app, auth, project, _ = integration
     chat, _, _ = promote_chat(integration)
     team = app.state.project_agent_team
@@ -51,12 +51,6 @@ def test_default_roster_workflow_and_work_items_follow_the_promoted_root(integra
     work = client.get(f"/api/v1/code/projects/{project['id']}/work-items", headers=auth)
     assert work.status_code == 200, work.text
     assert work.json()["lead"]["session_id"] == chat["id"]
-    document = app.state.sop_workflow_store.get(project["id"], "main")
-    revision = document.pop("revision")
-    document.pop("updated_at")
-    response = client.put(f"/api/v1/code/projects/{project['id']}/workflow", headers=auth,
-                          json={"expected_revision": revision, "workflow": document})
-    assert response.status_code == 200, response.text
     assert roster(integration)["agents"] == []
     next_chat = client.post(f"/api/v1/code/projects/{project['id']}/conversations", headers=auth, json={})
     assert next_chat.status_code == 200, next_chat.text

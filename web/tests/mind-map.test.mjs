@@ -65,7 +65,7 @@ async function setup(t, initialProps = {}) {
   }
   bindings.onMounted = (fn) => { mount = fn }
   bindings.onBeforeUnmount = (fn) => { unmount = fn }
-  const expose = '({ map, loading, error, detail, loadMap, loadDetail, invalidateDetail, closeDetail, poll, refresh, loadFeatureChildren, featureKids, featureBusyIds, loadBriefState, briefMissing, briefLoading, briefJob, briefPresentation, view, workflowOpened, onlyChanged, changedFiles, changedIds, visibleNodes, visibleLinks, featureMap, featureOpen, featureParent, purposeCache, onBusinessChanged, loadFeatures, hover, onNodeHover })'
+  const expose = '({ map, loading, error, detail, loadMap, loadDetail, invalidateDetail, closeDetail, poll, refresh, loadFeatureChildren, featureKids, featureBusyIds, loadBriefState, briefMissing, briefLoading, briefJob, briefPresentation, view, onlyChanged, changedFiles, changedIds, visibleNodes, visibleLinks, featureMap, featureOpen, featureParent, purposeCache, onBusinessChanged, loadFeatures, hover, onNodeHover })'
   const scope = vue.effectScope()
   const state = scope.run(() => new Function(...Object.keys(bindings), `${script}\nreturn ${expose}`)(...Object.values(bindings)))
   t.after(() => {
@@ -93,21 +93,25 @@ test('map load keeps the newer request and its loading state when older response
   assert.equal(s.loading.value, false)
 })
 
-test('workflow activation keeps the canvas mounted and pauses code index polling', async (t) => {
+test('structure and feature maps keep code polling and contain no workflow entry or API', async t => {
   const { state: s, stubs } = await setup(t)
   await s.loadMap()
-  let calls = 0
-  stubs.indexStatus = async () => { calls++; return { change_seq: 1 } }
-  s.view.value = 'workflow'
+  let statusReads = 0, featureReads = 0
+  stubs.indexStatus = async () => { statusReads++; return { change_seq: 1 } }
+  stubs.features = async () => { featureReads++; return { domains: [] } }
+  s.view.value = 'features'
   await vue.nextTick()
-  assert.equal(s.workflowOpened.value, true)
   await s.poll()
-  assert.equal(calls, 0)
+  assert.equal(featureReads, 1)
+  assert.equal(statusReads, 1)
   s.view.value = 'structure'
   await vue.nextTick()
-  assert.equal(s.workflowOpened.value, true)
   await s.poll()
-  assert.equal(calls, 1)
+  assert.equal(statusReads, 2)
+  const source = readFileSync(new URL('../src/components/code/MindMap.vue', import.meta.url), 'utf8')
+  assert.doesNotMatch(source, /SopWorkflow|workflow|工作流/)
+  assert.match(source, /@click="view = 'structure'"/)
+  assert.match(source, /@click="view = 'features'"/)
 })
 
 test('old map errors cannot clear a newer successful map', async (t) => {
@@ -388,8 +392,7 @@ test('automatic description status shares the index poll and never invokes the r
   const source = readFileSync(new URL('../src/components/code/MindMap.vue', import.meta.url), 'utf8')
   assert.doesNotMatch(source, /fillBriefs|fillFeatureBriefs|briefButtonLabel|具体业务含义|业务含义/)
   assert.match(source, /class="description-progress"[\s\S]*?role="status"/)
-  assert.match(source, /<template v-if="view !== 'workflow'">\s*<div class="description-progress"/,
-    'automatic progress is visible in structure and feature views')
+  assert.match(source, /<div class="description-progress"/, 'automatic progress stays visible in both map views')
 })
 
 test('unknown, unavailable model, failed, and API errors remain visible instead of claiming descriptions are complete', async t => {

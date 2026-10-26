@@ -1,7 +1,7 @@
 """Persistent project teams and a bounded, cooperative descendant scheduler.
 
 Prompts describe responsibilities; ownership, ancestry, depth, permissions,
-admission and audit identities are enforced here. Merely synchronising a graph
+admission and audit identities are enforced here. Merely inspecting a team
 creates session metadata, never a provider request or a workspace file.
 """
 
@@ -64,9 +64,8 @@ class _Capacity:
 
 
 class ProjectTeam:
-    def __init__(self, manager: Any, workflow_store: Any):
+    def __init__(self, manager: Any):
         self.manager = manager
-        self.workflow_store = workflow_store
         self.db = manager.session_repo.db
         self._lock = threading.RLock()
         self._capacities: dict[str, _Capacity] = {}
@@ -455,7 +454,7 @@ class ProjectTeam:
         if meta.get("project_id") != row["project_id"] or meta.get("tree_id", "main") != row["tree_id"]:
             raise TeamError("智能体会话绑定已改变，请重新打开项目")
         if live and (row["state"] == "retired" or meta.get("status") != "active"):
-            raise TeamError("智能体已退出工作流，不能执行或委派任务")
+            raise TeamError("智能体已退役，不能执行或委派任务")
         if row["role"] == "lead" and (row["parent_session_id"] or row["lead_session_id"] != session_id):
             raise TeamError("主智能体会话归属无效")
         if live and row["role"] != "lead":
@@ -643,7 +642,7 @@ class ProjectTeam:
             workspace = str(self.manager.workspace_for(parent_meta))
             task_id = str(parent_meta.get("task_id") or "")
             mode = parent_meta.get("permission_mode") or "workspace-write"
-            # Main-tree node grants follow Lead by policy, even if their saved
+            # Main-tree child grants follow Lead by policy, even if their saved
             # initial configuration predates a later Lead grant. Copy the
             # configured ancestor grant, never a temporary runtime clamp.
             ancestor = self._row(parent["parent_session_id"])
@@ -657,14 +656,6 @@ class ProjectTeam:
         )
         return self._insert(meta, parent=parent["session_id"], lead=parent["lead_session_id"], role=role,
                             depth=parent["depth"] + 1, title=title, node_id=node_id)
-
-    def validate_tree(self, project_id: str, user_id: str, tree: str = "main") -> dict:
-        """Check ownership and workspace before committing a workflow revision."""
-        with self._lock:
-            project = self._owned_project(project_id, user_id)
-            lead = self._lead(project_id, user_id)
-            workspace, task_id = self._tree_workspace(project, tree, lead)
-            return {"tree_id": tree, "task_id": task_id, "workspace": workspace, "lead_session_id": lead["session_id"]}
 
     def sync(self, project_id: str, user_id: str, tree: str = "main", conversation_id: str = "") -> dict:
         """Expose only tasks created on demand for the selected conversation."""
@@ -681,7 +672,6 @@ class ProjectTeam:
                 lead = self._lead(project_id, user_id)
             self._tree_workspace(project, tree, lead)
             # Legacy fixed-stage owners are retired, with transcripts retained.
-            # Saving or reading a workflow never creates another agent.
             legacy = self.db.query_all("SELECT session_id FROM project_agents WHERE project_id=? AND lead_session_id=? AND role='node' AND state!='retired'",
                                        (project_id, lead["session_id"]))
             for old in legacy:
@@ -750,13 +740,12 @@ class ProjectTeam:
         snapshot["lead"] = {key: snapshot["lead"][key] for key in ("session_id", "title", "role", "depth")} if snapshot["lead"] else None
         return snapshot
 
-    async def start(self, caller_session_id: str, user_id: str, prompt: str, *, node_id: str = "", parent_id: str = "",
+    async def start(self, caller_session_id: str, user_id: str, prompt: str, *, parent_id: str = "",
                     title: str = "", tree: str | None = None, context_strategy: str = "task_brief", budget: dict | None = None,
                     write_paths: list[str] | None = None, delegation_reason: str = "", depends_on: list[str] | None = None) -> dict:
         if self._closed:
             raise TeamError("智能体调度器已关闭")
         prompt = _string(prompt, "任务指令")
-        node_id = _string(node_id, "节点 ID", required=False, limit=64)
         parent_id = _string(parent_id, "父智能体 ID", required=False, limit=64)
         title = _string(title, "任务标题", required=False, limit=120)
         self._context_strategy(context_strategy)
@@ -766,26 +755,16 @@ class ProjectTeam:
         if caller["role"] != "lead":
             if tree is not None and tree != caller["tree_id"]:
                 raise TeamError("子智能体不能跨工作树委派任务")
-            if node_id or (parent_id and parent_id != caller_session_id):
-                raise TeamError("子智能体只能在自身下面创建子任务，不能接管工作流节点或同级智能体")
+            if parent_id and parent_id != caller_session_id:
+                raise TeamError("子智能体只能在自身下面创建子任务，不能接管同级智能体")
             tree = caller["tree_id"]
             parent = caller
         else:
             tree = tree or "main"
-            if node_id and parent_id:
-                raise TeamError("工作流节点和父智能体只能选择一项")
             parent = self._member(parent_id, user_id) if parent_id else caller
             self._authorize_target(caller, parent, allow_self=True)
             if parent["role"] != "lead":
                 tree = parent["tree_id"]
-        if node_id:
-            # Legacy callers may pass a workflow step as a task brief, but this
-            # no longer preallocates or reuses a persistent stage conversation.
-            document = self.workflow_store.get(project["id"], tree)
-            node = next((item for item in document["nodes"] if item["id"] == node_id), None)
-            if not node:
-                raise TeamError("工作流节点不存在，请先保存该节点")
-            title = title or node["title"]
         if parent["depth"] + 1 > self.limits()["max_depth"]:
             raise TeamError("已达到最大递归深度，不能再创建子智能体")
         workspace, _ = self._tree_workspace(project, tree, self._row(parent["lead_session_id"]))
@@ -1290,7 +1269,7 @@ class ProjectTeam:
                         raise ExecutionBudgetExceeded("等待团队执行名额时，任务或团队总耗时预算已达到上限") from None
                     raise
             # Admission can wait behind other workers for a long time. Changes
-            # to permissions, the workflow or an isolated worktree during that
+            # to permissions or an isolated worktree during that
             # wait must take effect before constructing the actual AgentLoop.
             current = self._member(sid, runtime.user_id)
             if current["activation_id"] != activation or current["state"] != "running":
@@ -1523,7 +1502,7 @@ class ProjectTeam:
                 state = "retired" if retired else "cancelled"
                 if retired or row["state"] in BUSY_STATES:
                     self.db.execute("UPDATE project_agents SET state=?,error=?,updated_at=? WHERE session_id=?",
-                                    (state, "工作流节点已删除" if retired else "执行已停止", _now(), sid))
+                                    (state, "历史阶段智能体已退役" if retired else "执行已停止", _now(), sid))
                     if row["activation_id"]:
                         self.db.execute("UPDATE project_agent_runs SET state='cancelled',error=?,updated_at=? WHERE session_id=? AND activation_id=? AND state IN ('queued','running','waiting')",
                                         ("执行已停止", _now(), sid, row["activation_id"]))
@@ -1576,7 +1555,7 @@ class ProjectTeam:
     def cancel_project(self, project_id: str) -> list[str]:
         """Stop all owned runtimes before a validated project deletion.
 
-        This lifecycle hook deliberately includes the Lead and every workflow
+        This lifecycle hook deliberately includes the Lead and every historical
         tree. Database cascade alone cannot stop tasks which already hold their
         runtime and workspace in memory. Caller performs project ownership and
         deletion validation before using this trusted hook.
@@ -1880,7 +1859,7 @@ class ProjectTeam:
                 "使用当前实际可用的工具，遵守会话当前权限、项目写入开关、工作树与文件边界；角色说明不授予额外权限，不自动提升任何保存权限。"
                 "只读和规划阶段继续只读，遇到需要审批的操作由实际执行者申请，不能通过委派或切换角色绕过底层限制。\n"
                 "复杂任务或存在可独立推进、责任范围不同的并行工作时再拆分；用 delegate_agent 按需创建后台子智能体，"
-                "委派明确的目标、输入、负责的文件范围、产出与验证标准，不要求固定 node_id，也不把工作流阶段当作派工前置条件。"
+                "委派明确的目标、输入、负责的文件范围、产出与验证标准，按实际任务创建后台子智能体。"
                 "派工前确认三点：能独立交付、写入责任能分开、并行节省时间超过交接与合并成本；每次填写 delegation_reason 说明收益。"
                 "write_paths=[] 表示只读；具体文件是唯一写入责任，目录用末尾 /，['.'] 表示整个工作区独占。"
                 "后台只读或限定文件任务不能执行任意 Shell/未知副作用工具，测试可由你在整合后统一运行，或安排全工作区执行者。"
@@ -1898,19 +1877,14 @@ class ProjectTeam:
                 "验证收据应包含工作目录、实际退出码和关键输出；记录缺失或截断时如实说明，不能把节点自述、源码推断或历史其他批次成功说成本次测试通过。"
                 "子任务完成后在当前对话整合结果并交付，不要求用户转到子任务对话收取产出。完成通知本身不等于测试通过；"
                 "如需正式记录接受或驳回，可按精确 activation_id 调用 audit_agent，它不是普通交付的必经步骤，也不需要额外派出审计智能体。"
-                "没有所需验证证据时如实说明并补充必要检查；不得把模型完成报告当成工作流节点已验收，节点进度仍遵守工作流约束。"
+                "没有所需验证证据时如实说明并补充必要检查，不把模型完成报告代替实际验证。"
             ) + summary
         detail = ""
         if (meta or self.manager.session_repo.get(runtime.session_id) or {}).get("kind") == "planner":
             detail = "\n当前是只读规划阶段：只读取事实并产出计划，不修改文件、提交代码或执行会写入项目的命令。委派的后代同样继承只读权限；计划获批准后才由隔离任务智能体实施。"
-        if row["node_id"]:
-            document = self.workflow_store.get(row["project_id"], row["tree_id"])
-            node = next((item for item in document["nodes"] if item["id"] == row["node_id"]), None)
-            if node:
-                detail = "\n" + wrap_untrusted(json.dumps({key: node[key] for key in ("id", "type", "title", "objective", "deliverable", "acceptance", "status")}, ensure_ascii=False), "负责的工作流节点资料")
         return header + (
             f"你负责父智能体 {row['parent_session_id']} 委派的后台任务；所属主对话是 {row['lead_session_id']}。"
-            "以执行和交付为优先，只完成当前节点/任务的责任范围，遵守继承的工作树、权限和文件边界。简单、连续的步骤由自己完成并运行相关验证；"
+            "以执行和交付为优先，只完成当前任务的责任范围，遵守继承的工作树、权限和文件边界。简单、连续的步骤由自己完成并运行相关验证；"
             "复杂或可独立推进、责任范围不同的子任务才通过 delegate_agent 分给后代，不为每个步骤重复派工；"
             "派工须填写 write_paths 与 delegation_reason，后代写入范围不能超出你本轮范围；同文件工作优先复用现有执行者，依赖用 depends_on 明确。"
             "等待子任务或审批时会交还文件持有权，恢复前重新排队；只读或限定文件任务使用原生工具，Shell验证交主代理或全工作区执行者。"
@@ -1919,7 +1893,7 @@ class ProjectTeam:
             "需要补证时用 read_agent_execution 按精确 activation_id 读取后代真实执行轨迹，不把自述当成验证。"
             "向自己的后代补充信息用 send_agent_message，继续派工用 followup_agent；只中断当前轮次用 interrupt_agent，停止整棵树用 stop_agent。"
             "最终向父级提供改动、工作目录、实际退出码和关键验证输出、实际产出及未解决问题，由所属主对话汇总交付；不要求用户切换到本智能体聊天。"
-            "不得自行宣称 Lead 已接受结果，也不能擅自标记节点验收完成。" + detail + self._result_context(row)
+            "不得自行宣称 Lead 已接受结果。" + detail + self._result_context(row)
         ) + self._scope_context(row)
 
     def _result_context(self, caller: dict) -> str:

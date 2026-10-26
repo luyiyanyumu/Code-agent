@@ -267,6 +267,21 @@ def test_scheduler_recurring_advances(db, manager):
     assert after["last_run_at"] is not None
 
 
+@pytest.mark.parametrize("prompt", ["完成一个普通任务", "# 检查\n读取数据\n---step---\n# 交付\n给出结论"])
+def test_automation_submits_entire_prompt_once_without_step_orchestration(db, manager, prompt):
+    uid = _make_user(db, "single_auto")
+    manager.router.provider_override = RecordingProvider([OfflineProvider.text_turn("任务已完成")])
+    result = asyncio.run(manager.run_automation(uid, "普通任务", prompt))
+    assert result.text == "任务已完成"
+    sessions = db.query_all("SELECT id,status FROM sessions WHERE user_id=?", (uid,))
+    assert len(sessions) == 1 and sessions[0]["status"] == "closed"
+    runtime = manager._runtimes[sessions[0]["id"]]
+    assert runtime.strict is True
+    prompts = [event.payload["text"] for event in runtime.transcript.replay(runtime.session_id) if event.type == "user_message"]
+    assert prompts == [prompt]
+    assert UsageRepo(db).summary_for_user(uid)["prompts"] == 1
+
+
 def test_scheduler_recurring_bad_rrule_pauses(db):
     uid = _make_user(db, "u_x")
     repo = _automation_db(db)

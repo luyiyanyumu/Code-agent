@@ -4,7 +4,7 @@
 
 ## 委派与继续
 
-- `delegate_agent` 按需创建子任务；必填 `prompt`、`write_paths` 和 `delegation_reason`。理由需说明独立交付物与并行收益；创建智能体不是默认步骤。旧工作流节点提示只用于任务背景，不会接管或自动运行保存的节点。
+- `delegate_agent` 按需创建子任务；必填 `prompt`、`write_paths` 和 `delegation_reason`。理由需说明独立交付物与并行收益；创建智能体不是默认步骤。
 - `send_agent_message` 将补充消息持久化到目标收件箱，不启动空闲智能体。繁忙智能体在下一次模型调用前接收消息。
 - `followup_agent` 复用空闲智能体的会话和工作区，创建新的 `activation_id`，必填 `delegation_reason` 说明复用价值。省略 `write_paths` 时继承上一轮范围；显式 `[]` 改为只读。繁忙目标应先接收消息或中断当前轮次。
 - `interrupt_agent` 中断目标当前轮次，保留后代任务与历史；`stop_agent` 停止目标及整棵后代树。

@@ -12,7 +12,6 @@ from code_agent.agent.project_team import ProjectTeam
 from code_agent.agent.router import ModelRouter
 from code_agent.api.app import build_registry
 from code_agent.api.security import hash_password
-from code_agent.codeintel.sop_workflow import WorkflowStore
 from code_agent.models.events import Event, EventType
 from code_agent.providers.offline import OfflineProvider
 from code_agent.sessions.manager import SessionManager
@@ -39,7 +38,7 @@ def environment(agent_home, monkeypatch):
                              session_repo=SessionRepo(db), approval_repo=ApprovalRepo(db),
                              router=ModelRouter(provider_name="offline"), registry=build_registry(),
                              project_repo=projects)
-    team = ProjectTeam(manager, WorkflowStore(db))
+    team = ProjectTeam(manager)
     manager.agent_team = team
     lead = manager.create_project_session(uid, project["id"], permission_mode="read-only")
     roster = team.sync(project["id"], uid)
@@ -137,14 +136,15 @@ def test_terminal_waiters_are_not_restored(environment, monkeypatch, end):
 @pytest.mark.parametrize("action", ["stop", "interrupt"])
 def test_team_stop_and_interrupt_clear_question_waiters(environment, action):
     manager, team, user, lead, roster = environment
-    child = roster["agents"][0]
+    child = team._create_worker(manager.project_repo.get(roster["lead"]["project_id"]), team._member(lead, user),
+                                tree="main", role="subagent", title="question recovery fixture")
     runtime = manager.get_runtime(child["session_id"], user)
     provider = OfflineProvider(script=[OfflineProvider.tool_call_turn("ask_user_question", {"questions": QUESTIONS})])
     build = runtime._build_loop
     runtime._build_loop = lambda **kwargs: build(**{**kwargs, "provider": provider})
 
     async def scenario():
-        await team.start(lead, user, "fixture stop", node_id=child["node_id"])
+        await team.followup(lead, user, child["session_id"], "fixture stop")
         group = (await wait_for_questions(runtime))[0]
         await getattr(team, action)(lead, user, child["session_id"])
         async with asyncio.timeout(3):
@@ -186,7 +186,8 @@ def test_in_process_legacy_future_can_recover_its_saved_payload(environment):
 
 def test_wait_any_reports_question_attention_and_cursor_changes(environment):
     manager, team, user, lead, roster = environment
-    child = roster["agents"][0]
+    child = team._create_worker(manager.project_repo.get(roster["lead"]["project_id"]), team._member(lead, user),
+                                tree="main", role="subagent", title="question attention fixture")
     runtime = manager.get_runtime(child["session_id"], user)
     provider = OfflineProvider(script=[OfflineProvider.tool_call_turn("ask_user_question", {"questions": QUESTIONS}),
                                        OfflineProvider.text_turn("fixture completed")])
@@ -194,7 +195,7 @@ def test_wait_any_reports_question_attention_and_cursor_changes(environment):
     runtime._build_loop = lambda **kwargs: build(**{**kwargs, "provider": provider})
 
     async def scenario():
-        await team.start(lead, user, "fixture question", node_id=child["node_id"])
+        await team.followup(lead, user, child["session_id"], "fixture question")
         group = (await wait_for_questions(runtime))[0]
         descriptor = team.descriptor(child["session_id"])
         assert descriptor["phase"] == "waiting_question"

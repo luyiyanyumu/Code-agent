@@ -638,7 +638,7 @@ def activate_profile(pid: str) -> dict[str, Any]:
 
 
 # Agent hierarchy limits are enforced by the runtime, independently of prompts.
-# Lead occupies depth 0; workflow node agents begin at depth 1.
+# Lead occupies depth 0; background child tasks begin at depth 1.
 DEFAULT_AGENT_TEAM_CONFIG = {"max_depth": 3, "max_parallel": 4}
 AGENT_TEAM_LIMITS = {"max_depth": (1, 8), "max_parallel": (1, 16)}
 

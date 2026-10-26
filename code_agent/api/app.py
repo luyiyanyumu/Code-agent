@@ -37,7 +37,6 @@ from code_agent.api.change_review_api import mount_change_review_api
 from code_agent.api.runtime_api import mount_runtime_api
 from code_agent.api.debug_api import mount_debug_api
 from code_agent.api.native_dialog_api import mount_native_dialog_api
-from code_agent.api.workflow_api import mount_workflow_api
 from code_agent.api.agent_settings_api import mount_agent_settings_api
 from code_agent.api.agent_team_api import mount_agent_team_api
 from code_agent.agent.project_team import ProjectTeam, TeamError
@@ -48,7 +47,6 @@ from code_agent.api.security import create_token, hash_password, verify_password
 from code_agent.automations import Scheduler, compute_initial_next_run
 from code_agent.codeintel.projects import ProjectService
 from code_agent.codeintel.service import CodeIntelService
-from code_agent.codeintel.sop_workflow import WorkflowStore
 from code_agent.config import (
     code_dir,
     artifacts_dir,
@@ -262,14 +260,6 @@ def _clean_code_context(body: dict[str, Any]) -> dict[str, Any] | None:
         value = str(raw.get(key) or "").strip()
         if value and len(value) <= 400:
             out[key] = value
-    node = raw.get("workflow_node_id")
-    tree = raw.get("workflow_tree_id", "main")
-    if isinstance(node, str) and node.strip() and len(node) <= 64 and isinstance(tree, str):
-        import re
-
-        if re.fullmatch(r"(?:main|task:[A-Za-z0-9_-]{1,96})", tree):
-            out["workflow_node_id"] = node.strip()
-            out["workflow_tree_id"] = tree
     for key in ("test_files", "importers"):
         items = raw.get(key)
         if isinstance(items, list):
@@ -517,8 +507,7 @@ def create_app(provider_name: str | None = None) -> FastAPI:
         project_repo=projects_repo,
         code_intel=code_intel,
     )
-    workflow_store = WorkflowStore(db)
-    project_team = ProjectTeam(manager, workflow_store)
+    project_team = ProjectTeam(manager)
     manager.agent_team = project_team
     register_agent_team_tools(registry, project_team)
     # M18 代码模式：项目服务在代码情报之后（后者已建），这里只做 state 暴露
@@ -631,7 +620,6 @@ def create_app(provider_name: str | None = None) -> FastAPI:
         batch_service=batch_service,
     )
     mount_runtime_api(app, projects_repo)
-    mount_workflow_api(app, service=code_service, store=workflow_store, team=project_team)
     mount_agent_team_api(app, service=code_service, team=project_team)
     mount_agent_settings_api(app)
     mount_native_dialog_api(app)

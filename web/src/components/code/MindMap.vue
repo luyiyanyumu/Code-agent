@@ -1,5 +1,5 @@
 <script setup>
-// 结构树与功能导航共用索引；项目 SOP 工作流独立保存。
+// 结构树与功能导航共用索引。
 //
 // 三个刻意的取舍：
 // 1. **语义缩放而不是图形缩放**：深度滑块换的是"画到哪一层语义"
@@ -13,7 +13,6 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { api } from '../../api.js'
 import { applyDelta, evidenceTokens, kindMeta, layoutFeatureTree, layoutStructure, SOURCE_LABEL } from '../../lib/mapLayout.js'
 import NodeDetail from './NodeDetail.vue'
-import SopWorkflow from './SopWorkflow.vue'
 import { businessEntityId, displayBusiness, BUSINESS_SOURCE_LABEL, BUSINESS_STATUS_LABEL } from '../../lib/businessMeaningDisplay.js'
 import { functionDescriptionPresentation, publishFunctionDescriptions } from '../../lib/functionDescriptions.js'
 
@@ -26,9 +25,8 @@ const props = defineProps({
   // 任务符号级差异（P4）：{ added:[symbol], modified:[...], removed:[...] }
   // 地图叠加层：一眼看清"这次任务动了哪些类/函数"。
   overlay: { type: Object, default: null },
-  agents: { type: Array, default: () => [] },
 })
-const emit = defineEmits(['open-file', 'select', 'ask', 'error', 'agent', 'team-refresh'])
+const emit = defineEmits(['open-file', 'select', 'ask', 'error'])
 
 // ---- P7：覆盖率上地图（三态：直接 / 文件级 / 无）----
 const showCoverage = ref(false)
@@ -355,8 +353,7 @@ const error = ref('')
 const scanning = ref(false)
 const notice = ref('')
 
-const view = ref('structure')          // structure | workflow | features
-const workflowOpened = ref(false)
+const view = ref('structure')          // structure | features
 const depth = ref(2)                   // 1 模块骨架 / 2 顶层符号 / 3 含成员
 /**
  * 视角预设：把"编程到底要关心哪几类东西"变成一键可达。
@@ -950,7 +947,7 @@ async function refresh(full = true) {
 
 /** 轮询变更信号：change_seq 变了才做事（比定时整取地图便宜得多）。 */
 async function poll() {
-  if (!props.projectId || disposed || loading.value || polling || view.value === 'workflow') return
+  if (!props.projectId || disposed || loading.value || polling) return
   const context = captureContext()
   const mine = mapSeq
   const briefRequest = ++briefSeq
@@ -1076,7 +1073,6 @@ watch([() => props.projectId, () => props.tree], () => {
 // 布局
 // ---------------------------------------------------------------------
 function relayout() {
-  if (view.value === 'workflow') return
   if (view.value === 'features') {
     layout.value = featureTree.value
       ? layoutFeatureTree(featureTree.value)
@@ -1110,7 +1106,6 @@ watch([view, query, showHeuristic, showSkipped, onlyChanged], () => {
   relayout()
 })
 watch(view, (v) => {
-  if (v === 'workflow') workflowOpened.value = true
   closeDetail()
   onlyChanged.value = false
   kindPanel.value = false
@@ -1408,10 +1403,9 @@ defineExpose({ refresh, verify, loadMap, poll })
 
 <template>
   <div class="map">
-    <div class="bar" :class="{ 'workflow-bar': view === 'workflow' }">
+    <div class="bar">
       <div class="seg">
         <button :class="{ active: view === 'structure' }" @click="view = 'structure'">结构</button>
-        <button :class="{ active: view === 'workflow' }" @click="view = 'workflow'">工作流</button>
         <button
           :class="{ active: view === 'features' }"
           title="功能视图：这个项目能干什么、干这件事的代码在哪"
@@ -1419,7 +1413,6 @@ defineExpose({ refresh, verify, loadMap, poll })
         >功能</button>
       </div>
 
-      <template v-if="view !== 'workflow'">
       <label v-if="view === 'structure'" class="ctl">
         深度
         <select v-model.number="depth">
@@ -1498,10 +1491,7 @@ defineExpose({ refresh, verify, loadMap, poll })
       >证据</button>
       <button class="ghost" title="复制给模型的紧凑地图" @click="copyDigest">摘要</button>
       </div>
-      </template>
     </div>
-
-    <template v-if="view !== 'workflow'">
     <div class="description-progress" :class="briefPresentation.tone" role="status" :title="briefPresentation.title">
       <span class="description-dot" aria-hidden="true" />
       <span>{{ briefPresentation.label }}</span>
@@ -1770,24 +1760,11 @@ defineExpose({ refresh, verify, loadMap, poll })
         @error="(message) => emit('error', message)"
       />
     </div>
-    </template>
-    <SopWorkflow
-      v-if="workflowOpened"
-      v-show="view === 'workflow'"
-      :project-id="projectId"
-      :tree="tree"
-      :agents="agents"
-      @ask="(text, intent) => emit('ask', text, intent)"
-      @agent="agent => emit('agent', agent)"
-      @team-refresh="payload => emit('team-refresh', payload)"
-      @error="message => emit('error', message)"
-    />
   </div>
 </template>
 
 <style scoped>
 .map { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; height: 100%; position: relative; }
-.bar.workflow-bar { padding: 8px 12px; }
 .bar {
   display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap;
   padding: 10px 12px 0; border-bottom: 1px solid var(--border); font-size: var(--fs-xs); background: var(--panel); flex: none;

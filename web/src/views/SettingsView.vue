@@ -616,7 +616,7 @@ onMounted(() => { if (activeSection.value === 'system') checkService() })
             </section>
             <section v-show="activeSection === 'agents'" aria-label="智能体协作设置">
       <section class="panel team-panel" aria-labelledby="agent-team-title">
-        <div class="section-head"><h3 id="agent-team-title">智能体协作</h3><span class="section-note">项目 Lead · 工作流节点智能体</span></div>
+        <div class="section-head"><h3 id="agent-team-title">智能体协作</h3><span class="section-note">主对话协调 · 后台子任务协作</span></div>
         <div v-if="teamLoading" class="loading-state" role="status">正在加载协作设置…</div>
         <form v-else-if="teamConfig" class="form team-form" novalidate @submit.prevent="saveAgentTeam">
           <fieldset class="form-fields" :disabled="teamSaving || !isAdmin">

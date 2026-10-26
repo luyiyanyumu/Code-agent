@@ -8,7 +8,7 @@ import { eventTime, sessionPresentation, internalMessagePresentation, incomplete
 import { teamNoticePresentation } from '../src/lib/agentTeam.js'
 import { PREFERENCE_DEFAULTS, shouldSendMessage } from '../src/lib/preferences.js'
 async function setup(t) {
-  const props = reactive({ sessionId: 's', fileContext: { path: 'a.py', start_line: 3, end_line: 4 }, codeContext: { path: 'a.py', start: 3, end: 4 }, selectionText: 'return value + 1', pendingPrompt: '', writable: false, workflowNodeId: '', workflowTree: 'main' })
+  const props = reactive({ sessionId: 's', fileContext: { path: 'a.py', start_line: 3, end_line: 4 }, codeContext: { path: 'a.py', start: 3, end: 4 }, selectionText: 'return value + 1', pendingPrompt: '', writable: false })
   const events = [], calls = [], scope = effectScope()
   const session = { timeline: ref([]), busy: ref(false), phase: ref(''), streamState: ref('open'), historyLoading: ref(false), historyError: ref(''), lastStopReason: ref('end_turn'), banner: ref(''), bannerDismissed: ref(false), recoveredThroughSeq: ref(0), submissionError: ref(''), streaming: ref(''), web: ref(false), usage: ref({ input: 0, output: 0, cached: 0 }), teamRevision: ref(0), teamChange: ref(null), refreshApproval: async () => calls.push(['refreshApproval']), load: async () => {}, send: async (...args) => { calls.push(args); return true } }
   const source = (await readFile(new URL('../src/components/code/AiPanel.vue', import.meta.url), 'utf8')).match(/<script setup>([\s\S]*?)<\/script>/)[1].replace(/^import .*\r?\n/gm, '')
@@ -328,7 +328,7 @@ test('a successful proposal refreshes review once and sessions reset deduplicati
   assert.equal(events.filter(([name]) => name === 'review-refresh').length, 2)
 })
 
-test('switching dialogue retains independent composer drafts and workflow handoff stays on the new dialogue', async t => {
+test('switching dialogue retains independent composer drafts and map questions stay on the new dialogue', async t => {
   const { s, props } = await setup(t)
   s.input.value = 'Lead 草稿'
   props.sessionId = 'child'; await nextTick(); assert.equal(s.input.value, '')
@@ -338,14 +338,13 @@ test('switching dialogue retains independent composer drafts and workflow handof
   assert.equal(s.input.value, '节点待分配')
 })
 
-test('node routing identity survives disabled file context and is consumed only after explicit submission', async t => {
+test('submission excludes all removed workflow context even when file context is disabled', async t => {
   const { s, props, calls, events } = await setup(t)
+  // Old persisted properties cannot revive the removed routing feature.
   props.workflowNodeId = 'verification'; props.workflowTree = 'task:42'
-  s.includeContext.value = false; s.input.value = '安排验收'
+  s.includeContext.value = false; s.input.value = '解释当前实现'
   assert.equal(calls.length, 0)
   await s.send()
-  assert.equal(calls[0][1].codeContext.workflow_node_id, 'verification')
-  assert.equal(calls[0][1].codeContext.workflow_tree_id, 'task:42')
-  assert.equal(calls[0][1].codeContext.path, undefined)
+  assert.deepEqual(JSON.parse(JSON.stringify(calls[0][1].codeContext)), {})
   assert.equal(events.some(([name]) => name === 'sent'), true)
 })

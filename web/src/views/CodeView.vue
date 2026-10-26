@@ -124,7 +124,6 @@ const editorToolsTarget = ref(null)
 const treeRef = ref(null)
 const mapRef = ref(null)
 const askPrompt = ref('')
-const pendingAgentNodeId = ref('')
 const pendingWorkItemSession = ref(null)
 const notice = ref('')
 const indexProgress = useIndexRefresh({ client: api.code, onDone: () => {
@@ -213,7 +212,6 @@ function clearProjectState() {
   activeTaskId.value = ''
   taskDiff.value = null
   askPrompt.value = ''
-  pendingAgentNodeId.value = ''
   pendingWorkItemSession.value = null
   notice.value = ''
   fileBusy.value = false
@@ -791,9 +789,8 @@ async function openFile(f, { recordNavigation = true } = {}) {
   }
 }
 
-/** 地图或工作流「交给 AI」：打开助手并准备输入，用户编辑后发送。 */
-function onAsk(text, intent = null) {
-  pendingAgentNodeId.value = intent?.node_id || ''
+/** 地图「交给 AI」：打开助手并准备输入，用户编辑后发送。 */
+function onAsk(text) {
   centerView.value = 'map'
   rightVisible.value = true
   rightTab.value = 'ai'
@@ -836,7 +833,6 @@ function showAssistantPanel() {
 }
 function onDesignAsk(text) {
   if (!project.value || typeof text !== 'string' || !text.trim()) return
-  pendingAgentNodeId.value = ''
   pendingWorkItemSession.value = null
   designAiResult.value = null
   centerView.value = 'design'
@@ -857,21 +853,16 @@ function onDesignSaved(result) {
   notice.value = '前端样式已保存到项目'
 }
 
-function selectAgent(id) {
-  // Legacy workflow links reveal background progress without changing drafts.
-  rightVisible.value = true; rightTab.value = 'ai'; mobilePanel.value = 'assistant'
-  void agentTeam.refresh()
-}
-function returnLead() { conversations.returnLead(); pendingWorkItemSession.value = null; pendingAgentNodeId.value = ''; askPrompt.value = '' }
+function returnLead() { conversations.returnLead(); pendingWorkItemSession.value = null; askPrompt.value = '' }
 function selectConversation(id) {
   if (!conversations.select(id)) return
-  pendingWorkItemSession.value = null; pendingAgentNodeId.value = ''; askPrompt.value = ''
+  pendingWorkItemSession.value = null; askPrompt.value = ''
 }
 async function createConversation() {
   if (activeTree.value !== 'main') return
   const result = await conversations.create()
   if (!result || conversations.activeRootId.value !== result.id) return
-  pendingWorkItemSession.value = null; pendingAgentNodeId.value = ''; askPrompt.value = ''
+  pendingWorkItemSession.value = null; askPrompt.value = ''
 }
 async function deleteConversation(id) {
   const item = conversations.conversations.value.find(item => item.id === id)
@@ -897,7 +888,7 @@ async function openWorkItemAgent({ sessionId, tree = 'main' }) {
   activeTree.value = tree
   activeTaskId.value = tree.startsWith('task:') ? tree.slice(5) : ''
   taskDiff.value = null
-  pendingAgentNodeId.value = ''; askPrompt.value = ''
+  askPrompt.value = ''
   rightVisible.value = true; rightTab.value = 'ai'; mobilePanel.value = 'assistant'
   await nextTick()
   await agentTeam.refresh()
@@ -914,20 +905,6 @@ function onTeamRefresh(change) {
   if (change) agentTeam.notify(change)
   else void agentTeam.refresh()
   taskPanel.value?.notify?.(change || {})
-}
-async function onWorkflowAgent(agent) {
-  if (agent?.session_id) selectAgent(agent.session_id)
-  else {
-    const pid = project.value?.id, tree = activeTree.value
-    await agentTeam.refresh()
-    if (disposed || project.value?.id !== pid || activeTree.value !== tree) return
-    const assigned = agentTeam.assignments.value.get(agent?.node_id)
-    if (assigned) selectAgent(assigned.session_id)
-  }
-}
-function refreshAgentTeam(payload) {
-  if (payload?.project_id && (payload.project_id !== project.value?.id || payload.tree_id !== activeTree.value)) return
-  void agentTeam.refresh()
 }
 
 /** 导图里选中的符号：用于把"当前坐标"随消息发给 AI */
@@ -1208,7 +1185,7 @@ watch(() => props.visible, active => {
   void refreshDiagnostics()
   void functionDescriptions.refresh(project.value.id)
 })
-watch(activeTree, () => { askPrompt.value = ''; pendingAgentNodeId.value = '' })
+watch(activeTree, () => { askPrompt.value = '' })
 watch(rightTab, tab => { rightActivated.value = new Set([...rightActivated.value, tab]) })
 watch(centerView, (view) => {
   if (view === 'map') mapActivated.value = true
@@ -1314,12 +1291,9 @@ onBeforeUnmount(() => {
           :tree="activeTree"
           :diagnostics="diagnostics"
           :overlay="taskDiff"
-          :agents="agentTeam.team.value?.agents || []"
           @open-file="openFile"
           @select="onSelectNode"
           @ask="onAsk"
-          @agent="onWorkflowAgent"
-          @team-refresh="refreshAgentTeam"
           @error="(m) => (banner = m)"
         />
         <FrontendDesign
@@ -1420,16 +1394,13 @@ onBeforeUnmount(() => {
           :team-loading="agentTeam.loading.value"
           :team-error="agentTeam.error.value"
           :team-acting="agentTeam.acting.value"
-          :workflow-node-id="pendingAgentNodeId"
-          :workflow-tree="activeTree"
           @conversation-select="selectConversation"
           @conversation-create="createConversation"
           @conversation-delete="deleteConversation"
           @conversation-refresh="conversations.refresh()"
           @team-refresh="onTeamRefresh"
           @agent-stop="id => agentTeam.action(id, 'stop')"
-          @clear-node-intent="pendingAgentNodeId = ''"
-          @sent="pendingAgentNodeId = ''; agentTeam.refresh(); conversations.refresh()"
+          @sent="agentTeam.refresh(); conversations.refresh()"
           @clear-context="contextEnabled = false"
           @consume-prompt="askPrompt = ''"
           @open-review="rightTab = 'changes'"

@@ -10,7 +10,6 @@ import pytest
 
 from code_agent.agent.project_team import ProjectTeam
 from code_agent.agent.router import ModelRouter
-from code_agent.codeintel.sop_workflow import WorkflowStore
 from code_agent.models.events import EventType, ModelTurn, TokenUsage, ToolCall
 from code_agent.providers.offline import OfflineProvider
 from code_agent.sessions.manager import SessionManager
@@ -40,7 +39,7 @@ def budget_runtime(agent_home, monkeypatch):
     manager = SessionManager(transcript=TranscriptStore(agent_home / "transcripts"), session_repo=SessionRepo(db),
                              approval_repo=ApprovalRepo(db), router=ModelRouter(provider_name="offline"),
                              registry=registry, project_repo=projects)
-    team = ProjectTeam(manager, WorkflowStore(db))
+    team = ProjectTeam(manager)
     manager.agent_team = team
     lead = manager.create_project_session(user, project["id"], permission_mode="full-access")["id"]
     roster = team.sync(project["id"], user)
@@ -81,10 +80,10 @@ class HeldParent(OfflineProvider):
         return await super().chat(messages, tools)
 
 
-async def start(e, worker, provider, *, budget=None):
+async def start(e, worker, provider, *, budget=None, prompt="offline bounded task", write_paths=None):
     runtime = e.manager.get_runtime(worker["session_id"], e.user)
     assign(runtime, provider)
-    record = await e.team.followup(e.lead, e.user, worker["session_id"], "offline bounded task", budget=budget)
+    record = await e.team.followup(e.lead, e.user, worker["session_id"], prompt, budget=budget, write_paths=write_paths)
     return runtime, e.team._starts[record["session_id"]]
 
 
@@ -203,7 +202,9 @@ def test_time_budget_cancels_pending_approval_and_cannot_write_after_expiry(budg
                       usage=TokenUsage(input_tokens=4, output_tokens=2, cached_tokens=1)),
             returned("must not request", 1),
         ])
-        runtime, task = await start(e, e.workers[0], provider, budget={"max_seconds": 1})
+        runtime, task = await start(e, e.workers[0], provider, budget={"max_seconds": 1},
+                                    prompt="Create expired.txt with the fixture text after permission is approved",
+                                    write_paths=["expired.txt"])
         async with asyncio.timeout(2):
             while runtime.pending_approval() is None:
                 await asyncio.sleep(0.005)

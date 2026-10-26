@@ -88,7 +88,7 @@ test('opening an editor project checks automatic functionality progress without 
   } finally { await view.dispose() }
 })
 
-test('workflow AI handoff opens the assistant and prepares a prompt without sending', async () => {
+test('map AI handoff opens the assistant and prepares a prompt without sending', async () => {
   const view = await component('../src/views/CodeView.vue', { user: { id: 1 } }, apiFor(), viewExports + ', onAsk, rightVisible, rightTab, mobilePanel, askPrompt, notice')
   try {
     const s = view.subject
@@ -100,6 +100,8 @@ test('workflow AI handoff opens the assistant and prepares a prompt without send
     assert.equal(s.mobilePanel.value, 'assistant')
     assert.equal(s.askPrompt.value, '需求确认：输出需求清单')
     assert.match(s.notice.value, /编辑后发送/)
+    const source = await readFile(new URL('../src/views/CodeView.vue', import.meta.url), 'utf8')
+    assert.doesNotMatch(source, /workflow|Workflow|pendingAgentNodeId|clear-node-intent/)
   } finally { await view.dispose() }
 })
 
@@ -178,15 +180,13 @@ test('design mode ignores an empty or explicitly unavailable project without cha
 })
 
 test('design handoff stays on its canvas, prepares the existing Lead composer, and rejects another session result', async () => {
-  const view = await component('../src/views/CodeView.vue', { user: { id: 1 } }, apiFor(), viewExports + ', onDesignAsk, onDesignResult, openFrontendDesign, designAiResult, designActivated, designAssistantVisible, centerView, askPrompt, rightShown, pendingAgentNodeId')
+  const view = await component('../src/views/CodeView.vue', { user: { id: 1 } }, apiFor(), viewExports + ', onDesignAsk, onDesignResult, openFrontendDesign, designAiResult, designActivated, designAssistantVisible, centerView, askPrompt, rightShown')
   try {
     const s = view.subject
     await s.selectProject(project('design-main')); await nextTick()
     s.openFrontendDesign()
-    s.pendingAgentNodeId.value = 'requirements'
     s.onDesignAsk('只设计当前选中标题的样式，请返回 frontend-style JSON')
     assert.equal(s.centerView.value, 'design')
-    assert.equal(s.pendingAgentNodeId.value, '')
     assert.equal(s.rightShown.value, true)
     assert.equal(s.designAssistantVisible.value, true)
     assert.match(s.askPrompt.value, /frontend-style JSON/)
@@ -201,16 +201,15 @@ test('design handoff stays on its canvas, prepares the existing Lead composer, a
   } finally { await view.dispose() }
 })
 
-test('workflow intent stays on its root dialogue and never selects a worker composer', async () => {
-  const view = await component('../src/views/CodeView.vue', { user: { id: 1 } }, apiFor(), viewExports + ', onAsk, agentTeam, pendingAgentNodeId')
+test('map questions stay on the root dialogue and never select a worker composer', async () => {
+  const view = await component('../src/views/CodeView.vue', { user: { id: 1 } }, apiFor(), viewExports + ', onAsk, agentTeam')
   try {
     const s = view.subject
     await s.selectProject(project('current')); await nextTick()
     s.agentTeam.team.value = { lead: { session_id: 'session-current', role: 'lead' }, agents: [{ session_id: 'worker-current', parent_session_id: 'session-current', role: 'node', node_id: 'requirements', state: 'idle' }] }
     assert.equal(s.agentTeam.select('worker-current'), false)
-    s.onAsk('节点需求确认', { node_id: 'requirements', tree_id: 'main' })
+    s.onAsk('解释所选代码及其依赖')
     assert.equal(s.agentTeam.sessionId.value, 'session-current')
-    assert.equal(s.pendingAgentNodeId.value, 'requirements')
     assert.equal(s.session.value.id, 'session-current', 'save/editor identity remains permanent Lead')
   } finally { await view.dispose() }
 })
@@ -220,18 +219,18 @@ const fileApi = (overrides = {}) => apiFor({
   ...overrides,
 })
 
-test('new project dialogue preserves dirty editor identity, keeps workflow on its current root, and stays outside task trees', async () => {
+test('new project dialogue preserves dirty editor identity, keeps map questions on its current root, and stays outside task trees', async () => {
   const creates = [], view = await component('../src/views/CodeView.vue', { user: { id: 'dialogue-owner' } }, fileApi({
     conversations: async pid => ({ default_session_id: `session-${pid}`, conversations: [{ id: `session-${pid}`, kind: 'code' }, ...creates.filter(([createdPid]) => createdPid === pid).map(() => ({ id: `${pid}-chat`, title: '新对话1', kind: 'chat' }))] }),
     createConversation: async (pid, payload) => { creates.push([pid, payload]); return { id: `${pid}-chat`, title: '新对话1', kind: 'chat', permission_mode: 'read-only', effective_permission: 'read-only' } },
-  }), viewExports + ', conversations, createConversation, selectConversation, selectAgent, agentTeam, aiSessionId, onAsk, pendingAgentNodeId')
+  }), viewExports + ', conversations, createConversation, selectConversation, agentTeam, aiSessionId, onAsk')
   try {
     const s = view.subject
     await s.selectProject(project('dialogue')); await nextTick(); await new Promise(setImmediate)
     await s.openFile({ path: 'draft.py' }); s.onEditorChange({ key: s.file.value.key, text: 'unsaved editor content' })
     const key = s.workbench.activeKey.value
     s.agentTeam.team.value = { lead: { session_id: 'session-dialogue' }, agents: [{ session_id: 'dialogue-worker', role: 'node' }] }
-    s.selectAgent('dialogue-worker')
+    assert.equal(s.agentTeam.select('dialogue-worker'), false)
     await s.createConversation(); await nextTick()
     assert.deepEqual(JSON.parse(JSON.stringify(creates)), [['dialogue', { from_session_id: 'session-dialogue' }]])
     assert.equal(s.aiSessionId.value, 'dialogue-chat')
@@ -239,8 +238,8 @@ test('new project dialogue preserves dirty editor identity, keeps workflow on it
     assert.equal(s.workbench.activeKey.value, key)
     assert.equal(s.documents.value.find(doc => doc.key === key).text, 'unsaved editor content')
     assert.equal(s.documents.value.find(doc => doc.key === key).dirty, true)
-    s.onAsk('工作流需求', { node_id: 'requirements' })
-    assert.equal(s.aiSessionId.value, 'dialogue-chat'); assert.equal(s.pendingAgentNodeId.value, 'requirements')
+    s.onAsk('解释当前地图节点')
+    assert.equal(s.aiSessionId.value, 'dialogue-chat')
     s.selectConversation('dialogue-chat'); assert.equal(s.aiSessionId.value, 'dialogue-chat')
     s.activeTree.value = 'task:123'; await nextTick()
     assert.equal(s.conversations.isChat.value, false)

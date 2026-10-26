@@ -34,8 +34,6 @@ const props = defineProps({
   teamLoading: { type: Boolean, default: false },
   teamError: { type: String, default: '' },
   teamActing: { type: String, default: '' },
-  workflowNodeId: { type: String, default: '' },
-  workflowTree: { type: String, default: 'main' },
   visible: { type: Boolean, default: true },
   projectChat: { type: Boolean, default: false },
   draftScope: { type: String, default: '' },
@@ -47,7 +45,7 @@ const props = defineProps({
   conversationLoading: { type: Boolean, default: false },
   conversationError: { type: String, default: '' },
 })
-const emit = defineEmits(['clear-context', 'clear-node-intent', 'consume-prompt', 'open-review', 'review-refresh', 'team-refresh', 'agent-stop', 'sent', 'assistant-complete', 'conversation-select', 'conversation-create', 'conversation-delete', 'conversation-refresh'])
+const emit = defineEmits(['clear-context', 'consume-prompt', 'open-review', 'review-refresh', 'team-refresh', 'agent-stop', 'sent', 'assistant-complete', 'conversation-select', 'conversation-create', 'conversation-delete', 'conversation-refresh'])
 
 const s = useAgentSession()
 const input = ref('')
@@ -194,7 +192,6 @@ watch(cards, list => {
 watch(() => props.sessionId, () => { seenProposals = new Set() })
 function prepareAction(action) {
   if (!props.fileContext) return
-  emit('clear-node-intent')
   const location = `${props.fileContext.path}:${props.codeContext?.start || props.fileContext.start_line || 1}-${props.codeContext?.end || props.fileContext.end_line || 1}`
   const selected = props.selectionText ? `\n当前选中片段：\n${props.selectionText}\n` : ''
   const request = action === 'explain' ? `解释 ${location} 的逻辑、调用关系和潜在问题，引用项目内的文件与行号。` : action === 'tests' ? `为 ${location} 生成有意义的测试，沿用项目已有测试框架。` : `优化 ${location} 的逻辑，先说明问题与改法。`
@@ -312,8 +309,7 @@ async function send() {
   // 结构坐标随消息发给服务端：由它从符号索引渲染成事实块（只进模型 prompt，
   // 展示文本仍是用户原文）。这样模型看到的是"文件:行 + 签名 + 被谁引用"，
   // 而不是让模型自己去猜用户在指什么。
-  const ctx = { ...(includeContext.value ? props.codeContext || {} : {}), workflow_tree_id: props.workflowTree }
-  if (props.workflowNodeId) ctx.workflow_node_id = props.workflowNodeId
+  const ctx = includeContext.value ? { ...props.codeContext } : {}
   // 联网开关也跟着走（M19）：关着时后端不会把 web_search/web_fetch 暴露给模型
   const sent = await s.send(text, { codeContext: ctx, web: s.web.value })
   if (sent && props.sessionId === sessionId) emit('sent')
@@ -443,7 +439,6 @@ const STATE_LABEL = { running: '执行中', ok: '完成', denied: '被拒绝', e
       <div v-if="s.approvalError?.value" class="question-error-notice" role="alert">{{ s.approvalError.value }}<button class="ghost" @click="refreshApprovals">重新核对审批</button></div>
 
       <div v-show="!s.approval.value && !pendingQuestions.length" class="composer">
-        <div v-if="workflowNodeId" class="workflow-intent"><UiIcon name="git-branch" :size="12" />当前工作流节点上下文<button aria-label="清除工作流节点上下文" @click="emit('clear-node-intent')"><UiIcon name="close" :size="11" /></button></div>
         <div v-if="fileContext" class="code-actions"><button :disabled="s.busy.value" @click="prepareAction('explain')">解释代码</button><button :disabled="s.busy.value" @click="prepareAction('modify')">提出修改</button><button :disabled="s.busy.value" @click="prepareAction('tests')">生成测试</button><span v-if="selectionText" class="muted">已选中代码</span></div>
         <div v-if="fileContext" class="ctx">
           <label class="ctx-label">
@@ -500,8 +495,6 @@ const STATE_LABEL = { running: '执行中', ok: '完成', denied: '被拒绝', e
 .has-approval .conversation-body > :deep(.approval-request) { flex: 1 1 0%; min-height: 0; max-height: none; max-width: none; }
 .has-approval .banner { flex: 0 1 auto; min-height: 0; max-height: 15%; overflow: auto; }
 .session-usage { flex: none; padding: 5px 14px; color: var(--muted); font-size: var(--fs-2xs); border-bottom: 1px solid var(--border); }.team-receipt { border: 1px solid var(--border); border-radius: 6px; background: var(--panel-soft); padding: 9px; font-size: var(--fs-xs); }.team-receipt header { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; color: var(--muted); }.team-receipt header strong { color: var(--text); }.team-receipt header button { margin-left: auto; color: var(--accent); font-size: var(--fs-2xs); }.team-receipt summary { margin-top: 6px; cursor: pointer; color: var(--accent); }.team-receipt p { margin: 7px 0; white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.7; }.team-receipt small { display: block; margin-top: 6px; color: var(--muted); font-size: var(--fs-2xs); }
-.workflow-intent { display: flex; align-items: center; gap: 6px; color: var(--accent); font-size: 10px; padding-bottom: 7px; }
-.workflow-intent button { display: grid; place-items: center; margin-left: auto; border: 0; padding: 2px; background: transparent; color: var(--muted); }
 .head { display: flex; align-items: center; gap: 8px; min-height: 43px; flex: none; padding: 7px 14px; font-size: var(--fs-sm); }
 .head .assistant-icon { display: grid; place-items: center; width: 25px; height: 25px; color: var(--accent); background: var(--accent-soft); border-radius: 6px; flex: none; }
 .title { font-weight: var(--fw-semibold); white-space: nowrap; }.spacer { flex: 1; min-width: 0; }

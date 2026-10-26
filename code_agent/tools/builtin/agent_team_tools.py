@@ -279,7 +279,6 @@ class DelegateAgentTool(_TeamTool):
         "Provide prompt, explicit write_paths and delegation_reason; overlapping declared write scopes queue instead of running together. "
         "Create a background child task under the current conversation; workers create descendants only. "
         "The main assistant owns the user-facing conversation and integrates child results. "
-        "Legacy saved workflow nodes may be addressed via node_id only when explicitly required. "
         "Returns immediately with a persistent session_id and activation_id. Creating/delegating does not mean completion. "
         "Depth and project-wide descendant parallelism are enforced by the runtime."
     )
@@ -290,7 +289,6 @@ class DelegateAgentTool(_TeamTool):
             "write_paths": _WRITE_PATHS_SCHEMA,
             "delegation_reason": _REASON_SCHEMA,
             "depends_on": _DEPENDS_SCHEMA,
-            "node_id": {"type": "string", "maxLength": 64},
             "parent_session_id": {"type": "string", "maxLength": 64, "description": "Lead may choose an existing descendant parent; workers can only choose themselves."},
             "title": {"type": "string", "maxLength": 120},
             "tree": {"type": "string", "maxLength": 101},
@@ -301,10 +299,10 @@ class DelegateAgentTool(_TeamTool):
     }
 
     async def perform(self, arguments: dict, ctx: ToolContext) -> dict:
-        args = _object(arguments, {"prompt", "node_id", "parent_session_id", "title", "tree", "context_strategy", "budget", "write_paths", "delegation_reason", "depends_on"})
+        args = _object(arguments, {"prompt", "parent_session_id", "title", "tree", "context_strategy", "budget", "write_paths", "delegation_reason", "depends_on"})
         return await self.team.start(
             ctx.session_id, ctx.user_id, _text(args, "prompt", required=True),
-            node_id=_text(args, "node_id", limit=64), parent_id=_text(args, "parent_session_id", limit=64),
+            parent_id=_text(args, "parent_session_id", limit=64),
             title=_text(args, "title", limit=120), tree=_text(args, "tree", limit=101) or None,
             context_strategy=args.get("context_strategy", "task_brief"),
             budget=args.get("budget"),
@@ -416,9 +414,9 @@ class AuditAgentTool(_TeamTool):
     description = (
         "Lead only: accept or reject a completed descendant's exact activation_id with concrete evidence or a rejection reason. "
         "A completion report is not proof; inspect changes and verification first. Stale run ids cannot approve newer output. "
-        "This records an audit decision and does not mark a workflow node done, merge code or publish."
+        "This records an audit decision and does not merge code or publish."
     )
-    description_zh = "Lead 按执行编号核对证据并接受或驳回产出，审计结果独立于工作流进度。"
+    description_zh = "Lead 按执行编号核对证据并接受或驳回产出。"
     parameters = {"type": "object", "properties": {
         "session_id": {"type": "string", "minLength": 1, "maxLength": 64},
         "activation_id": {"type": "integer", "minimum": 1, "maximum": 2**63 - 1},

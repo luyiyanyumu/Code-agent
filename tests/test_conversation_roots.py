@@ -76,7 +76,7 @@ def test_multiple_root_sql_uniqueness_and_repeated_team_initialization_are_idemp
     assert bindings(e, all_ids) == before
 
     for _ in range(3):
-        e.team = ProjectTeam(e.manager, e.store)
+        e.team = ProjectTeam(e.manager)
         e.manager.team = e.team
         e.team.bind_lead(e.manager.session_repo.get(canonical["session_id"]))
         for row in chats:

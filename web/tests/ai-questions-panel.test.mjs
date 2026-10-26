@@ -11,7 +11,7 @@ import { PREFERENCE_DEFAULTS, shouldSendMessage } from '../src/lib/preferences.j
 
 const group = id => ({ id, session_id: 'worker', status: 'pending', questions: [{ id: 'one', question: `问题 ${id}`, options: [{ label: '继续' }] }] })
 async function panel(t) {
-  const props = reactive({ sessionId: 'worker', workflowTree: 'main', writable: true, pendingPrompt: '' }), calls = [], events = [], scope = effectScope()
+  const props = reactive({ sessionId: 'worker', writable: true, pendingPrompt: '' }), calls = [], events = [], scope = effectScope()
   const session = { timeline: ref([]), questions: ref([]), busy: ref(true), phase: ref('tools'), streamState: ref('open'), historyLoading: ref(false), historyError: ref(''), banner: ref(''), streaming: ref(''), web: ref(false), usage: ref({}), questionSubmitting: ref(''), questionError: ref(''),
     load: async () => { session.questionError.value = '' }, send: async () => true, answerQuestions: async (...args) => calls.push(['answer', ...args]), dismissQuestions: async (...args) => calls.push(['dismiss', ...args]) }
   session.pendingQuestions = computed(() => session.questions.value.filter(value => value.status === 'pending'))

@@ -6,7 +6,6 @@ import pytest
 
 from code_agent.agent.project_team import ProjectTeam
 from code_agent.agent.router import ModelRouter
-from code_agent.codeintel.sop_workflow import WorkflowStore
 from code_agent.providers.offline import OfflineProvider
 from code_agent.sessions.manager import SessionManager
 from code_agent.storage.db import ApprovalRepo, Database, ProjectRepo, SessionRepo, TaskRepo, UserRepo
@@ -32,7 +31,7 @@ def test_running_child_rechecks_lead_permission_without_changing_task_tree_polic
         approval_repo=ApprovalRepo(db), router=ModelRouter(provider_name="offline"),
         registry=registry, project_repo=projects,
     )
-    team = ProjectTeam(manager, WorkflowStore(db))
+    team = ProjectTeam(manager)
     manager.agent_team = team
     lead = manager.create_project_session(user_id, project["id"], permission_mode="workspace-write")
     tree = "main"

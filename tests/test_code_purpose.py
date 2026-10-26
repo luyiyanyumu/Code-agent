@@ -286,7 +286,7 @@ def test_class_purpose_says_what_it_is_and_where_it_is_used(env):
 
 
 def test_undocumented_class_leads_with_its_fields(env):
-    """没有 docstring 的类（真机上的 `WorkflowStep`）：字段就是它的含义，别再只说"没有基类"。"""
+    """没有 docstring 的类（真机上的 `TaskSpec`）：字段就是它的含义，别再只说"没有基类"。"""
     out = _purpose(env, "sym:pkg/config.py#Draft")
     assert out["headline"].startswith("类 Draft：字段 title、body"), out["headline"]
     assert "pkg/other.py" in out["headline"]

@@ -158,7 +158,7 @@ def test_team_never_accepts_partial_model_output_as_completed_or_pending_audit(t
         async def handler(*_args):
             return LoopResult(text="partial output, work remains", stop_reason=reason, turns=1, usage=TokenUsage())
         e.manager.handler = handler
-        worker = await e.team.start(lead["session_id"], e.owner, "limited model response", node_id="implementation")
+        worker = await e.team.start(lead["session_id"], e.owner, "limited model response")
         await settled(e, [worker["session_id"]])
         descriptor = e.team.descriptor(worker["session_id"])
         assert descriptor["state"] == "failed" and descriptor["audit"]["decision"] == "none"

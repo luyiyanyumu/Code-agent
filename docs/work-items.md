@@ -20,7 +20,7 @@
 
 ## API 和历史任务
 
-- `GET /api/v1/code/projects/{project_id}/work-items` 聚合团队工作、隔离任务、并行批次。不会执行任务、创建工作流成员或迁移历史会话。批次车道与所属任务的主执行智能体不重复作为顶层任务展示，递归子任务仍可追踪。
+- `GET /api/v1/code/projects/{project_id}/work-items` 聚合团队工作、隔离任务、并行批次，不会执行任务或迁移历史会话。批次车道与所属任务的主执行智能体不重复作为顶层任务展示，递归子任务仍可追踪。
 - `POST /api/v1/code/projects/{project_id}/work-items` 接受 `requirement`、可选 `title` 和 `execution_mode`（`team`、`isolated`、`parallel`）。隔离方式支持 `plan_first`、显式 `git_init` 和手动 `plan`。
 - 现有任务、批次的计划、审查、验证、合并、放弃接口继续兼容，供统一任务详情使用。
 

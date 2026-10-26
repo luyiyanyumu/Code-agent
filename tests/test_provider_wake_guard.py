@@ -8,7 +8,6 @@ import pytest
 
 from code_agent.agent.project_team import ProjectTeam
 from code_agent.agent.router import ModelRouter
-from code_agent.codeintel.sop_workflow import WorkflowStore
 from code_agent.models.events import EventType
 from code_agent.providers.offline import OfflineProvider
 from code_agent.providers.openai_compat import LLMError
@@ -53,7 +52,7 @@ def environment(agent_home, monkeypatch, request):
         root = agent_home / "project"
         root.mkdir()
         project = projects.create(user, "wake-guard", str(root), str(root))
-        team = ProjectTeam(manager, WorkflowStore(db))
+        team = ProjectTeam(manager)
         manager.agent_team = team
         meta = manager.create_project_session(user, project["id"], permission_mode="read-only")
     else:

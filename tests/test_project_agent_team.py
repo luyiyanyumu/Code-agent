@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import copy
 import json
 from types import SimpleNamespace
 
@@ -15,7 +14,6 @@ from code_agent.agent.project_team import ProjectTeam, TeamError
 from code_agent.api.agent_team_api import mount_agent_team_api
 from code_agent.api.deps import CurrentUser, get_current_user
 from code_agent.codeintel.projects import ProjectService
-from code_agent.codeintel.sop_workflow import WorkflowDocument, WorkflowStore, default_workflow
 from code_agent.storage.db import Database, ProjectRepo, SessionRepo, TaskRepo, UserRepo
 from code_agent.tools.base import ToolContext, ToolError
 from code_agent.tools.builtin.agent_team_tools import register_agent_team_tools
@@ -103,23 +101,26 @@ def team_env(tmp_path, monkeypatch):
     stranger = users.create("stranger", "unused")["id"]
     manager = FakeManager(db)
     project = manager.project_repo.create(owner, "project", str(root), str(root))
-    store = WorkflowStore(db)
     limits = {"max_depth": 3, "max_parallel": 2}
     monkeypatch.setattr("code_agent.agent.project_team.settings.agent_team_config", lambda: dict(limits))
     monkeypatch.setattr("code_agent.agent.project_team.settings.permission_mode", lambda: "workspace-write")
-    team = ProjectTeam(manager, store)
+    team = ProjectTeam(manager)
     manager.team = team
     yield SimpleNamespace(root=root, db=db, manager=manager, project=project, pid=project["id"], owner=owner,
-                          stranger=stranger, store=store, team=team, limits=limits, tmp_path=tmp_path)
+                          stranger=stranger, team=team, limits=limits, tmp_path=tmp_path)
     db.close()
 
 
 def nodes(env, tree="main"):
-    """Explicit task fixtures; sync itself must never preallocate workflow agents."""
+    """Independent test identities for permission and scheduler regressions."""
     snapshot = env.team.sync(env.pid, env.owner, tree)
     owners = {row["node_id"]: row for row in snapshot["agents"]
               if row["role"] == "subagent" and row["tree_id"] == tree and row["node_id"]}
-    for node in default_workflow()["nodes"]:
+    tasks = (("requirements", "需求检查"), ("ui_design", "界面检查"), ("architecture", "方案检查"),
+             ("planning", "计划检查"), ("implementation", "实现检查"), ("verification", "测试检查"),
+             ("release", "交付检查"), ("maintenance", "维护检查"))
+    for task_id, title in tasks:
+        node = {"id": task_id, "title": title}
         if node["id"] not in owners:
             owners[node["id"]] = env.team._create_worker(
                 env.project, snapshot["lead"], tree=tree, role="subagent", title=node["title"], node_id=node["id"])
@@ -132,12 +133,6 @@ async def fixture_task(env, caller, user, prompt, *, node_id, tree="main", **kwa
     return await env.team.followup(caller, user, owners[node_id]["session_id"], prompt, **kwargs)
 
 
-def save_nodes(env, document):
-    data = copy.deepcopy(document)
-    data.pop("revision", None)
-    data.pop("updated_at", None)
-    revision = env.store.get(env.pid, "main")["revision"]
-    env.store.save(env.pid, "main", WorkflowDocument.model_validate(data), revision)
 
 
 async def settled(env, session_ids):
@@ -205,46 +200,18 @@ def test_closed_lead_replacement_reparents_existing_node_identity(team_env):
     assert all(row["parent_session_id"] == new_lead["session_id"] for row in new_owners.values())
 
 
-def test_workflow_remove_and_undo_leave_dynamic_tasks_and_history_unchanged(team_env):
-    e = team_env
-    lead, owners = nodes(e)
-    sid = owners["requirements"]["session_id"]
-    runtime = e.manager.get_runtime(sid, e.owner)
-    runtime.prompts.append("existing transcript")
-    original = default_workflow()
-    removed = copy.deepcopy(original)
-    removed["nodes"] = [row for row in removed["nodes"] if row["id"] != "requirements"]
-    removed["edges"] = [row for row in removed["edges"] if "requirements" not in (row["source"], row["target"])]
-    save_nodes(e, removed)
-    e.team.sync(e.pid, e.owner)
-    assert e.team.descriptor(sid)["state"] == "idle"
-    save_nodes(e, original)
-    _, revived = nodes(e)
-    assert revived["requirements"]["session_id"] == sid
-    assert revived["requirements"]["state"] == "idle"
-    assert revived["requirements"]["activation_id"] == owners["requirements"]["activation_id"]
-    assert runtime.prompts == ["existing transcript"]
 
 
-def test_workflow_rename_does_not_rename_or_replace_existing_dynamic_task(team_env):
-    e = team_env
-    _, owners = nodes(e)
-    document = default_workflow()
-    document["nodes"][0]["title"] = "新需求负责人"
-    save_nodes(e, document)
-    _, renamed = nodes(e)
-    assert renamed["requirements"]["session_id"] == owners["requirements"]["session_id"]
-    assert renamed["requirements"]["title"] == owners["requirements"]["title"]
 
 
-def test_legacy_node_hint_starts_independent_tasks_and_reuse_requires_followup(team_env):
+def test_independent_tasks_use_new_identities_and_reuse_requires_followup(team_env):
     e = team_env
     lead = e.team.sync(e.pid, e.owner)["lead"]
 
     async def main():
-        first = await e.team.start(lead["session_id"], e.owner, "first requirement", node_id="requirements")
+        first = await e.team.start(lead["session_id"], e.owner, "first requirement", title="需求检查")
         await settled(e, [first["session_id"]])
-        second = await e.team.start(lead["session_id"], e.owner, "another requirement", node_id="requirements")
+        second = await e.team.start(lead["session_id"], e.owner, "another requirement", title="需求检查")
         await settled(e, [second["session_id"]])
         assert first["session_id"] != second["session_id"]
         assert first["role"] == second["role"] == "subagent"
@@ -282,7 +249,6 @@ def test_delegation_is_nonblocking_and_reports_real_result_with_prompt(team_env)
         notice = e.manager.get_runtime(lead["session_id"], e.owner).notes[0]
         assert notice["activation_id"] == 1
         assert notice["audit_required"] is False and notice["audit_available"] is True
-        assert e.store.get(e.pid, "main")["nodes"][5]["status"] == "pending"
         assert e.db.query_one("SELECT prompt FROM project_agent_runs WHERE session_id=?", (started["session_id"],))["prompt"] == "verify source"
         await e.team.aclose()
 
@@ -412,7 +378,7 @@ def test_foreign_project_owner_ancestor_and_sibling_are_denied(team_env):
 
     async def main():
         with pytest.raises(KeyError):
-            await e.team.start(lead["session_id"], e.stranger, "not mine", node_id="requirements")
+            await e.team.start(lead["session_id"], e.stranger, "not mine")
         with pytest.raises(KeyError):
             await e.team.stop(lead["session_id"], e.owner, foreign["session_id"])
         for target in (lead, owners["verification"]):
@@ -420,8 +386,6 @@ def test_foreign_project_owner_ancestor_and_sibling_are_denied(team_env):
                 await e.team.wait(worker["session_id"], e.owner, [target["session_id"]], 0)
             with pytest.raises(TeamError, match="后代"):
                 await e.team.stop(worker["session_id"], e.owner, target["session_id"])
-        with pytest.raises(TeamError):
-            await e.team.start(worker["session_id"], e.owner, "hijack", node_id="verification")
         with pytest.raises(TeamError):
             await e.team.start(worker["session_id"], e.owner, "hijack", parent_id=lead["session_id"])
         await e.team.aclose()
@@ -559,7 +523,6 @@ def test_audit_requires_lead_completed_exact_activation_and_evidence(team_env):
         assert rejected["audit"]["decision"] == "rejected"
         history = e.db.query_all("SELECT * FROM project_agent_runs WHERE session_id=? ORDER BY activation_id", (second["session_id"],))
         assert [row["audit_decision"] for row in history] == ["accepted", "rejected"]
-        assert e.store.get(e.pid, "main")["nodes"][5]["status"] == "pending"
         await e.team.aclose()
 
     asyncio.run(main())
@@ -881,7 +844,7 @@ def test_dynamic_limits_wake_queued_workers_without_old_run_finishing(team_env):
     asyncio.run(main())
 
 
-def test_legacy_stage_retirement_blocks_direct_run_and_delegation_without_workflow_revival(team_env):
+def test_legacy_stage_retirement_blocks_execution_and_keeps_history(team_env):
     e = team_env
     lead, owners = nodes(e)
 
@@ -895,18 +858,12 @@ def test_legacy_stage_retirement_blocks_direct_run_and_delegation_without_workfl
         await entered.wait()
         # Simulate an owner persisted by the previous fixed-stage implementation.
         e.db.execute("UPDATE project_agents SET role='node' WHERE session_id=?", (worker["session_id"],))
-        original = default_workflow()
-        removed = copy.deepcopy(original)
-        removed["nodes"] = removed["nodes"][1:]
-        removed["edges"] = removed["edges"][1:]
-        save_nodes(e, removed)
         e.team.sync(e.pid, e.owner)
         assert e.team.descriptor(worker["session_id"])["state"] == "retired"
-        with pytest.raises(TeamError, match="退出工作流"):
+        with pytest.raises(TeamError, match="退役"):
             await e.team.run(e.manager.get_runtime(worker["session_id"], e.owner), "try direct")
-        with pytest.raises(TeamError, match="退出工作流"):
+        with pytest.raises(TeamError, match="退役"):
             await e.team.start(worker["session_id"], e.owner, "try delegate")
-        save_nodes(e, original)
         e.team.sync(e.pid, e.owner)
         for _ in range(8):
             await asyncio.sleep(0)
@@ -934,10 +891,6 @@ def test_legacy_stage_retirement_from_thread_cancels_on_task_owner_loop(team_env
         worker = await fixture_task(e, lead["session_id"], e.owner, "thread retirement", node_id="requirements")
         await entered.wait()
         e.db.execute("UPDATE project_agents SET role='node' WHERE session_id=?", (worker["session_id"],))
-        removed = default_workflow()
-        removed["nodes"] = removed["nodes"][1:]
-        removed["edges"] = removed["edges"][1:]
-        save_nodes(e, removed)
         await asyncio.to_thread(e.team.sync, e.pid, e.owner)
         for _ in range(12):
             await asyncio.sleep(0)
@@ -954,7 +907,7 @@ def test_restart_marks_interrupted_runs_and_keeps_completed_audits(team_env):
     lead, owners = nodes(e)
     sid = owners["verification"]["session_id"]
     e.team._begin_activation(sid, "interrupted prompt", "queued")
-    restarted = ProjectTeam(e.manager, e.store)
+    restarted = ProjectTeam(e.manager)
     e.manager.team = restarted
     row = restarted.descriptor(sid)
     assert row["state"] == "cancelled" and "重启" in row["error"]
@@ -1038,6 +991,7 @@ def test_model_tools_use_actor_context_and_reject_bad_types(team_env):
         listing = json.loads(await registry.dispatch("team_list", {}, ctx))
         assert listing["lead"]["session_id"] == lead["session_id"]
         bad = [
+            ("delegate_agent", {"node_id": "requirements", "prompt": "ok", "write_paths": [], "delegation_reason": "independent check"}),
             ("delegate_agent", {"prompt": 42, "write_paths": [], "delegation_reason": "independent check"}),
             ("delegate_agent", {"prompt": "ok", "title": [], "write_paths": [], "delegation_reason": "independent check"}),
             ("delegate_agent", {"prompt": "ok", "permission_mode": "full-access", "write_paths": [], "delegation_reason": "independent check"}),
@@ -1049,7 +1003,7 @@ def test_model_tools_use_actor_context_and_reject_bad_types(team_env):
         for name, arguments in bad:
             with pytest.raises(ToolError):
                 await registry.dispatch(name, arguments, ctx)
-        delegated = json.loads(await registry.dispatch("delegate_agent", {"node_id": "requirements", "prompt": "verify",
+        delegated = json.loads(await registry.dispatch("delegate_agent", {"prompt": "verify",
             "write_paths": [], "delegation_reason": "independent verification while the Lead coordinates"}, ctx))
         await settled(e, [delegated["session_id"]])
         output = json.loads(await registry.dispatch("wait_agents", {"session_ids": [delegated["session_id"]], "timeout_seconds": 0}, ctx))
@@ -1087,10 +1041,10 @@ def test_role_context_contains_real_node_scope_and_no_fake_completion(team_env):
     assert "独立执行任务" in lead_context and "activation_id" in lead_context
     assert "当前对话的协调者" in lead_context and "完成通知本身不等于测试通过" in lead_context
     assert "不是普通交付的必经步骤" in lead_context and "如实说明并补充必要检查" in lead_context
-    assert "不要求固定 node_id" in lead_context
-    assert "测试验收" in node_context and "实际产出" in node_context
-    assert "不可信外部数据" in node_context
-    assert "不能擅自标记节点验收完成" in node_context
+    assert "按实际任务创建后台子智能体" in lead_context
+    assert "实际产出" in node_context and f"父智能体 {lead['session_id']}" in node_context
+    assert "负责的工作流节点资料" not in node_context
+    assert "不得自行宣称 Lead 已接受结果" in node_context
 
 
 @pytest.mark.parametrize("mode", ["read-only", "workspace-write", "full-access"])

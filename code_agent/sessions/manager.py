@@ -35,7 +35,6 @@ from code_agent.agent.repeat_reminder import RepeatReminder
 from code_agent.agent.router import ModelRouter
 from code_agent.agent.routing import classify as route_task
 from code_agent.agent.routing import route_hint
-from code_agent.agent.workflow import WorkflowStep
 from code_agent.config import agent_home, artifacts_dir, code_dir
 from code_agent.models.events import Event, EventType, TokenUsage, new_id
 from code_agent.providers.capacity import (
@@ -1116,18 +1115,6 @@ class SessionRuntime:
                     block = ""
                 if block:
                     blocks.append(block)
-            if self.agent_team is not None:
-                from code_agent.context.safety import wrap_untrusted
-
-                member = self.agent_team.descriptor(self.session_id)
-                node_id = code_context.get("workflow_node_id")
-                tree = code_context.get("workflow_tree_id") or "main"
-                if member and member["role"] == "lead" and isinstance(node_id, str) and isinstance(tree, str) and re.fullmatch(r"(?:main|task:[A-Za-z0-9_-]{1,96})", tree):
-                    document = self.agent_team.workflow_store.get(member["project_id"], tree)
-                    node = next((item for item in document["nodes"] if item["id"] == node_id), None)
-                    if node:
-                        intent = {"workflow_node_id": node_id, "workflow_tree_id": tree, "node": node}
-                        blocks.append(wrap_untrusted(json.dumps(intent, ensure_ascii=False), "用户选择的工作流节点任务资料：由当前对话主助手按需直接执行或委派"))
         return blocks, meta
 
     async def _prepare_context(self, prompt: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
@@ -2390,44 +2377,8 @@ class SessionManager:
             runtime.extra_policies = dict(self.extra_policies)
         return len(self._runtimes)
 
-    async def run_workflow(
-        self, user_id: str, name: str, steps: list["WorkflowStep"]
-    ) -> list[dict[str, Any]]:
-        """确定性工作流执行（M14）：每个步骤一个严格会话，顺序执行、上下文串联。
-
-        与自由循环互补：步骤固定、要精确控制路径的自动化任务用工作流，
-        每步有独立会话/轨迹/审计，结果显式传给下一步。
-        """
-        from code_agent.agent.workflow import run_workflow as _run_workflow
-
-        async def run_step(prompt: str, _context: str) -> dict[str, Any]:
-            meta = self.session_repo.create(user_id=user_id, title=f"[auto] {name}")
-            runtime = self.get_runtime(meta["id"], user_id, strict=True)
-            try:
-                result = await runtime.submit(prompt)
-                return {
-                    "text": result.text,
-                    "stop_reason": result.stop_reason,
-                    "turns": result.turns,
-                    "usage": result.usage.model_dump(),
-                }
-            finally:
-                self.session_repo.close(meta["id"])
-
-        return await _run_workflow(steps, run_step)
-
     async def run_automation(self, user_id: str, name: str, prompt: str) -> Any:
-        """自动化执行入口（s23）：专用会话 + strict 运行时（审批 fail closed）。
-
-        M14：prompt 含 `---step---` 分隔符时按「确定性工作流」逐步执行
-        （每步一个严格会话、上下文串联），否则走单 prompt 自由循环。
-        """
-        from code_agent.agent.workflow import parse_steps
-
-        steps = parse_steps(prompt)
-        if len(steps) > 1:
-            return await self.run_workflow(user_id, name, steps)
-
+        """在专用严格会话中执行一个完整任务，非交互审批继续 fail closed。"""
         meta = self.session_repo.create(user_id=user_id, title=f"[auto] {name}")
         runtime = self.get_runtime(meta["id"], user_id, strict=True)
         try:

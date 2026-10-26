@@ -1,7 +1,7 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { effectScope, nextTick, reactive } from 'vue'
-import { agentTreeRows, nodeAgents, agentCanStop, agentStateLabel, agentProgress, pendingTeamApprovals, teamNoticePresentation, useProjectAgentTeam } from '../src/lib/agentTeam.js'
+import { agentTreeRows, agentCanStop, agentStateLabel, agentProgress, pendingTeamApprovals, teamNoticePresentation, useProjectAgentTeam } from '../src/lib/agentTeam.js'
 
 const deferred = () => { let resolve, reject; const promise = new Promise((yes, no) => { resolve = yes; reject = no }); return { promise, resolve, reject } }
 const settle = async () => { await nextTick(); for (let n = 0; n < 10; n++) await Promise.resolve() }
@@ -26,8 +26,6 @@ test('agent tree follows parent identities and skips retired workers without hid
   const team = roster()
   team.agents.push({ session_id: 'retired', parent_session_id: 'a-lead', role: 'node', node_id: 'old', state: 'retired' }, { session_id: 'orphan', parent_session_id: 'unknown', role: 'subagent', state: 'idle' })
   assert.deepEqual(agentTreeRows(team).map(a => [a.session_id, a.indent]), [['a-lead', 0], ['a-main-node', 1], ['a-main-child', 2], ['orphan', 1]])
-  assert.equal(nodeAgents(team).get('verification').session_id, 'a-main-node')
-  assert.equal(nodeAgents(team).has('old'), false)
   assert.equal(agentCanStop(team.lead), true)
   assert.equal(agentCanStop({ state: 'completed' }), false)
 })
@@ -63,11 +61,12 @@ test('late old project responses cannot replace new project Lead or worker roste
   assert.equal(f.state.select('a-main-node'), false)
 })
 
-test('tree selection returns to Lead and maps only current-tree node identities', async t => {
+test('tree selection retains the root dialogue and displays legacy node records as background tasks', async t => {
   const f = setup(t); await settle(); f.state.select('a-main-node')
   f.props.tree = 'task:42'; await settle()
   assert.equal(f.state.sessionId.value, 'a-lead')
-  assert.equal(f.state.assignments.value.get('verification').session_id, 'a-task:42-node')
+  assert.equal(f.state.rows.value.some(agent => agent.session_id === 'a-task:42-node'), true)
+  assert.equal(Object.hasOwn(f.state, 'assignments'), false)
   assert.equal(f.state.select('a-main-node'), false)
 })
 
@@ -87,7 +86,7 @@ test('manual audit sends displayed activation identity and refreshes only curren
   await f.state.action('a-main-node', 'accepted', '已核对测试', 'activation-1')
   assert.deepEqual(f.calls.find(call => call[0] === 'auditAgent'), ['auditAgent', 'a', 'a-main-node', 'accepted', '已核对测试', 'activation-1'])
   assert.equal(f.calls.filter(call => call[0] === 'agentTeam').length, 2)
-  assert.equal(f.state.team.value.agents[1].state, 'running', 'UI does not synthesize completed workflow gates')
+  assert.equal(f.state.team.value.agents[1].state, 'running', 'UI does not synthesize completed task states')
 })
 
 test('stopping worker cannot mutate selection or error state after project switch', async t => {

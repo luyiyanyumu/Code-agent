@@ -253,19 +253,6 @@ export const api = {
       request('POST', `/api/v1/code/projects/${encodeURIComponent(pid)}/agents/${encodeURIComponent(sessionId)}/interrupt`, {}),
     auditAgent: (pid, sessionId, decision, reason = '', activationId = '') =>
       request('POST', `/api/v1/code/projects/${encodeURIComponent(pid)}/agents/${encodeURIComponent(sessionId)}/audit`, { decision, reason, activation_id: activationId }),
-    workflow: (pid, tree = 'main', options = {}) =>
-      request('GET', `/api/v1/code/projects/${encodeURIComponent(pid)}/workflow?tree=${encodeURIComponent(tree)}`, undefined, options),
-    saveWorkflow: (pid, workflow, expectedRevision, tree = 'main') =>
-      request('PUT', `/api/v1/code/projects/${encodeURIComponent(pid)}/workflow?tree=${encodeURIComponent(tree)}`, {
-        expected_revision: expectedRevision,
-        workflow: {
-          schema_version: workflow.schema_version,
-          name: workflow.name,
-          nodes: workflow.nodes,
-          edges: workflow.edges,
-          viewport: workflow.viewport,
-        },
-      }),
     meta: () => request('GET', '/api/v1/code/meta'),
     listProjects: () => request('GET', '/api/v1/code/projects'),
     openProject: (path) => request('POST', '/api/v1/code/projects', { mode: 'open', path }),

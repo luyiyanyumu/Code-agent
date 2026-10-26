@@ -47,7 +47,7 @@ def roster(env):
 
 
 def worker(env, root_id=None, *, title="测试后台任务"):
-    """Explicit test identity; roster/workflow reads never allocate workers."""
+    """Explicit test identity; roster reads never allocate workers."""
     _, app, _, project, _ = env
     team = app.state.project_agent_team
     lead = team._row(root_id or roster(env)["lead"]["session_id"])
@@ -78,24 +78,6 @@ def test_app_mounts_settings_without_precreating_branches_or_writing(integration
     assert roster(integration)["limits"] == {"max_depth": 2, "max_parallel": 1}
 
 
-def test_successful_workflow_save_does_not_allocate_or_retire_dynamic_workers(integration):
-    client, app, auth, project, _ = integration
-    first = roster(integration)
-    child = worker(integration)
-    document = app.state.sop_workflow_store.get(project["id"], "main")
-    document.pop("revision"); document.pop("updated_at")
-    document["nodes"].append({**document["nodes"][0], "id": "custom-check", "type": "custom", "title": "独立检查"})
-    path = f"/api/v1/code/projects/{project['id']}/workflow"
-    response = client.put(path, headers=auth, json={"expected_revision": 0, "workflow": document})
-    assert response.status_code == 200, response.text
-    row = app.state.db.query_one("SELECT * FROM project_agents WHERE project_id=? AND node_id='custom-check'", (project["id"],))
-    assert row is None
-    document["nodes"] = document["nodes"][:-1]
-    assert client.put(path, headers=auth, json={"expected_revision": 1, "workflow": document}).status_code == 200
-    assert app.state.project_agent_team.descriptor(child["session_id"])["state"] == "idle"
-    assert app.state.db.query_all("SELECT * FROM project_agent_runs") == []
-    assert first["agents"] == []
-    assert [row["session_id"] for row in roster(integration)["agents"]] == [child["session_id"]]
 
 
 def test_lead_execution_tools_keep_disabled_tools_and_plugin_permissions(integration, monkeypatch):
@@ -372,21 +354,10 @@ def test_existing_project_main_migrates_without_losing_transcript_and_old_duplic
     assert app.state.transcript.replay(canonical["id"])[0].payload["text"] == "已有项目对话"
 
 
-def test_workflow_node_intent_is_cleaned_and_resolved_by_server(integration):
-    _, app, _, project, _ = integration
-    lead = roster(integration)["lead"]["session_id"]
-    runtime = app.state.sessions.get_runtime(lead, project["user_id"])
-    context = _clean_code_context({"code_context": {"workflow_node_id": "requirements", "workflow_tree_id": "main", "role": "admin"}})
-    assert context == {"workflow_node_id": "requirements", "workflow_tree_id": "main"}
-    blocks, metadata = runtime._code_context_blocks("处理这个节点", context)
-    assert metadata["code_context"] == context
-    assert any("需求确认" in text and "按需直接执行或委派" in text for text in blocks)
-    assert any("数据块开始" in text for text in blocks)
-    assert _clean_code_context({"code_context": {"workflow_node_id": "requirements", "workflow_tree_id": "../other"}}) is None
 
 
 @pytest.mark.parametrize("root_kind", ["main", "chat"])
-def test_real_loop_delegates_executes_reports_and_audits_without_marking_sop_done(integration, root_kind):
+def test_real_loop_delegates_executes_reports_and_audits(integration, root_kind):
     client, app, auth, project, root = integration
     lead = conversation_root(integration, root_kind)
     owner = project["user_id"]
@@ -404,7 +375,7 @@ def test_real_loop_delegates_executes_reports_and_audits_without_marking_sop_don
                 return ModelTurn(tool_calls=[ToolCall(name=name, arguments=arguments)], stop_reason="tool_use", usage=TokenUsage(input_tokens=1, output_tokens=1))
             if role == "lead":
                 if index == 0:
-                    return invoke("delegate_agent", {"node_id": "requirements", "prompt": "读 source.txt，写入 verified，执行 echo 确认，并回报证据",
+                    return invoke("delegate_agent", {"prompt": "读 source.txt，写入 verified，执行 echo 确认，并回报证据",
                         "write_paths": ["."], "delegation_reason": "独立完成写入及命令验证，Lead 同时准备核验证据"})
                 if index == 1:
                     latest = next(message for message in reversed(messages) if message.get("role") == "tool")
@@ -431,7 +402,6 @@ def test_real_loop_delegates_executes_reports_and_audits_without_marking_sop_don
     completed = app.state.project_agent_team.descriptor(child["session_id"])
     assert completed["state"] == "completed"
     assert completed["audit"]["decision"] == "accepted"
-    assert app.state.sop_workflow_store.get(project["id"], "main")["nodes"][0]["status"] == "pending"
     assert any(event.payload.get("team_notice", {}).get("session_id") == child["session_id"] for event in app.state.transcript.replay(lead))
     assert app.state.db.query_one("SELECT COUNT(*) n FROM project_agent_audits")["n"] == 1
 
@@ -506,7 +476,7 @@ def test_idle_lead_is_woken_to_audit_a_late_child_result(integration, monkeypatc
                     await release.wait()
                     return self.text_turn("source.txt 存在，交由 Lead 读取验证")
                 if index == 0:
-                    return invoke("delegate_agent", {"node_id": "requirements", "prompt": "检查输入并回传证据",
+                    return invoke("delegate_agent", {"prompt": "检查输入并回传证据",
                         "write_paths": [], "delegation_reason": "独立检查输入，Lead 可继续整合已有结果"})
                 if index == 1:
                     latest = next(message for message in reversed(messages) if message.get("role") == "tool")
@@ -597,13 +567,6 @@ def test_cold_lead_lifecycle_stops_running_descendants_without_cached_lead(integ
     asyncio.run(verify())
 
 
-def test_invalid_collaboration_tree_cannot_commit_a_workflow_revision(integration):
-    client, app, auth, project, _ = integration
-    workflow = app.state.sop_workflow_store.get(project["id"], "task:missing")
-    workflow.pop("revision"); workflow.pop("updated_at")
-    response = client.put(f"/api/v1/code/projects/{project['id']}/workflow?tree=task:missing", headers=auth, json={"expected_revision": 0, "workflow": workflow})
-    assert response.status_code == 404
-    assert app.state.sop_workflow_store.get(project["id"], "task:missing")["revision"] == 0
 
 
 def test_wait_tool_cannot_release_capacity_while_same_turn_tools_still_execute(agent_home, tmp_path):

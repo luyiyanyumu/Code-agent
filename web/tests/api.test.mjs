@@ -99,21 +99,12 @@ test('agent roster and controls preserve encoded identities and audit activation
   ])
 })
 
-test('workflow reads forward their abort signal and encoded project/tree identities to fetch', async t => {
-  mock(t, 'localStorage', { getItem: () => null })
-  const controller = new AbortController()
-  mock(t, 'fetch', (path, options) => {
-    assert.equal(path, '/api/v1/code/projects/p%2F1/workflow?tree=task%3Aa%20b')
-    assert.equal(options.method, 'GET')
-    assert.equal(options.signal, controller.signal)
-    assert.equal(options.body, undefined)
-    return new Promise((_, reject) => {
-      options.signal.addEventListener('abort', () => reject(Object.assign(new Error('cancelled'), { name: 'AbortError' })), { once: true })
-    })
-  })
-  const reading = api.code.workflow('p/1', 'task:a b', { signal: controller.signal })
-  controller.abort()
-  await assert.rejects(reading, { name: 'AbortError' })
+test('removed workflow API is unavailable while map and collaboration methods remain callable', () => {
+  assert.equal(Object.hasOwn(api.code, 'workflow'), false)
+  assert.equal(Object.hasOwn(api.code, 'saveWorkflow'), false)
+  for (const method of ['map', 'features', 'agentTeam', 'stopAgent', 'conversations', 'createConversation']) {
+    assert.equal(typeof api.code[method], 'function', method)
+  }
 })
 
 test('team budgets use their separate settings endpoint without saving collaboration limits', async t => {
