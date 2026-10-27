@@ -1,6 +1,6 @@
 [project]
 name = "code-agent"
-version = "0.10.1"
+version = "0.10.2"
 description = "Code-agent - enterprise agent platform (core loop, runtime, memory, extensions, productization, hardening, delivery, model access, plugins)"
 requires-python = ">=3.11"
 dependencies = [

@@ -65,7 +65,7 @@ Lead 可以独立读取代码、修改文件、运行工具并验证结果；适
 准备 **Node.js 20.11+** 和 **Python 3.11+**，运行：
 
 ```bash
-npx --yes https://github.com/luyiyanyumu/Code-agent/releases/latest/download/code-agent.tgz
+npx code-agent@latest
 ```
 
 首次启动会下载应用、创建独立 Python 虚拟环境并安装后端依赖，然后自动打开 **[http://127.0.0.1:8765](http://127.0.0.1:8765)**。前端已随发行包构建，无需克隆仓库或执行 `npm ci`；之后启动会复用已安装的运行环境。
@@ -73,12 +73,18 @@ npx --yes https://github.com/luyiyanyumu/Code-agent/releases/latest/download/cod
 下载并准备最新版，暂不启动：
 
 ```bash
-npx --yes --prefer-online https://github.com/luyiyanyumu/Code-agent/releases/latest/download/code-agent.tgz install
+npx code-agent@latest install
 ```
 
-更新后，在旧服务终端按 `Ctrl+C` 停止，再将上述安装命令末尾的 `install` 去掉启动新版。会话、配置和密钥保存在 `~/.code-agent`，更新程序不会覆盖它们。启动后可在 **设置 → 模型与连接** 中配置密钥；追加 `--provider offline` 可体验离线演示。
+更新也可以使用：
 
-当前发行渠道为 **GitHub Release**。更多命令、运行目录和自定义选项见 [npx 安装与更新](docs/npx.md)。
+```bash
+npx code-agent@latest update
+```
+
+更新完成后，在旧服务终端按 `Ctrl+C` 停止，再运行 `npx code-agent@latest`。会话、配置和密钥保存在 `~/.code-agent`，更新程序不会覆盖它们。启动后可在 **设置 → 模型与连接** 中配置密钥；追加 `--provider offline` 可体验离线演示。
+
+更多命令、运行目录和自定义选项见 [npx 安装与更新](docs/npx.md)。
 
 ### 从源码开发
 

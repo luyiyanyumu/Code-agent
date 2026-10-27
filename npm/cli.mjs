@@ -7,11 +7,13 @@ import { fileURLToPath } from 'node:url'
 import net from 'node:net'
 
 const packageRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..')
-export const latestPackage = 'https://github.com/luyiyanyumu/Code-agent/releases/latest/download/code-agent.tgz'
+export const latestPackage = 'code-agent@latest'
 const providers = new Set(['offline', 'deepseek', 'openai', 'openai_compat'])
 const help = `Code-agent：本地 AI 编码工作台
 
 用法：code-agent [start|install|update] [选项]
+  启动：npx code-agent@latest
+  更新：npx code-agent@latest update
   start              启动工作台（默认）；首次自动安装 Python 后端
   install            只准备当前版本的运行环境
   update             下载最新发布包并准备环境，不中断已有服务
@@ -244,13 +246,23 @@ export function findNpmCli(env = process.env, node = process.execPath) {
 
 export async function updateLatest(options, { run = runCommand, env = process.env, cwd = process.cwd(), npmCli, node = process.execPath, log = console.log } = {}) {
   const source = env.CODE_AGENT_UPDATE_PACKAGE || latestPackage
-  if (!source.startsWith('https://') && !isAbsolute(source)) throw new Error('更新包必须是 HTTPS 地址或本地绝对路径。')
+  let allowed = false
+  if (typeof source === 'string' && !source.startsWith('-') && !/[\u0000-\u001f\u007f]/.test(source)) {
+    allowed = source === latestPackage || isAbsolute(source)
+    if (!allowed && source.startsWith('https://') && !/\s/.test(source)) {
+      try {
+        const url = new URL(source)
+        allowed = url.protocol === 'https:' && Boolean(url.hostname) && !url.username && !url.password && !url.hash
+      } catch { /* Reject malformed URLs instead of forwarding npm package specifications. */ }
+    }
+  }
+  if (!allowed) throw new Error('更新包必须是 code-agent@latest、有效 HTTPS 地址或本地绝对路径。')
   const args = [npmCli || findNpmCli(env, node), 'exec', '--yes', '--prefer-online', '--package', source, '--', 'code-agent', 'install']
   if (options.home) args.push('--home', options.home)
   if (options.python) args.push('--python', options.python)
   log('[code-agent] 正在下载并准备最新版本；已有服务继续运行。')
   const result = await run(node, args, { cwd, env })
-  if (result.code === 0) log('[code-agent] 最新运行环境已准备好。停止旧服务后，使用 npx --yes --prefer-online --package ' + source + ' code-agent 启动新版，并保留原来的 --home、--port 等启动选项。')
+  if (result.code === 0) log('[code-agent] 最新运行环境已准备好。停止旧服务后，使用 npx code-agent@latest 启动新版，并保留原来的 --home、--port 等启动选项。')
   return result.code
 }
 

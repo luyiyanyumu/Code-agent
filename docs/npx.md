@@ -1,6 +1,6 @@
 # npx 安装与更新
 
-Code-agent 通过 GitHub Release 提供包含已构建前端的 npm 发行包。`npx` 下载启动器，启动器自动创建独立 Python 环境并安装后端；使用时不需要源码仓库，也不需要单独构建前端。
+Code-agent 通过 npm 提供包含已构建前端的发行包。`npx` 下载启动器，启动器自动创建独立 Python 环境并安装后端；使用时不需要源码仓库，也不需要单独构建前端。
 
 ## 环境要求
 
@@ -14,15 +14,17 @@ Code-agent 通过 GitHub Release 提供包含已构建前端的 npm 发行包。
 在终端执行：
 
 ```bash
-npx --yes https://github.com/luyiyanyumu/Code-agent/releases/latest/download/code-agent.tgz
+npx code-agent@latest
 ```
 
 命令默认执行 `start`。首次运行自动准备后端环境；后续复用已完成的安装。服务启动后默认打开 `http://127.0.0.1:8765`，前端和后端使用同一个端口。保持终端运行，按 `Ctrl+C` 停止服务。
 
+首次下载时，npm 可能询问是否安装包，输入 `y` 继续；也可在 `npx` 后加 `--yes` 跳过这项 npm 确认。
+
 在工作台的 **设置 → 模型与连接** 中配置模型，也可以设置 README 中的模型环境变量，或在应用数据目录的 `.env` 中保存配置。没有密钥时，可先运行离线演示：
 
 ```bash
-npx --yes https://github.com/luyiyanyumu/Code-agent/releases/latest/download/code-agent.tgz --provider offline
+npx code-agent@latest --provider offline
 ```
 
 离线模式使用演示提供方，不调用真实 AI 服务。
@@ -32,42 +34,42 @@ npx --yes https://github.com/luyiyanyumu/Code-agent/releases/latest/download/cod
 只下载并准备最新版，不启动服务：
 
 ```bash
-npx --yes --prefer-online https://github.com/luyiyanyumu/Code-agent/releases/latest/download/code-agent.tgz install
+npx code-agent@latest install
 ```
 
-`--prefer-online` 由 npm 处理，要求优先检查在线内容。应用的 `update` 子命令也会调用 npm，从上述默认发行地址下载并准备最新版：
+应用的 `update` 子命令也会调用 npm，从 npm registry 的 `latest` 版本下载并准备运行环境：
 
 ```bash
-npx --yes https://github.com/luyiyanyumu/Code-agent/releases/latest/download/code-agent.tgz update
+npx code-agent@latest update
 ```
 
 下载完成后，在旧服务终端按 `Ctrl+C`，再启动新版：
 
 ```bash
-npx --yes --prefer-online https://github.com/luyiyanyumu/Code-agent/releases/latest/download/code-agent.tgz
+npx code-agent@latest
 ```
 
-更新不会自动中断正在运行的任务。npm 会管理下载缓存；详情见 [npm exec 官方说明](https://docs.npmjs.com/cli/commands/npm-exec/)。
+更新不会自动中断正在运行的任务。npm 管理发行包的下载缓存；如需优先检查在线内容，可在 `npx` 后添加 `--prefer-online`。详情见 [npm exec 官方说明](https://docs.npmjs.com/cli/commands/npm-exec/)。
 
 ## 自定义启动
 
 ```bash
 # 修改端口，不自动打开浏览器
-npx --yes https://github.com/luyiyanyumu/Code-agent/releases/latest/download/code-agent.tgz start --port 8877 --no-open
+npx code-agent@latest start --port 8877 --no-open
 
 # 指定 Python 与应用数据目录；路径有空格时添加引号
-npx --yes https://github.com/luyiyanyumu/Code-agent/releases/latest/download/code-agent.tgz start --python "C:/Python311/python.exe" --home "D:/Code-agent-data"
+npx code-agent@latest start --python "C:/Python311/python.exe" --home "D:/Code-agent-data"
 
 # 查看帮助与版本
-npx --yes https://github.com/luyiyanyumu/Code-agent/releases/latest/download/code-agent.tgz --help
-npx --yes https://github.com/luyiyanyumu/Code-agent/releases/latest/download/code-agent.tgz --version
+npx code-agent@latest --help
+npx code-agent@latest --version
 ```
 
 | 命令或选项 | 用途 |
 | --- | --- |
 | `start` | 准备运行环境并启动工作台；省略子命令时默认执行 |
 | `install` | 仅准备当前下载版本的运行环境 |
-| `update` | 从默认 GitHub Release 地址获取最新版并执行安装 |
+| `update` | 从 npm registry 获取 `latest` 版本并执行安装 |
 | `--no-open` | 启动后不自动打开浏览器 |
 | `--host` | 指定监听地址，默认 `127.0.0.1` |
 | `--port` | 指定端口，默认 `8765` |
@@ -92,8 +94,23 @@ npx --yes https://github.com/luyiyanyumu/Code-agent/releases/latest/download/cod
 
 ## 维护者发布
 
-当前用户命令使用 GitHub Release 中的 `code-agent.tgz`，没有要求 npm 账户，也不依赖 npm registry 中同名包的归属。
+完成测试与打包后，用拥有 `code-agent` 发布权限的 npm 账户登录，并发布已验证的发行包：
 
-维护者完成构建、测试与打包后，将发行包作为 `code-agent.tgz` 上传到新的 GitHub Release。`releases/latest/download/code-agent.tgz` 会指向最新正式发行版。
+```bash
+npm login
+npm publish <发行包路径> --access public
+```
 
-后续如需提供更短的 npm registry 命令，需要先登录 npm、确认可用包名及发布权限，再执行 `npm publish <发行包路径>`。只有实际发布并确认包名后，才能将用户命令切换为 `npx <包名>@latest`。
+首次发布及后续发布按 npm 账户要求完成人工登录、双因素认证或发布确认。每次发布应使用新的版本号，并确认 npm 的 `latest` 标签指向目标版本。
+
+未来如需通过 CI 自动发布，可在 npm 包设置中配置受信任发布者（trusted publishing），再连接对应仓库与发布流程；只有账号侧完成配置后才能启用。当前不以已配置自动发布为前提。
+
+### GitHub Release 备用分发
+
+仍可从 GitHub Release 下载同一发行包：
+
+```bash
+npx --yes --prefer-online https://github.com/luyiyanyumu/Code-agent/releases/latest/download/code-agent.tgz
+```
+
+此地址由维护者同步上传发行包，实际版本以对应 Release 为准；常规使用优先选择 npm 短命令。

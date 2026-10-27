@@ -113,13 +113,57 @@ test('Python selection refuses old versions and honors explicit paths without fa
 })
 
 test('update uses npm JS entry, online package fetch, exact arguments, and child exit status', async () => {
+  assert.equal(latestPackage, 'code-agent@latest')
   let call
   const result = await updateLatest({ home: 'C:\\Data with spaces', python: 'C:\\Python & More\\python.exe' }, {
     node: '/node', npmCli: '/npm with spaces/npm-cli.js', env: {}, cwd: '/work', log() {},
     run: async (...args) => { call = args; return { code: 37 } },
   })
   assert.equal(result, 37)
-  assert.deepEqual(call, ['/node', ['/npm with spaces/npm-cli.js', 'exec', '--yes', '--prefer-online', '--package', latestPackage, '--', 'code-agent', 'install', '--home', 'C:\\Data with spaces', '--python', 'C:\\Python & More\\python.exe'], { cwd: '/work', env: {} }])
+  assert.deepEqual(call, ['/node', ['/npm with spaces/npm-cli.js', 'exec', '--yes', '--prefer-online', '--package', 'code-agent@latest', '--', 'code-agent', 'install', '--home', 'C:\\Data with spaces', '--python', 'C:\\Python & More\\python.exe'], { cwd: '/work', env: {} }])
+})
+
+test('successful registry update displays the short npx command and preserves option reminder', async () => {
+  const messages = []
+  const calls = []
+  assert.equal(await updateLatest({}, {
+    npmCli: '/npm/npm-cli.js', env: { CODE_AGENT_UPDATE_PACKAGE: 'code-agent@latest' }, log: message => messages.push(message),
+    run: async (command, args) => { calls.push([command, args]); return { code: 0 } },
+  }), 0)
+  assert.deepEqual(calls[0][1].slice(1, 6), ['exec', '--yes', '--prefer-online', '--package', 'code-agent@latest'])
+  assert.match(messages.at(-1), /npx code-agent@latest 启动新版/)
+  assert.match(messages.at(-1), /--home、--port/)
+  assert.doesNotMatch(messages.at(-1), /--package|github\.com/)
+})
+
+test('update source rejects arbitrary npm specs, flags, credentials, and malformed URLs before spawning', async () => {
+  for (const source of [
+    '--registry=https://evil.test', '-h', 'code-agent@latest --help', 'other-package@latest',
+    'npm:other-package@latest', 'code-agent@file:./untrusted', 'git+https://evil.test/repo.git',
+    'http://evil.test/package.tgz', 'https://', 'https://user:secret@evil.test/package.tgz',
+    'https://evil.test/package.tgz#fragment', 'https://evil.test/package.tgz --help',
+    'https://evil.test/package.tgz\n--registry=bad', './relative-package.tgz', 'code-agent@latest\u0000',
+  ]) {
+    await assert.rejects(updateLatest({}, {
+      env: { CODE_AGENT_UPDATE_PACKAGE: source }, npmCli: '/npm/npm-cli.js', log() {},
+      run() { assert.fail('invalid update source must not spawn a process') },
+    }), /更新包必须是/)
+  }
+})
+
+test('legacy HTTPS and local absolute tarball sources remain single npm arguments for smoke tests', async () => {
+  for (const source of [
+    'https://github.com/luyiyanyumu/Code-agent/releases/latest/download/code-agent.tgz',
+    join(tmpdir(), 'code agent smoke', 'code-agent.tgz'),
+  ]) {
+    let args
+    assert.equal(await updateLatest({}, {
+      env: { CODE_AGENT_UPDATE_PACKAGE: source }, npmCli: '/npm/npm-cli.js', log() {},
+      run: async (command, passed) => { args = passed; return { code: 0 } },
+    }), 0)
+    assert.equal(args[5], source)
+    assert.deepEqual(args.slice(6), ['--', 'code-agent', 'install'])
+  }
 })
 
 test('busy port check runs before dependency install and never starts a child', async t => {
