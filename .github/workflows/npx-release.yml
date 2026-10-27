@@ -33,7 +33,7 @@ jobs:
       - run: python -m pip install '.[dev]'
       - run: python -m pytest tests/test_static_web.py tests/test_startup_probe.py tests/test_retrieval.py tests/test_env_loader.py tests/test_api.py tests/test_ws.py
       - run: npm pack --pack-destination .
-      - run: npm run test:package -- --tarball code-agent-$(node -p "require('./package.json').version").tgz
+      - run: npm run test:package -- --tarball luyiyanyumu-code-agent-$(node -p "require('./package.json').version").tgz
       - name: Publish prebuilt tarball
         env:
           GH_TOKEN: ${{ github.token }}
@@ -42,7 +42,7 @@ jobs:
         run: |
           version=$(node -p "require('./package.json').version")
           test "$RELEASE_TAG" = "v$version"
-          cp "code-agent-$version.tgz" code-agent.tgz
+          cp "luyiyanyumu-code-agent-$version.tgz" code-agent.tgz
           sha256sum code-agent.tgz > code-agent.tgz.sha256
           if ! gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
             gh release create "$RELEASE_TAG" --verify-tag --title "Code-agent $version" --generate-notes

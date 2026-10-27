@@ -1,6 +1,6 @@
 # npx 安装与更新
 
-Code-agent 通过 npm 提供包含已构建前端的发行包。`npx` 下载启动器，启动器自动创建独立 Python 环境并安装后端；使用时不需要源码仓库，也不需要单独构建前端。
+Code-agent 通过 [npm · @luyiyanyumu/code-agent](https://www.npmjs.com/package/@luyiyanyumu/code-agent) 提供包含已构建前端的发行包。`npx` 下载启动器，启动器自动创建独立 Python 环境并安装后端；使用时不需要源码仓库，也不需要单独构建前端。
 
 ## 环境要求
 
@@ -14,7 +14,7 @@ Code-agent 通过 npm 提供包含已构建前端的发行包。`npx` 下载启�
 在终端执行：
 
 ```bash
-npx code-agent@latest
+npx @luyiyanyumu/code-agent@latest
 ```
 
 命令默认执行 `start`。首次运行自动准备后端环境；后续复用已完成的安装。服务启动后默认打开 `http://127.0.0.1:8765`，前端和后端使用同一个端口。保持终端运行，按 `Ctrl+C` 停止服务。
@@ -24,7 +24,7 @@ npx code-agent@latest
 在工作台的 **设置 → 模型与连接** 中配置模型，也可以设置 README 中的模型环境变量，或在应用数据目录的 `.env` 中保存配置。没有密钥时，可先运行离线演示：
 
 ```bash
-npx code-agent@latest --provider offline
+npx @luyiyanyumu/code-agent@latest --provider offline
 ```
 
 离线模式使用演示提供方，不调用真实 AI 服务。
@@ -34,19 +34,19 @@ npx code-agent@latest --provider offline
 只下载并准备最新版，不启动服务：
 
 ```bash
-npx code-agent@latest install
+npx @luyiyanyumu/code-agent@latest install
 ```
 
 应用的 `update` 子命令也会调用 npm，从 npm registry 的 `latest` 版本下载并准备运行环境：
 
 ```bash
-npx code-agent@latest update
+npx @luyiyanyumu/code-agent@latest update
 ```
 
 下载完成后，在旧服务终端按 `Ctrl+C`，再启动新版：
 
 ```bash
-npx code-agent@latest
+npx @luyiyanyumu/code-agent@latest
 ```
 
 更新不会自动中断正在运行的任务。npm 管理发行包的下载缓存；如需优先检查在线内容，可在 `npx` 后添加 `--prefer-online`。详情见 [npm exec 官方说明](https://docs.npmjs.com/cli/commands/npm-exec/)。
@@ -55,14 +55,14 @@ npx code-agent@latest
 
 ```bash
 # 修改端口，不自动打开浏览器
-npx code-agent@latest start --port 8877 --no-open
+npx @luyiyanyumu/code-agent@latest start --port 8877 --no-open
 
 # 指定 Python 与应用数据目录；路径有空格时添加引号
-npx code-agent@latest start --python "C:/Python311/python.exe" --home "D:/Code-agent-data"
+npx @luyiyanyumu/code-agent@latest start --python "C:/Python311/python.exe" --home "D:/Code-agent-data"
 
 # 查看帮助与版本
-npx code-agent@latest --help
-npx code-agent@latest --version
+npx @luyiyanyumu/code-agent@latest --help
+npx @luyiyanyumu/code-agent@latest --version
 ```
 
 | 命令或选项 | 用途 |
@@ -94,7 +94,7 @@ npx code-agent@latest --version
 
 ## 维护者发布
 
-完成测试与打包后，用拥有 `code-agent` 发布权限的 npm 账户登录，并发布已验证的发行包：
+完成测试与打包后，用拥有 `@luyiyanyumu/code-agent` 发布权限的 npm 账户登录，并将已验证的 scoped 发行包公开发布：
 
 ```bash
 npm login
