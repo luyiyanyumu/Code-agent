@@ -21,7 +21,8 @@
 | `CODE_AGENT_SEARCH_API_VERSION` | `2023-06-01` | `anthropic-version` 头 |
 | `CODE_AGENT_SEARCH_MAX_USES` | `5` | 单次请求内最多触发几次搜索 |
 | `CODE_AGENT_SEARCH_MAX_RESULTS` | `8` | 合并后最多返回多少条来源 |
-| `DEEPSEEK_API_KEY` | —— | 复用聊天用的 key；没有 key 时整个联网开关不可用 |
+| `CODE_AGENT_SEARCH_API_KEY` | —— | 独立检索 key，可用于显式配置的检索端点 |
+| `DEEPSEEK_API_KEY` | —— | 官方检索端点可复用；也支持设置页保存的官方 DeepSeek 连接 |
 """
 
 from __future__ import annotations
@@ -30,6 +31,7 @@ import json
 import os
 from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -87,12 +89,12 @@ class SearchResult:
         }
 
 
-def _setting(name: str, default: str) -> str:
+def _setting(name: str, default: str, *, values: dict | None = None) -> str:
     """config.json 的 search 段优先，其次环境变量，最后默认值。"""
     try:
         from code_agent.settings import load
 
-        cfg = load().get("search") or {}
+        cfg = (load() if values is None else values).get("search") or {}
         if isinstance(cfg, dict):
             key = name.replace("CODE_AGENT_SEARCH_", "").lower()
             value = cfg.get(key)
@@ -105,51 +107,98 @@ def _setting(name: str, default: str) -> str:
     return os.environ.get(name, default)
 
 
-def _setting_int(name: str, default: int) -> int:
+def _setting_int(name: str, default: int, *, values: dict | None = None) -> int:
     try:
-        value = int(_setting(name, str(default)))
+        value = int(_setting(name, str(default), values=values))
     except (TypeError, ValueError):
         return default
     return value if value > 0 else default
 
 
-def search_config() -> dict[str, Any]:
+def search_config(*, _values: dict | None = None) -> dict[str, Any]:
     """当前检索配置（不含 key）。"""
     return {
-        "base_url": _setting("CODE_AGENT_SEARCH_BASE_URL", DEFAULT_BASE_URL),
-        "model": _setting("CODE_AGENT_SEARCH_MODEL", DEFAULT_MODEL),
-        "api_version": _setting("CODE_AGENT_SEARCH_API_VERSION", DEFAULT_API_VERSION),
-        "max_uses": _setting_int("CODE_AGENT_SEARCH_MAX_USES", DEFAULT_MAX_USES),
-        "max_results": _setting_int("CODE_AGENT_SEARCH_MAX_RESULTS", DEFAULT_MAX_RESULTS),
+        "base_url": _setting("CODE_AGENT_SEARCH_BASE_URL", DEFAULT_BASE_URL, values=_values),
+        "model": _setting("CODE_AGENT_SEARCH_MODEL", DEFAULT_MODEL, values=_values),
+        "api_version": _setting("CODE_AGENT_SEARCH_API_VERSION", DEFAULT_API_VERSION, values=_values),
+        "max_uses": _setting_int("CODE_AGENT_SEARCH_MAX_USES", DEFAULT_MAX_USES, values=_values),
+        "max_results": _setting_int("CODE_AGENT_SEARCH_MAX_RESULTS", DEFAULT_MAX_RESULTS, values=_values),
     }
 
 
-def api_key() -> str:
-    """检索用的 key：优先 config.json 的 api_key，其次 DEEPSEEK_API_KEY。"""
+def _official_deepseek(url: str, *, empty=False) -> bool:
+    if not url:
+        return empty
     try:
-        from code_agent.settings import load
+        parsed = urlsplit(url)
+        return (parsed.scheme == "https" and parsed.hostname == "api.deepseek.com"
+                and parsed.port in (None, 443) and not parsed.username and not parsed.password
+                and not parsed.query and not parsed.fragment)
+    except ValueError:
+        return False
 
-        cfg = load()
-        value = cfg.get("search_api_key") if isinstance(cfg, dict) else ""
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    except Exception:  # noqa: BLE001
-        pass
-    return os.environ.get("DEEPSEEK_API_KEY", "").strip()
+
+def _valid_endpoint(url: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+        return (parsed.scheme in ("http", "https") and bool(parsed.hostname)
+                and parsed.port != 0 and not parsed.username and not parsed.password
+                and not parsed.query and not parsed.fragment)
+    except (TypeError, ValueError):
+        return False
+
+
+def _credential(cfg: dict[str, Any], values: dict[str, Any]) -> tuple[str, str]:
+    """Resolve fresh credentials without ever sending a chat key to a gateway."""
+    try:
+        from code_agent.settings import model_config
+
+        search = values.get("search") if isinstance(values.get("search"), dict) else {}
+        for value, source in ((search.get("api_key"), "search_settings"),
+                              (values.get("search_api_key"), "search_settings"),
+                              (os.environ.get("CODE_AGENT_SEARCH_API_KEY"), "search_environment")):
+            if isinstance(value, str) and value.strip():
+                return value.strip(), source
+        if not _official_deepseek(cfg["base_url"]):
+            return "", ""
+        value = os.environ.get("DEEPSEEK_API_KEY", "").strip()
+        if value:
+            return value, "deepseek_environment"
+        current = model_config()
+        if current.get("provider") == "deepseek" and _official_deepseek(
+                str(current.get("base_url") or "").strip(), empty=True):
+            value = str(current.get("api_key") or "").strip()
+            if value:
+                return value, "model_settings"
+    except Exception:
+        # Capability errors must never include configuration or credential text.
+        return "", ""
+    return "", ""
+
+
+def api_key() -> str:
+    """Reuse the same current, endpoint-scoped credential as capability/search."""
+    return _configuration()[1]
+
+
+def _configuration() -> tuple[dict[str, Any], str, dict[str, Any]]:
+    from code_agent.settings import load
+
+    values = load()
+    cfg = search_config(_values=values)
+    if not _valid_endpoint(cfg["base_url"]):
+        return cfg, "", {**cfg, "base_url": "", "available": False,
+            "reason_code": "WEB_PROVIDER_CONFIG_INVALID", "credential_source": "",
+            "reason": "联网检索地址无效，请配置不含账号、密码或查询参数的 HTTP/HTTPS 检索地址。"}
+    key, source = _credential(cfg, values)
+    return cfg, key, {**cfg, "available": bool(key), "credential_source": source,
+        "reason_code": "" if key else "WEB_PROVIDER_CREDENTIAL_MISSING",
+        "reason": "" if key else "未配置可用于联网检索的 API key。请在模型设置中配置官方 DeepSeek 连接，或配置独立检索密钥。"}
 
 
 def availability() -> dict[str, Any]:
     """联网能力是否可用 + 为什么不可用（界面据此禁用开关并给出提示）。"""
-    cfg = search_config()
-    key = api_key()
-    if not key:
-        return {
-            "available": False,
-            "reason": "没有检索用的 API key：在 ~/.code-agent/config.json 设 search_api_key，"
-                      "或设置环境变量 DEEPSEEK_API_KEY",
-            **cfg,
-        }
-    return {"available": True, "reason": "", **cfg}
+    return _configuration()[2]
 
 
 class DeepSeekSearchProvider:
@@ -162,10 +211,9 @@ class DeepSeekSearchProvider:
         clean = [q.strip() for q in queries if str(q).strip()][:4]
         if not clean:
             raise WebError("没有有效的检索词", "WEB_BAD_REQUEST")
-        cfg = search_config()
-        key = api_key()
-        if not key:
-            raise WebError(availability()["reason"], "WEB_PROVIDER_CREDENTIAL_MISSING")
+        cfg, key, info = _configuration()
+        if not info["available"]:
+            raise WebError(info["reason"], info["reason_code"])
 
         endpoint = f"{cfg['base_url'].rstrip('/')}/messages"
         # 多条 query 一次请求：DSH 的做法是每条 query 一次调用再合并；

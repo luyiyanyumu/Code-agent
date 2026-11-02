@@ -13,7 +13,18 @@ const monacoEntries = [...readFileSync(new URL('./src/lib/monacoRuntime.js', imp
   .matchAll(/(?:import|from)\s+['"](monaco-editor\/[^'"]+)['"]/g)].map(match => match[1])
 
 export default defineConfig({
-  plugins: [vue()],
+  plugins: [vue(), {
+    name: 'code-agent-frontend-health',
+    configureServer(server) {
+      // Health must not wait for HTML transforms, dependency optimization or
+      // the backend proxy. Both processes are monitored independently.
+      server.middlewares.use((request, response, next) => {
+        if (request.url?.split('?')[0] !== '/__code_agent_health') return next()
+        response.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' })
+        response.end(JSON.stringify({ ok: true, service: 'code-agent-frontend' }))
+      })
+    },
+  }],
   // monaco 是运行期按需加载的大依赖：先在 dev 期预构建，避免"第一次打开文件时
   // Vite 现场重新预构建 → 整页刷新"（那会打断用户当前的选择与编辑状态）
   optimizeDeps: {
@@ -38,7 +49,16 @@ export default defineConfig({
         // Monaco 单独成 chunk：代码页是异步加载的，且这个 chunk 体积大、
         // 变更少——独立出来才能被浏览器长期缓存，而不是每次改业务代码都失效
         manualChunks(id) {
-          if (id.includes('monaco-editor')) return 'monaco'
+          // Vite's shared dynamic-import helper is used by the entry as well as
+          // the editor. If Rollup folds it into Monaco, the entry statically
+          // imports the whole editor (and its CSS) before any file is opened.
+          // Keep this tiny shared runtime independent of the deferred feature.
+          if (id === '\0vite/preload-helper.js') return 'vite-runtime'
+          // The NLS bootstrap and its offline table must evaluate inside the
+          // same chunk before contributions register their localized actions.
+          // Otherwise importing the raw table from the Monaco chunk can load
+          // those actions before the bootstrap in the application chunk runs.
+          if (id.includes('monaco-editor') || /[\\/]src[\\/]lib[\\/](?:editorLocale|completionLocale)\.js$/.test(id)) return 'monaco'
           return undefined
         },
       },

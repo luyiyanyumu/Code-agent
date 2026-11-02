@@ -19,9 +19,12 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import hashlib
 import os
+import secrets
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -42,6 +45,9 @@ MAX_SESSIONS = int(os.environ.get("CODE_AGENT_LSP_MAX", "3"))
 #: initialize 超时：rust-analyzer/jdtls 首次索引会慢，给足
 INIT_TIMEOUT = float(os.environ.get("CODE_AGENT_LSP_INIT_TIMEOUT", "45"))
 DOCUMENTATION_RETRY_DELAY = 60.0
+MAX_COMPLETION_CONTEXTS = 4096
+COMPLETION_DOCUMENTATION_BUDGET = 0.03
+MAX_HOVER_CONTEXTS = 128
 
 
 def notification_needs_translation(message: dict) -> bool:
@@ -201,7 +207,12 @@ class LspSession:
     document_texts: dict[str, str] = field(default_factory=dict)
     foreground_documents: set[str] = field(default_factory=set)
     localization_tasks: dict[str, asyncio.Task] = field(default_factory=dict)
+    completion_contexts: OrderedDict[str, dict] = field(default_factory=OrderedDict)
+    hover_contexts: OrderedDict[str, dict] = field(default_factory=OrderedDict)
     notification_revisions: dict[str, int] = field(default_factory=dict)
+    diagnostic_pull_tasks: dict[str, asyncio.Task] = field(default_factory=dict)
+    diagnostic_pull_revisions: dict[str, int] = field(default_factory=dict)
+    diagnostic_pull_disabled: bool = False
     started_at: float = field(default_factory=time.monotonic)
     last_used: float = field(default_factory=time.monotonic)
     error: str = ""
@@ -279,6 +290,7 @@ class LspManager:
         self.documentation_prewarm = DocumentationPrewarmer(self, documentation_path)
         self._documentation_jobs: dict[tuple[str, str], asyncio.Task] = {}
         self._documentation_progress: dict[tuple[str, str], dict] = {}
+        self._foreground_hover_jobs: set[asyncio.Task] = set()
 
     # ------------------------------------------------------------------
     # 配置与状态
@@ -513,8 +525,16 @@ class LspManager:
 
     async def _retire(self, session: LspSession) -> None:
         failure = ""
+        session.completion_contexts.clear()
+        session.hover_contexts.clear()
         try:
             self.documentation_prewarm.cancel(session)
+            session.diagnostic_pull_disabled = True
+            pull_tasks = list(session.diagnostic_pull_tasks.values())
+            for pending in pull_tasks:
+                pending.cancel()
+            await asyncio.gather(*pull_tasks, return_exceptions=True)
+            session.diagnostic_pull_tasks.clear()
             for pending in list(session.localization_tasks.values()):
                 pending.cancel()
             await asyncio.gather(*session.localization_tasks.values(), return_exceptions=True)
@@ -547,7 +567,10 @@ class LspManager:
             )
         launch_args = list(entry["args"])
         launch_command = resolved
-        launch_environment: dict[str, Any] = {}
+        launch_environment: dict[str, Any] = (
+            {"source": "bundled", "version": entry.get("version", "")}
+            if entry.get("source") == "bundled" else {}
+        )
         if entry["id"] == "jdtls":
             from code_agent.codeintel.java_lsp_launch import jdtls_process_command, prepare_jdtls_launch
 
@@ -573,7 +596,7 @@ class LspManager:
         if isinstance(initial.get("settings"), dict):
             session.settings = _deep_merge(session.settings, initial["settings"])
         if lang == "python":
-            session.environment = await asyncio.to_thread(interpreter_info, root)
+            session.environment.update(await asyncio.to_thread(interpreter_info, root))
             session.settings = _deep_merge(session.settings, {
                 "python": {"pythonPath": session.environment["python"]},
                 "pylsp": {"plugins": {"jedi": {"environment": session.environment["python"]}}},
@@ -595,6 +618,11 @@ class LspManager:
         def closed() -> None:
             self.failures.setdefault(entry["id"], "服务器进程已退出")
             self.documentation_prewarm.cancel(session)
+            session.completion_contexts.clear()
+            session.hover_contexts.clear()
+            session.diagnostic_pull_disabled = True
+            for pending in list(session.diagnostic_pull_tasks.values()):
+                pending.cancel()
             for pending in list(session.localization_tasks.values()):
                 pending.cancel()
             for uri in session.diagnostics:
@@ -691,6 +719,10 @@ class LspManager:
 
     async def _finish_shutdown(self, pending: list[asyncio.Task]) -> None:
         try:
+            hover_jobs = list(self._foreground_hover_jobs)
+            for job in hover_jobs:
+                job.cancel()
+            await asyncio.gather(*hover_jobs, return_exceptions=True)
             for job in self._documentation_jobs.values():
                 job.cancel()
             await asyncio.gather(*self._documentation_jobs.values(), return_exceptions=True)
@@ -1049,7 +1081,14 @@ class LspManager:
                 else:
                     session.document_hashes.pop(uri, None)
             elif method == "textDocument/didClose":
+                pending = session.diagnostic_pull_tasks.pop(uri, None)
+                if pending is not None:
+                    pending.cancel()
+                session.diagnostic_pull_revisions.pop(uri, None)
                 session.documents.pop(uri, None)
+                for ticket, receipt in list(session.completion_contexts.items()):
+                    if receipt["uri"] == uri:
+                        session.completion_contexts.pop(ticket, None)
                 session.document_hashes.pop(uri, None)
                 session.document_texts.pop(uri, None)
                 session.foreground_documents.discard(uri)
@@ -1061,18 +1100,166 @@ class LspManager:
                 if len(session.closed_documents) > 1024:
                     session.closed_documents.pop()
                 self._sync_diagnostics(session, uri)
+            if method in ("textDocument/didOpen", "textDocument/didChange", "textDocument/didClose"):
+                self._cancel_hover_contexts(session, uri)
         session.touch()
         await session.client.notify(method, params)
         if method in ("textDocument/didOpen", "textDocument/didChange", "textDocument/didSave"):
             self.documentation_prewarm.schedule(session, uri, session.document_texts.get(uri))
+            self._schedule_diagnostic_pull(session, uri)
+
+    def _schedule_diagnostic_pull(self, session: LspSession, uri: str) -> None:
+        """ESLint uses pull diagnostics; coalesce edits without blocking the stdio reader."""
+        if (session.server_id != "eslint" or session.diagnostic_pull_disabled or not session.alive
+                or not session.supports("diagnosticProvider") or uri not in session.documents):
+            return
+        revision = session.diagnostic_pull_revisions.get(uri, 0) + 1
+        session.diagnostic_pull_revisions[uri] = revision
+        pending = session.diagnostic_pull_tasks.get(uri)
+        if pending is not None and not pending.done():
+            return
+
+        async def pull() -> None:
+            task = asyncio.current_task()
+            try:
+                while uri in session.documents and not session.diagnostic_pull_disabled:
+                    requested = session.diagnostic_pull_revisions.get(uri)
+                    await asyncio.sleep(0.1)
+                    if requested != session.diagnostic_pull_revisions.get(uri):
+                        continue
+                    version = session.documents.get(uri)
+                    try:
+                        report = await session.client.request(
+                            "textDocument/diagnostic", {"textDocument": {"uri": uri}}, timeout=20,
+                        )
+                    except JsonRpcError as exc:
+                        if "-32601" in str(exc):
+                            session.diagnostic_pull_disabled = True
+                            return
+                        if requested != session.diagnostic_pull_revisions.get(uri):
+                            continue
+                        return  # Retry only after a new edit/refresh, never spin on server errors.
+                    if (uri in session.documents and session.documents[uri] == version
+                            and requested == session.diagnostic_pull_revisions.get(uri)
+                            and isinstance(report, dict) and isinstance(report.get("items"), list)):
+                        self._on_notification(session, {"jsonrpc": "2.0", "method": "textDocument/publishDiagnostics",
+                            "params": {"uri": uri, "version": version, "diagnostics": report["items"]}})
+                    if requested == session.diagnostic_pull_revisions.get(uri):
+                        return
+            finally:
+                if session.diagnostic_pull_tasks.get(uri) is task:
+                    session.diagnostic_pull_tasks.pop(uri, None)
+
+        task = asyncio.create_task(pull())
+        session.diagnostic_pull_tasks[uri] = task
+        task.add_done_callback(self._observe_task)
+
+    @staticmethod
+    def _remember_completion_items(session: LspSession, result: Any, uri: str | None, version: int | None) -> None:
+        if uri is None or uri not in session.documents or session.documents[uri] != version:
+            return
+        # Tickets describe actual server receipts, not caller-supplied prose.
+        # A bounded recent window also covers clients displaying older lists.
+        for key, value in list(session.completion_contexts.items()):
+            if value["uri"] not in session.documents or session.documents[value["uri"]] != value["version"]:
+                session.completion_contexts.pop(key, None)
+        items = result.get("items", []) if isinstance(result, dict) else result
+        defaults = result.get("itemDefaults", {}) if isinstance(result, dict) else {}
+        if not isinstance(items, list):
+            return
+        # Inherited opaque data can be a large shared server record. Retain one
+        # private snapshot per list, rather than cloning it for every candidate.
+        inherited_data = copy.deepcopy(defaults["data"]) if isinstance(defaults, dict) and "data" in defaults else None
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            original = copy.deepcopy(item)
+            if "data" not in original and isinstance(defaults, dict) and "data" in defaults:
+                original["data"] = inherited_data
+            ticket = secrets.token_urlsafe(18)
+            session.completion_contexts[ticket] = {"uri": uri, "version": version, "item": original}
+            metadata = item.get("_code_agent_original")
+            if not isinstance(metadata, dict):
+                metadata = {}; item["_code_agent_original"] = metadata
+            metadata["_completion_context"] = ticket
+            while len(session.completion_contexts) > MAX_COMPLETION_CONTEXTS:
+                session.completion_contexts.popitem(last=False)
+
+    @staticmethod
+    def _cancel_hover_contexts(session: LspSession, uri: str) -> None:
+        for key, state in list(session.hover_contexts.items()):
+            if state["uri"] == uri:
+                session.hover_contexts.pop(key, None)
+                task = session.localization_tasks.pop(key, None)
+                if task:
+                    task.cancel()
+
+    async def _foreground_hover(self, session, result, uri, version, position, *, retry=False):
+        """Project immediately; notify only while the exact source is current."""
+        if not isinstance(result, dict) or "contents" not in result:
+            return result
+        scope = f"{session.project_id}:{session.tree_id}:{session.server_id}"
+        key = f"hover:{uri}:{position.get('line')}:{position.get('character')}"
+        digest = hashlib.sha256(repr(restore_protocol_text(result)).encode("utf-8")).hexdigest()
+        state = session.hover_contexts.get(key)
+        if state and (state["version"] != version or state["digest"] != digest):
+            session.hover_contexts.pop(key, None)
+            task = session.localization_tasks.pop(key, None)
+            if task:
+                task.cancel()
+            state = None
+        if state and (not retry or state["status"] == "pending"):
+            session.hover_contexts.move_to_end(key)
+            return copy.deepcopy(state["result"])
+        output = await localize_result(self.documentation_translator, "textDocument/hover", result,
+            scope=scope, hover_mode="background", hover_retry=retry)
+        state = {"uri": uri, "version": version, "digest": digest, "result": output,
+                 "status": (output.get("documentation_translation") or {}).get("status"),
+                 "generation": self._generation}
+        session.hover_contexts[key] = state
+        session.hover_contexts.move_to_end(key)
+        while len(session.hover_contexts) > MAX_HOVER_CONTEXTS:
+            old_key, _ = session.hover_contexts.popitem(last=False)
+            old_task = session.localization_tasks.pop(old_key, None)
+            if old_task:
+                old_task.cancel()
+        if state["status"] != "pending":
+            return output
+
+        async def finished():
+            try:
+                translated = await localize_result(self.documentation_translator, "textDocument/hover", result,
+                    scope=scope, hover_mode="wait")
+                if (not session.alive or self._generation != state["generation"]
+                        or session.documents.get(uri) != version or session.hover_contexts.get(key) is not state):
+                    return
+                state["result"] = translated
+                state["status"] = (translated.get("documentation_translation") or {}).get("status")
+                self._publish(session, {"jsonrpc": "2.0", "method": "code-agent/documentationUpdated", "params": {
+                    "uri": uri, "version": version, "position": dict(position), "status": state["status"]}})
+            finally:
+                if session.localization_tasks.get(key) is asyncio.current_task():
+                    session.localization_tasks.pop(key, None)
+
+        task = asyncio.create_task(finished())
+        session.localization_tasks[key] = task
+        self._foreground_hover_jobs.add(task)
+        task.add_done_callback(self._foreground_hover_jobs.discard)
+        task.add_done_callback(self._observe_task)
+        return output
 
     async def handle_client_request(
         self, session: LspSession, message: dict, *, on_request_id: Callable[[int], None] | None = None,
     ) -> dict:
         """处理浏览器发来的请求，返回可直接下发的 JSON-RPC 响应信封。"""
+        started = time.monotonic()
         rid = message.get("id")
         method = message.get("method")
         params = message.get("params")
+        hover_retry = False
+        if method == "textDocument/hover" and isinstance(params, dict):
+            hover_retry = params.get("codeAgentRetryTranslation") is True
+            params = {key: value for key, value in params.items() if key != "codeAgentRetryTranslation"}
         if not isinstance(method, str) or not method:
             return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32600, "message": "缺少 method"}}
         if method in ("initialize", "shutdown", "exit"):
@@ -1134,6 +1321,23 @@ class LspManager:
             mode = "range" if method.endswith("/range") else "full"
             if not isinstance(semantic, dict) or semantic.get(mode) is None or semantic.get(mode) is False:
                 return {"jsonrpc": "2.0", "id": rid, "result": None}
+        completion_context = None
+        completion_ticket = None
+        local_completion_resolve = False
+        if method == "completionItem/resolve" and isinstance(params, dict):
+            metadata = params.get("_code_agent_original")
+            if isinstance(metadata, dict) and "_completion_context" in metadata:
+                completion_ticket = metadata["_completion_context"]
+                completion_context = session.completion_contexts.get(completion_ticket) if isinstance(completion_ticket, str) else None
+                if (completion_context is None or not session.alive
+                        or completion_context["uri"] not in session.documents
+                        or session.documents[completion_context["uri"]] != completion_context["version"]):
+                    return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32801, "message": "补全列表已变化，请重新触发补全"}}
+                session.completion_contexts.move_to_end(completion_ticket)
+                uri = completion_context["uri"]
+                params = copy.deepcopy(completion_context["item"])
+                provider = session.capabilities.get("completionProvider")
+                local_completion_resolve = not (isinstance(provider, dict) and provider.get("resolveProvider"))
         version = session.documents.get(uri) if uri else None
         params = restore_protocol_text(params)
         actual_id: int | None = None
@@ -1145,7 +1349,8 @@ class LspManager:
                 on_request_id(value)
 
         try:
-            result = await self.request(session, method, params, timeout=timeout, on_request_id=assigned)
+            result = (copy.deepcopy(params) if local_completion_resolve else
+                      await self.request(session, method, params, timeout=timeout, on_request_id=assigned))
             if uri and session.documents.get(uri) != version:
                 return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32801, "message": "请求期间文档已变化"}}
             if method == "textDocument/rename" and result is not None:
@@ -1161,10 +1366,31 @@ class LspManager:
                         return {**action, "edit": self._check_workspace_edit(session, action["edit"])}
                     return action
                 result = [canonical_action(action) for action in result] if isinstance(result, list) else canonical_action(result)
-            result = await localize_result(self.documentation_translator, method, result,
-                                           scope=f"{session.project_id}:{session.tree_id}:{session.server_id}")
+            if method == "textDocument/completion":
+                self._remember_completion_items(session, result, uri, version)
+            if completion_context is not None and isinstance(result, dict) and not local_completion_resolve:
+                completion_context["item"] = {**completion_context["item"], **restore_protocol_text(result)}
+            if (method == "textDocument/hover" and uri and uri in session.documents
+                    and callable(getattr(self.documentation_translator, "project_hover", None))
+                    and isinstance(params, dict) and isinstance(params.get("position"), dict)):
+                result = await self._foreground_hover(session, result, uri, version, params["position"], retry=hover_retry)
+            else:
+                result = await localize_result(self.documentation_translator, method, result,
+                                           scope=f"{session.project_id}:{session.tree_id}:{session.server_id}",
+                                           completion_cache_only=method == "textDocument/completion",
+                                           completion_timeout=(max(0.0, min(COMPLETION_DOCUMENTATION_BUDGET,
+                                               timeout - (time.monotonic() - started)))
+                                               if method == "completionItem/resolve" else None))
             if uri and session.documents.get(uri) != version:
                 return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32801, "message": "翻译期间文档已变化"}}
+            if completion_ticket is not None and (not session.alive
+                    or session.completion_contexts.get(completion_ticket) is not completion_context):
+                return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32801, "message": "补全列表已失效，请重新触发补全"}}
+            if completion_ticket is not None and isinstance(result, dict):
+                metadata = result.get("_code_agent_original")
+                if not isinstance(metadata, dict):
+                    metadata = {}; result["_code_agent_original"] = metadata
+                metadata["_completion_context"] = completion_ticket
             return {"jsonrpc": "2.0", "id": rid, "result": result}
         except asyncio.CancelledError:
             if actual_id is not None:
@@ -1419,7 +1645,29 @@ class LspManager:
             # 必须按 section 返回真实设置：返回空对象等于告诉服务器"没配置"，
             # pyright 会退回默认（不做类型检查）→ 诊断永远是空的
             items = (message.get("params") or {}).get("items") or []
-            return [_section_of(session.settings, str(item.get("section") or "")) for item in items]
+            def configuration(item: dict) -> Any:
+                section = str(item.get("section") or "")
+                if session.server_id == "eslint" and not section:
+                    # vscode-eslint requests an empty section but expects its own flattened
+                    # settings, including defaults normally supplied by the VSCode extension.
+                    defaults = {
+                        "nodePath": None, "validate": "on", "run": "onType", "packageManager": "npm",
+                        "useFlatConfig": True, "experimental": {"useFlatConfig": False},
+                        "rulesCustomizations": [], "problems": {"shortenToSingleLine": False},
+                        "codeActionOnSave": {"enable": False, "mode": "all"},
+                        "codeAction": {"disableRuleComment": {"enable": True}, "showDocumentation": {"enable": True}},
+                        "options": {}, "quiet": False, "format": False,
+                        "workspaceFolder": {"uri": _root_uri(session.root), "name": session.root.name},
+                        "workingDirectory": {"directory": str(session.root), "changeProcessCWD": True},
+                    }
+                    configured = session.settings.get("eslint")
+                    return _deep_merge(defaults, configured if isinstance(configured, dict) else {})
+                return _section_of(session.settings, section)
+            return [configuration(item) for item in items]
+        if method == "workspace/diagnostic/refresh":
+            for uri in list(session.documents):
+                self._schedule_diagnostic_pull(session, uri)
+            return None
         if method == "window/workDoneProgress/create":
             return None
         if method in ("workspace/codeLens/refresh", "workspace/inlayHint/refresh"):

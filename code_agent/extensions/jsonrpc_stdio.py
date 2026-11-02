@@ -153,7 +153,8 @@ class JsonRpcStdio:
     # ------------------------------------------------------------------
     async def start(self, *, timeout: float = DEFAULT_TIMEOUT) -> None:
         creationflags = (
-            subprocess.CREATE_NEW_PROCESS_GROUP if platform.system() == "Windows" else 0
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+            if platform.system() == "Windows" else 0
         )
         try:
             self._proc = await asyncio.create_subprocess_exec(
@@ -329,6 +330,7 @@ class JsonRpcStdio:
                     killer = await asyncio.create_subprocess_exec(
                         "taskkill", "/F", "/T", "/PID", str(proc.pid),
                         stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                        creationflags=subprocess.CREATE_NO_WINDOW,
                     )
                     await killer.wait()
             else:

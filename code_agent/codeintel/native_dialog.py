@@ -52,6 +52,14 @@ class _GUID(ctypes.Structure):
         return cls.from_buffer_copy(uuid.UUID(value).bytes_le)
 
 
+class _FILETIME(ctypes.Structure):
+    _fields_ = [("low", _DWORD), ("high", _DWORD)]
+
+    @property
+    def value(self) -> int:
+        return (self.high << 32) | self.low
+
+
 _CLSID_FILE_OPEN_DIALOG = _GUID.parse("DC1C5A9C-E88A-4DDE-A5A1-60F82A20AEF7")
 _IID_FILE_OPEN_DIALOG = _GUID.parse("D57C7288-D4AD-4768-BE02-9D969532D960")
 _IID_SHELL_ITEM = _GUID.parse("43826D1E-E718-42EE-BC55-A1E261C37BFE")
@@ -168,11 +176,10 @@ class _WindowsFolderDialog:
         return options.value
 
     def show(self) -> dict[str, Any]:
-        # This is called only after a user's explicit request. No automatic focus stealing.
-        user32 = ctypes.WinDLL("user32")
-        user32.GetForegroundWindow.argtypes = []
-        user32.GetForegroundWindow.restype = ctypes.c_void_p
-        hr = _com_call(self.pointer, 3, [ctypes.c_void_p], user32.GetForegroundWindow())
+        # The helper may be killed on timeout or shutdown. Never give this
+        # out-of-process modal dialog another application's window as owner:
+        # abrupt helper exit could otherwise leave that owner disabled.
+        hr = _com_call(self.pointer, 3, [ctypes.c_void_p], None)
         if (hr & 0xFFFFFFFF) == _CANCELLED:
             return {"path": None, "cancelled": True}
         _checked(hr, "Show")
@@ -205,6 +212,40 @@ class _WindowsFolderDialog:
         self.close()
 
 
+def _configure_helper_dpi() -> None:
+    """Set the isolated helper STA's DPI context before creating Shell windows.
+
+    Python does not carry the desktop host's PMv2 manifest. Without this,
+    Windows bitmap-scales the picker on high-DPI displays. Never call this
+    from API imports or capability checks; only the short-lived helper uses it.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        set_thread = user32.SetThreadDpiAwarenessContext
+        set_thread.argtypes = [ctypes.c_void_p]
+        set_thread.restype = ctypes.c_void_p
+        if set_thread(ctypes.c_void_p(-4)):  # PER_MONITOR_AWARE_V2
+            return
+    except (OSError, AttributeError):
+        pass
+    try:
+        shcore = ctypes.WinDLL("shcore", use_last_error=True)
+        set_process = shcore.SetProcessDpiAwareness
+        set_process.argtypes = [ctypes.c_int]
+        set_process.restype = _HRESULT
+        if set_process(2) >= 0:  # PROCESS_PER_MONITOR_DPI_AWARE
+            return
+    except (OSError, AttributeError):
+        pass
+    try:
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.SetProcessDPIAware()
+    except (OSError, AttributeError):
+        pass
+
+
 def _folder_path(value: Any) -> str:
     if not isinstance(value, str) or not value or "\x00" in value:
         raise NativeDialogError("系统没有返回有效的文件夹路径")
@@ -225,13 +266,95 @@ def _arguments(start: str, title: str) -> tuple[str, str]:
     return start.strip(), title.strip()
 
 
+def _process_created(kernel32: Any, handle: Any) -> int:
+    created, exited, kernel, user = (_FILETIME() for _ in range(4))
+    kernel32.GetProcessTimes.argtypes = [ctypes.c_void_p] + [ctypes.POINTER(_FILETIME)] * 4
+    kernel32.GetProcessTimes.restype = ctypes.c_int
+    if not kernel32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                                   ctypes.byref(kernel), ctypes.byref(user)):
+        raise NativeDialogError("无法确认文件夹选择器的启动进程")
+    return created.value
+
+
+def _parent_identity() -> dict[str, int]:
+    """Private helper protocol, never supplied by an HTTP caller."""
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    return {"parent_pid": os.getpid(),
+            "parent_created": _process_created(kernel32, ctypes.c_void_p(-1))}
+
+
+def _helper_command() -> list[str]:
+    # Windows venv python.exe may be a redirector which starts another Python
+    # process. Holding/killing that stub would not own the dialog's lifetime.
+    # This file uses only stdlib: run the real interpreter and trusted script
+    # directly, without site imports, PYTHONPATH, or the codeintel package init.
+    executable = getattr(sys, "_base_executable", None) or sys.executable
+    return [executable, "-I", "-S", "-X", "utf8", str(Path(__file__).resolve()), "--helper"]
+
+
+def _start_parent_watchdog(pid: Any, created: Any):
+    """Watch a verified parent handle; on parent exit only this helper exits.
+
+    The launcher can terminate the backend without running its lifespan hooks.
+    A held process handle cannot be confused with a later recycled PID.
+    """
+    if (type(pid) is not int or pid <= 0 or pid != os.getppid()
+            or type(created) is not int or not 0 < created < 2**64):
+        raise NativeDialogError("文件夹选择器的启动进程无效")
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.argtypes = [_DWORD, ctypes.c_int, _DWORD]
+    kernel32.OpenProcess.restype = ctypes.c_void_p
+    kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+    kernel32.CloseHandle.restype = ctypes.c_int
+    kernel32.WaitForSingleObject.argtypes = [ctypes.c_void_p, _DWORD]
+    kernel32.WaitForSingleObject.restype = _DWORD
+    # SYNCHRONIZE plus PROCESS_QUERY_LIMITED_INFORMATION, never termination rights.
+    handle = kernel32.OpenProcess(0x100000 | 0x1000, False, pid)
+    if not handle:
+        raise NativeDialogError("文件夹选择器的启动进程已退出")
+    try:
+        if _process_created(kernel32, handle) != created or kernel32.WaitForSingleObject(handle, 0) != 0x102:
+            raise NativeDialogError("文件夹选择器的启动进程已变化或退出")
+    except BaseException:
+        kernel32.CloseHandle(handle)
+        raise
+    stopped = threading.Event()
+
+    def watch() -> None:
+        try:
+            while not stopped.is_set():
+                result = kernel32.WaitForSingleObject(handle, 100)
+                if result == 0:  # WAIT_OBJECT_0: the verified parent exited.
+                    os._exit(0)
+                if result != 0x102:  # WAIT_TIMEOUT; unknown state must not orphan a window.
+                    os._exit(1)
+        finally:
+            kernel32.CloseHandle(handle)
+
+    thread = threading.Thread(target=watch, name="folder-picker-parent", daemon=True)
+    try:
+        thread.start()
+    except BaseException:
+        kernel32.CloseHandle(handle)
+        raise
+
+    def close() -> None:
+        stopped.set()
+        thread.join(timeout=1)
+
+    return close
+
+
 async def _terminate(process: asyncio.subprocess.Process) -> None:
     if process.returncode is None:
         try:
             process.kill()
         except ProcessLookupError:
             pass
-    await process.wait()
+    try:
+        await asyncio.wait_for(process.wait(), timeout=5)
+    except asyncio.TimeoutError as exc:
+        raise NativeDialogError("文件夹选择器未能及时退出，请重试") from exc
 
 
 async def aclose() -> None:
@@ -256,11 +379,11 @@ async def pick_folder(start: str = "", title: str = "选择项目文件夹", *,
     try:
         # CREATE_NO_WINDOW hides only the helper's console; Explorer's picker stays visible.
         process = await asyncio.create_subprocess_exec(
-            sys.executable, "-m", "code_agent.codeintel.native_dialog", "--helper",
+            *_helper_command(),
             stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE, creationflags=0x08000000 if os.name == "nt" else 0)
         _active_process = process
-        data = json.dumps({"start": start, "title": title}, ensure_ascii=False).encode("utf-8")
+        data = json.dumps({"start": start, "title": title, **_parent_identity()}, ensure_ascii=False).encode("utf-8")
         try:
             stdout, _stderr = await asyncio.wait_for(process.communicate(data), timeout=timeout)
         except asyncio.TimeoutError as exc:
@@ -296,6 +419,7 @@ async def pick_folder(start: str = "", title: str = "选择项目文件夹", *,
 
 
 def _helper_main() -> int:
+    stop_watchdog = lambda: None
     try:
         payload = sys.stdin.buffer.read(_MAX_INPUT + 1)
         if len(payload) > _MAX_INPUT:
@@ -304,6 +428,8 @@ def _helper_main() -> int:
         if not isinstance(body, dict):
             raise NativeDialogError("文件夹选择参数无效")
         start, title = _arguments(body.get("start", ""), body.get("title", "选择项目文件夹"))
+        stop_watchdog = _start_parent_watchdog(body.get("parent_pid"), body.get("parent_created"))
+        _configure_helper_dpi()
         available = capabilities()
         if not available["available"]:
             raise NativeDialogUnavailable(available.get("reason", "系统文件夹选择不可用"))
@@ -313,6 +439,8 @@ def _helper_main() -> int:
         result = {"error": str(exc), "unavailable": isinstance(exc, NativeDialogUnavailable)}
     except Exception:
         result = {"error": "系统文件夹选择窗口无法打开，请重试", "unavailable": False}
+    finally:
+        stop_watchdog()
     # ASCII JSON survives Windows' console encodings; the receiving process decodes UTF-8.
     sys.stdout.write(json.dumps(result, ensure_ascii=True))
     sys.stdout.flush()

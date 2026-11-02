@@ -157,6 +157,7 @@ class CodeIntelService:
         self._chunk_stores: dict[str, Any] = {}
         #: "怎么拿模型"由 API 层注入（codeintel 不依赖 agent/session 那一层）
         self.brief_provider_factory: Any = None
+        self._brief_configuration_revision = 0
         self._guard = threading.RLock()
         self._scanning: set[str] = set()
         self._scan_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="code-index")
@@ -944,10 +945,23 @@ class CodeIntelService:
         也避免 codeintel 依赖 agent/session 那一层。
         """
         self.brief_provider_factory = factory
+        self.notify_brief_configuration_changed()
+
+    def notify_brief_configuration_changed(self) -> None:
+        """Release configuration-blocked jobs without starting model calls.
+
+        Settings saves and profile activation call this after the shared router
+        reloads. Running jobs keep their captured provider and source inventory.
+        """
         with self._guard:
+            self._brief_configuration_revision += 1
             self._brief_checked.clear()
             for state in self._fill_jobs.values():
                 state["retry_after"] = 0.0
+                if not state.get("running") and (state.get("block_reason") or state.get("error")):
+                    state.update({"state": "waiting", "error": "", "error_code": "", "block_reason": "", "action": "",
+                                  "failed": 0, "done": int(state.get("written") or 0) + int(state.get("skipped") or 0),
+                                  "note": "模型配置已更新，等待自动补全功能描述"})
 
     def bind_brief_loop(self, loop: asyncio.AbstractEventLoop) -> None:
         """Keep provider connections on the server loop, including sync GET callers."""
@@ -1014,6 +1028,9 @@ class CodeIntelService:
             "finished_at": state.get("finished_at") or "",
             "auto": bool(state.get("auto")),
             "error": state.get("error") or "",
+            "error_code": state.get("error_code") or "",
+            "block_reason": state.get("block_reason") or "",
+            "action": state.get("action") or "",
             "note": state.get("note") or "",
             "state": str(state.get("state") or "idle"),
             "revision": revision,
@@ -1179,6 +1196,14 @@ class CodeIntelService:
                     current["missing"] = max(0, int(current.get("coverage_total") or 0) - current["described"])
 
         state = self._brief_fill_state(project, tree_id)
+
+        def source_current() -> bool:
+            # A cancellation-resistant provider may return after close removed
+            # the index. Check its generation before any signature/index read.
+            with self._guard:
+                self._assert_brief_generation(key, generation)
+                return self._brief_signature(project, tree_id)[:4] == signature[:4]
+
         try:
             targets = await asyncio.to_thread(self._collect_targets, project, limit=limit, tree_id=tree_id, generation=generation)
             state = self._brief_fill_state(project, tree_id)
@@ -1196,6 +1221,8 @@ class CodeIntelService:
                     self._brief_checked[key] = signature
                 return
             provider = None
+            with self._guard:
+                configuration_revision = self._brief_configuration_revision
             if self.brief_provider_factory is not None:
                 provider = self.brief_provider_factory()
             if str(getattr(provider, "name", "")) == "offline":
@@ -1207,12 +1234,12 @@ class CodeIntelService:
             result = await brief_fill.fill(
                 targets, provider=provider, write=write, on_progress=progress, threaded_write=True,
                 timeout=BRIEF_MODEL_TIMEOUT,
-                should_continue=lambda: self._brief_signature(project, tree_id)[:4] == signature[:4],
+                should_continue=source_current,
             )
             # Reconcile coverage from current code and any manual descriptions
             # entered while this request was in flight, without another model call.
             await asyncio.to_thread(self._collect_targets, project, limit=0, tree_id=tree_id, generation=generation)
-            if self._brief_signature(project, tree_id)[:4] != signature[:4]:
+            if not source_current():
                 result.source_changed = True
                 result.aborted = "源码已变化，等待增量更新"
             view = result.view()
@@ -1231,11 +1258,21 @@ class CodeIntelService:
                             "error": "; ".join(view["errors"][:2]) if incomplete else "",
                             "note": view["aborted"] or ("重试后功能描述已补全" if view["errors"] and not incomplete else ""),
                             "model": view["model"],
+                            "error_code": view["error_code"],
+                            "block_reason": view["block_reason"],
+                            "action": view["action"],
                             "state": "waiting" if view["aborted"] else ("error" if incomplete else "complete"),
-                            "retry_after": monotonic() + BRIEF_RETRY_COOLDOWN if incomplete and not view["source_changed"] else 0.0,
+                            "retry_after": monotonic() + BRIEF_RETRY_COOLDOWN if incomplete and not view["source_changed"] and not view["block_reason"] else 0.0,
                             **initial_inventory,
                         }
                     )
+                    if configuration_revision != self._brief_configuration_revision and incomplete and view["block_reason"]:
+                        # A settings save can race a missing-key/auth result
+                        # from the previously captured provider. Do not let the
+                        # late result block the newly configured model forever.
+                        job.update({"state": "waiting", "error": "", "error_code": "", "block_reason": "", "action": "",
+                                    "failed": 0, "done": view["written"] + view["skipped"], "retry_after": 0.0,
+                                    "note": "模型配置已更新，等待自动补全功能描述"})
                     if not incomplete:
                         current_signature = self._brief_signature(project, tree_id)
                         if current_signature[:4] == signature[:4]:
@@ -1304,6 +1341,8 @@ class CodeIntelService:
                 return {"started": False, "reason": "项目正在关闭"}
             if auto and self._brief_checked.get(key) == signature:
                 return {"started": False, "reason": "当前代码的功能描述已检查", **self.brief_fill_status(project, tree_id)}
+            if auto and state.get("block_reason"):
+                return {"started": False, "reason": "等待模型配置更新后补全功能描述", **self.brief_fill_status(project, tree_id)}
             if auto and float(state.get("retry_after") or 0) > monotonic():
                 return {"started": False, "reason": "等待自动重试功能描述", **self.brief_fill_status(project, tree_id)}
             loop = self._brief_loop
@@ -1321,6 +1360,9 @@ class CodeIntelService:
                 "finished_at": "",
                 "auto": bool(auto),
                 "error": "",
+                "error_code": "",
+                "block_reason": "",
+                "action": "",
                 "note": "",
                 "model": "",
                 "project_id": project["id"],

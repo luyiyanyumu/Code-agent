@@ -160,3 +160,64 @@ def test_repeated_fitting_retains_selected_source_and_stable_budget():
 def test_unspecified_or_unknown_protected_ids_preserve_existing_api_behavior():
     messages = [{"role": "user", "content": "Implement."}] + exchange("source", "source " * 1000)
     assert compact_messages(messages, 800) == compact_messages(messages, 800, preserve_tool_ids={"unknown"})
+
+
+def test_parallel_source_bundle_uses_empty_assistant_share_for_complete_sources():
+    from code_agent.models.events import ProviderPayload
+
+    sources = {"implementation": "i" * 6350, "regression": "r" * 7540, "acceptance": "a" * 9999}
+    exchanges = [exchange(key, text) for key, text in sources.items()]
+    private = ProviderPayload("private protocol " * 60)
+    assistant = {"role": "assistant", "content": None, "_provider_payload": private,
+                 "tool_calls": [call for pair in exchanges for call in pair[0]["tool_calls"]]}
+    messages = [{"role": "system", "content": "trusted system"}, {"role": "user", "content": "goal " * 290},
+                assistant, *[pair[1] for pair in exchanges]]
+
+    result = compact_messages(messages, 24_000, preserve_tool_ids=sources)
+
+    assert bodies(result)["implementation"] == sources["implementation"]
+    assert bodies(result)["regression"] == sources["regression"]
+    assert TOOL_OMIT_MARKER in bodies(result)["acceptance"]
+    assert len(bodies(result)["acceptance"]) > 6000
+    assert next(m for m in result if m.get("role") == "assistant")["_provider_payload"] is private
+    assert_budget(result, 24_000)
+    assert_paired(result)
+
+
+def test_old_parallel_source_keeps_complete_implementation_after_new_test_read():
+    from code_agent.models.events import ProviderPayload
+
+    implementation = exchange("implementation", "i" * 6350)
+    acceptance = exchange("acceptance", "a" * 9999)
+    old = {**implementation[0], "_provider_payload": ProviderPayload("protocol " * 40),
+           "tool_calls": implementation[0]["tool_calls"] + acceptance[0]["tool_calls"]}
+    regression = exchange("regression", "r" * 7540)
+    messages = [{"role": "user", "content": "goal " * 290}, old,
+                implementation[1], acceptance[1], *regression]
+
+    result = compact_messages(messages, 24_000,
+                              preserve_tool_ids={"implementation", "acceptance", "regression"})
+
+    assert bodies(result)["implementation"] == "i" * 6350
+    assert bodies(result)["regression"] == "r" * 7540
+    assert TOOL_OMIT_MARKER in bodies(result)["acceptance"]
+    assert next(m for m in result if m.get("tool_calls", [{}])[0].get("id") == "implementation")["_provider_payload"] is old["_provider_payload"]
+    assert_budget(result, 24_000)
+    assert_paired(result)
+
+
+@pytest.mark.parametrize("with_reminder", [False, True])
+def test_latest_small_verification_result_survives_source_pressure(with_reminder):
+    source = exchange("source", "s" * 12_000)
+    verification = exchange("verification", "69 passed in 1.0s")
+    verification[0]["tool_calls"][0]["function"] = {"name": "bash", "arguments": '{"command":"pytest -q"}'}
+    messages = [{"role": "user", "content": "Implement and verify."}, *source, *verification]
+    if with_reminder:
+        messages.append({"role": "user", "content": "Reuse the source already read.", "_context_source": "auto"})
+
+    result = compact_messages(messages, 10_000, preserve_tool_ids={"source"})
+
+    assert bodies(result)["verification"] == "69 passed in 1.0s"
+    assert TOOL_OMIT_MARKER in bodies(result)["source"]
+    assert_budget(result, 10_000)
+    assert_paired(result)

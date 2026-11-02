@@ -66,6 +66,23 @@ def test_status_diffs_history_and_show_are_read_only(repo: Path):
     assert (repo / "source.txt").read_text() == "working\n"
 
 
+def test_background_git_keeps_output_without_allocating_a_windows_console(repo: Path, monkeypatch):
+    real_create = asyncio.create_subprocess_exec
+    options = []
+
+    async def tracked_create(*args, **kwargs):
+        options.append(kwargs)
+        return await real_create(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", tracked_create)
+    assert "initial read-tool fixture" in _read(repo, operation="log")["output"]
+    assert options
+    if os.name == "nt":
+        assert all(item["creationflags"] & subprocess.CREATE_NO_WINDOW for item in options)
+    else:
+        assert all(not item.get("creationflags") for item in options)
+
+
 @pytest.mark.parametrize("args", [
     {"operation": "commit"}, {"operation": "fetch"}, {"operation": "status", "command": "reset --hard"},
     {"operation": "log", "revision": "--output=owned"},

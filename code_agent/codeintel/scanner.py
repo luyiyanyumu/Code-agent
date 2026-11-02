@@ -13,7 +13,10 @@
 from __future__ import annotations
 
 import os
+import contextlib
+import signal
 import subprocess
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 
@@ -86,6 +89,52 @@ def _sniff_binary(path: Path) -> bool:
         return True  # 读不了就当作不可解析，别让扫描崩在单个文件上
 
 
+def _git_run(argv: list[str], *, input: bytes = b"") -> subprocess.CompletedProcess:
+    """Bound Git and its children without pipe-reader joins after timeout.
+
+    Windows wrappers may leave a child holding stdout after their parent dies.
+    Temporary files make completion depend on the owned process, not pipe EOF.
+    Reuse the IDE's suspended-start job so even an exited wrapper's descendants
+    remain owned. Import lazily because the runtime imports this scanner.
+    """
+    job = None
+    process = None
+    with tempfile.TemporaryFile() as stdin, tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        stdin.write(input)
+        stdin.seek(0)
+        options = {"stdin": stdin, "stdout": stdout, "stderr": stderr,
+                   "env": {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_OPTIONAL_LOCKS": "0"}}
+        if os.name == "nt":
+            options["creationflags"] = subprocess.CREATE_NO_WINDOW | 0x00000004  # CREATE_SUSPENDED
+        else:
+            options["start_new_session"] = True
+        try:
+            process = subprocess.Popen(argv, **options)
+            if os.name == "nt":
+                from code_agent.codeintel.runtime import _WindowsJob, _resume_windows_process
+                job = _WindowsJob(process.pid)
+                _resume_windows_process(process.pid)
+            process.wait(timeout=GIT_IGNORE_TIMEOUT)
+            # Inventory is bounded even if an unexpected Git wrapper is noisy.
+            if stdout.tell() > 32 * 1024 * 1024 or stderr.tell() > 1024 * 1024:
+                raise OSError("Git inventory output exceeds its limit")
+            stdout.seek(0)
+            stderr.seek(0)
+            return subprocess.CompletedProcess(argv, process.returncode, stdout.read(), stderr.read())
+        finally:
+            if job is not None:
+                job.close()
+            elif process is not None and os.name != "nt":
+                with contextlib.suppress(ProcessLookupError):
+                    os.killpg(process.pid, signal.SIGKILL)
+            if process is not None:
+                if process.poll() is None:
+                    with contextlib.suppress(OSError):
+                        process.kill()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    process.wait(timeout=1)
+
+
 def _git_ignored_paths(root: Path) -> tuple[frozenset[str], frozenset[str]]:
     """Ask Git for ignored paths once, including tracked build copies.
 
@@ -102,12 +151,10 @@ def _git_ignored_paths(root: Path) -> tuple[frozenset[str], frozenset[str]]:
     empty: tuple[frozenset[str], frozenset[str]] = (frozenset(), frozenset())
     if not any((parent / ".git").exists() for parent in (root, *root.parents)):
         return empty
-    kwargs = {"capture_output": True, "timeout": GIT_IGNORE_TIMEOUT,
-              "creationflags": subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0}
     try:
-        inventory = subprocess.run(
+        inventory = _git_run(
             ["git", "-c", "core.fsmonitor=false", "-C", str(root), "ls-files", "--cached", "--others", "--ignored",
-             "--exclude-standard", "--directory", "-z", "--", "."], **kwargs,
+             "--exclude-standard", "--directory", "-z", "--", "."],
         )
         if inventory.returncode != 0:
             return empty
@@ -118,9 +165,9 @@ def _git_ignored_paths(root: Path) -> tuple[frozenset[str], frozenset[str]]:
                      if parent.as_posix() != "."}
         if ancestors:
             payload = b"\0".join(os.fsencode(path) for path in sorted(ancestors)) + b"\0"
-            matched = subprocess.run(
+            matched = _git_run(
                 ["git", "-C", str(root), "check-ignore", "--no-index", "--stdin", "-z"],
-                input=payload, **kwargs,
+                input=payload,
             )
             if matched.returncode in {0, 1}:
                 directories.update(os.fsdecode(value).rstrip("/") for value in matched.stdout.split(b"\0") if value)

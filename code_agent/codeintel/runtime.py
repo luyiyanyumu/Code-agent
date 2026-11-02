@@ -726,8 +726,27 @@ class IdeRuntime:
                 "kind": kind, "script": goal, "cwd": cwd, "source": "project", "manifest": relative_of(root, manifest),
                 "runner": runner, "available": not reason, "reason": reason, "command": command}
 
-    def _argv(self, root: Path, directory: Path, *, kind, path="", script="", command="") -> list[str]:
+    @staticmethod
+    def launch_options(args=None, env=None) -> tuple[list[str], dict[str, str]]:
+        args = [] if args is None else args
+        env = {} if env is None else env
+        if not isinstance(args, list) or len(args) > 100 or any(
+            not isinstance(value, str) or len(value) > 8192 or "\x00" in value for value in args
+        ):
+            raise ValueError("args 必须是不超过 100 项的字符串数组")
+        if not isinstance(env, dict) or len(env) > 100 or any(
+            not isinstance(key, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]{0,127}", key)
+            or not isinstance(value, str) or len(value) > 16384 or "\x00" in value
+            for key, value in env.items()
+        ):
+            raise ValueError("env 必须是有效环境变量名与字符串值的映射（最多 100 项）")
+        return list(args), dict(env)
+
+    def _argv(self, root: Path, directory: Path, *, kind, path="", script="", command="", args=None) -> list[str]:
+        args, _ = self.launch_options(args)
         if kind == "command":
+            if args:
+                raise ValueError("自定义命令的参数请直接写入 command")
             if not command.strip() or len(command) > 8192 or "\x00" in command:
                 raise ValueError("command 必须是不超过 8192 字符的非空文本")
             name = "powershell" if os.name == "nt" else "bash"
@@ -748,12 +767,12 @@ class IdeRuntime:
             executable = str(select_python(root)) if kind == "python" else shutil.which("node")
             if not executable:
                 raise RuntimeUnavailable("未安装 Node.js")
-            return [executable, "-u", str(target)] if kind == "python" else [executable, str(target)]
+            return [executable, "-u", str(target), *args] if kind == "python" else [executable, str(target), *args]
         if kind == "pytest":
             target = safe_child(root, path) if path else None
             if target and not target.exists():
                 raise ValueError("pytest path 不存在")
-            return [str(select_python(root)), "-u", "-m", "pytest", *([str(target)] if target else [])]
+            return [str(select_python(root)), "-u", "-m", "pytest", *([str(target)] if target else []), *args]
         if kind == "npm":
             data = self._package(directory / "package.json")
             scripts = data.get("scripts", {})
@@ -766,8 +785,8 @@ class IdeRuntime:
                 cli = Path(npm).parent / "node_modules/npm/bin/npm-cli.js"
                 if not node or not cli.is_file():
                     raise RuntimeUnavailable("找不到 npm-cli.js；请检查 Node.js/npm 安装")
-                return [node, str(cli), "run", "--", script]
-            return [npm, "run", "--", script]
+                return [node, str(cli), "run", "--", script, *args]
+            return [npm, "run", "--", script, *args]
         if kind in ("maven", "gradle"):
             if path or command:
                 raise ValueError("Maven/Gradle 使用 script 任务和 cwd 模块目录，不直接运行 Java 服务文件")
@@ -782,13 +801,20 @@ class IdeRuntime:
             config = self._jvm_config(root, directory, kind, script, manifest, self._tools())
             if not config["available"]:
                 raise RuntimeUnavailable(config["reason"])
-            return config["command"]
+            argv = list(config["command"])
+            if os.name == "nt" and argv[1:5] == ["/d", "/v:off", "/s", "/c"]:
+                if any(re.search(r'[\x00-\x1f"%!&|<>^]', value) for value in args):
+                    raise ValueError("Windows Maven/Gradle 参数不能含 shell 控制字符；可通过 env 传入复杂设置")
+                argv[-1] += "".join(" " + subprocess.list2cmdline([value]) for value in args)
+                return argv
+            return [*argv, *args]
         raise ValueError("kind 仅支持 command、python、node、npm、pytest、maven、gradle")
 
-    def create_run(self, project_id, user_id, *, kind, path="", script="", command="", cwd="", name="") -> dict:
+    def create_run(self, project_id, user_id, *, kind, path="", script="", command="", cwd="", name="", args=None, env=None) -> dict:
         root = self._root(project_id, user_id)
         directory = self._cwd(root, cwd)
-        argv = self._argv(root, directory, kind=kind, path=path, script=script, command=command)
+        args, env = self.launch_options(args, env)
+        argv = self._argv(root, directory, kind=kind, path=path, script=script, command=command, args=args)
         if len(name) > 200 or "\x00" in name:
             raise ValueError("name 不合法")
         with self._lock:
@@ -800,7 +826,7 @@ class IdeRuntime:
                     # cmd parses its /c tail itself, not with C-runtime argv
                     # quoting. list2cmdline would turn its quotes into \".
                     launch = subprocess.list2cmdline(argv[:5]) + " " + argv[5]
-                record.process = subprocess.Popen(launch, cwd=directory, env=self._env(), stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                record.process = subprocess.Popen(launch, cwd=directory, env={**self._env(), **env}, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                                   stderr=subprocess.STDOUT, creationflags=_NO_WINDOW | (0x00000004 if os.name == "nt" else 0),
                                                   start_new_session=os.name != "nt")
                 if os.name == "nt":

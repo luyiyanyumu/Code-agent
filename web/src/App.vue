@@ -3,6 +3,9 @@ import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, r
 import { api, getToken, setToken } from './api.js'
 import DialogHost from './components/ui/DialogHost.vue'
 import AgentLogo from './components/ui/AgentLogo.vue'
+import DesktopSystemPanel from './components/DesktopSystemPanel.vue'
+import DesktopWindowControls from './components/DesktopWindowControls.vue'
+import { desktopRuntime } from './lib/desktopRuntime.js'
 import { initializePreferences } from './lib/preferences.js'
 import { SETTINGS_SECTIONS } from './lib/settingsCatalog.js'
 
@@ -12,6 +15,10 @@ const SettingsView = defineAsyncComponent(() => import('./views/SettingsView.vue
 const user = ref(null)
 const booting = ref(true)
 const bootError = ref('')
+const desktopAvailable = desktopRuntime.available()
+const integratedTitlebar = desktopRuntime.integratedTitlebar()
+const desktopPanelOpen = ref(false)
+const desktopState = ref(null)
 
 function savedPreference(key, fallback) {
   try { return localStorage.getItem(key) || fallback } catch { return fallback }
@@ -62,6 +69,7 @@ function onSettingsShortcut(event) {
   }
 }
 onMounted(() => {
+  desktopRuntime.connect()
   window.addEventListener('keydown', onSettingsShortcut)
   // 丢弃旧全局页面的启动状态，保留其迁移后的设置分类。
   try { localStorage.setItem('code-agent:view', 'code') } catch { /* 工作区仍可使用。 */ }
@@ -70,6 +78,7 @@ onMounted(() => {
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', onSettingsShortcut)
   disposePreferences()
+  desktopRuntime.dispose()
 })
 
 async function restore() {
@@ -89,23 +98,26 @@ onMounted(restore)
 </script>
 
 <template>
-  <div v-if="booting || bootError" class="boot" aria-live="polite">
+  <div v-if="booting || bootError" class="boot" :class="{ 'desktop-boot': integratedTitlebar }" aria-live="polite">
     <div class="boot-card">
       <AgentLogo class="logo" :wordmark="false" :size="44" />
       <h1>{{ bootError ? '工作区暂时无法连接' : '正在打开工作区' }}</h1>
       <p>{{ bootError || '连接服务，准备你的工作空间…' }}</p>
       <button v-if="bootError" class="primary" @click="restore">重新连接</button>
+      <button v-if="bootError && desktopAvailable" class="boot-system" @click="desktopPanelOpen = true">应用状态与日志</button>
       <span v-else class="boot-spinner" aria-hidden="true"></span>
     </div>
   </div>
-  <div v-else class="shell">
+  <div v-else class="shell" :class="{ 'desktop-titlebar-shell': integratedTitlebar }">
     <a class="skip-link" href="#main-workspace">跳转到主要内容</a>
     <main id="main-workspace" class="content" :aria-label="activeLabel" tabindex="-1">
-      <CodeView v-show="view === 'code'" :key="user.id || user.user_id" :user="user" :visible="view === 'code'" @open-settings="openSettings" />
-      <SettingsView v-if="settingsVisited" v-show="view === 'settings'" :user="user" :visible="view === 'settings'" :initial-section="settingsInitialSection" :initial-tool-tab="settingsInitialToolTab" @close="closeSettings" @section-change="settingsSectionChanged" @navigate="settingsNavigate" />
+      <CodeView v-show="view === 'code'" :key="user.id || user.user_id" :user="user" :visible="view === 'code'" :desktop-state="desktopState" @open-settings="openSettings" @open-desktop="desktopPanelOpen = true" />
+      <SettingsView v-if="settingsVisited" v-show="view === 'settings'" :user="user" :visible="view === 'settings'" :desktop-available="desktopAvailable" :initial-section="settingsInitialSection" :initial-tool-tab="settingsInitialToolTab" @close="closeSettings" @section-change="settingsSectionChanged" @navigate="settingsNavigate" @open-desktop="desktopPanelOpen = true" />
     </main>
   </div>
   <DialogHost />
+  <DesktopWindowControls v-if="integratedTitlebar" />
+  <DesktopSystemPanel v-if="desktopAvailable" :open="desktopPanelOpen" @close="desktopPanelOpen = false" @status="desktopState = $event" />
 </template>
 
 <style scoped>
@@ -115,10 +127,14 @@ onMounted(restore)
 .boot-card h1 { font-size: var(--fs-xl); color: var(--text); margin: 0 0 var(--sp-2); }
 .boot-card p { margin: 0 0 var(--sp-6); overflow-wrap: anywhere; }
 .boot-spinner { display: block; width: 22px; height: 22px; margin: 0 auto; border: 2px solid var(--border-strong); border-top-color: var(--accent); border-radius: 50%; animation: boot-spin .8s linear infinite; }
+.boot-system { margin-left: 8px; }
 @keyframes boot-spin { to { transform: rotate(360deg); } }
 .shell { height: 100%; display: flex; min-width: 0; min-height: 0; }
 .content { flex: 1; outline: none; background: var(--bg); overflow: hidden; display: flex; flex-direction: column; min-width: 0; min-height: 0; position: relative; }
 .skip-link { position: fixed; top: 8px; left: 12px; z-index: 1000; padding: 8px 14px; background: var(--panel); border-radius: 8px; box-shadow: var(--shadow-pop); transform: translateY(-160%); }
 .skip-link:focus { transform: translateY(0); }
+.desktop-boot::before { content: ''; position: fixed; top: 0; left: 0; right: 138px; height: 35px; -webkit-app-region: drag; app-region: drag; }
+.desktop-titlebar-shell :deep(.settings-header) { padding-right: 158px; -webkit-app-region: drag; app-region: drag; user-select: none; }
+.desktop-titlebar-shell :deep(.settings-header button), .desktop-titlebar-shell :deep(.settings-header a), .desktop-titlebar-shell :deep(.settings-header input) { -webkit-app-region: no-drag; app-region: no-drag; }
 @media (prefers-reduced-motion: reduce) { .boot-spinner { animation: none; } }
 </style>

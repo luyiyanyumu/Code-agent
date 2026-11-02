@@ -29,6 +29,13 @@ root = fso.GetParentFolderName(WScript.ScriptFullName)
 logDir = root & "\logs"
 q = Chr(34)
 
+' A normal double-click opens the independent control panel. Explicit service
+' flags retain the existing automation-compatible launch path below.
+If WScript.Arguments.Count = 0 And fso.FileExists(root & "\code-agent-launcher.vbs") Then
+    sh.Run "wscript.exe " & q & root & "\code-agent-launcher.vbs" & q, 0, False
+    WScript.Quit 0
+End If
+
 If Not fso.FolderExists(logDir) Then fso.CreateFolder(logDir)
 
 ' Serialize the entire flow, including the detached service launch and probes.

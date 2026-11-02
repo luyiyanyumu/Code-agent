@@ -3,7 +3,8 @@
 import { createJavaTokenIndex, describeJavaToken } from './javaTokenDocumentation.js'
 import { isChineseDocumentationTranslation } from './javaSymbolPurpose.js'
 import { hoverMarkdownStrings, normalizeHoverDocumentation } from './hoverDocumentation.js'
-import { describeSymbolHover, documentationTranslationState, documentationTranslationNote } from './symbolHoverDocumentation.js'
+import { describeSymbolHover, documentationTranslationState, documentationTranslationNote, chineseDocumentationProjection } from './symbolHoverDocumentation.js'
+import { compactSymbolHover } from './compactSymbolHover.js'
 
 const indexes = new WeakMap()
 const semanticCache = new WeakMap()
@@ -114,6 +115,7 @@ export function getTokenHover(model, position, serverResult = null) {
   if (!model || model.isDisposed?.()) return null
   if (model.getLanguageId?.() !== 'java') return describeSymbolHover({ model, position, serverResult, semanticToken: semanticAt(model, position) })
   const raw = serverResult?.contents == null ? [] : Array.isArray(serverResult.contents) ? serverResult.contents : [serverResult.contents]
+  const projection = chineseDocumentationProjection(serverResult, 'java')
   const documentationTranslation = documentationTranslationState(serverResult?.documentation_translation) === 'ready' && isChineseDocumentationTranslation(serverResult?.documentation_translation)
     ? { language: 'zh-CN', source: 'configured-model' } : null
   let description = null, range
@@ -126,16 +128,29 @@ export function getTokenHover(model, position, serverResult = null) {
       range = { startLineNumber: start.lineNumber, startColumn: start.column, endLineNumber: end.lineNumber, endColumn: end.column }
     }
   }
-  const translationNote = raw.length ? documentationTranslationNote(serverResult?.documentation_translation) : []
-  const allContents = [...(description?.contents || []), ...translationNote, ...raw]
+  let tokenSections = description?.contents || []
+  let originalSections = projection.originalSections
+  // Local Javadoc can be English even when the server is still translating.
+  // Keep the classification/type facts, but do not duplicate English prose in
+  // the prominent Chinese “作用” field. The complete original remains available.
+  if (description?.purpose && !/\p{Script=Han}/u.test(description.purpose) && /[a-z]/i.test(description.purpose)) {
+    originalSections = [...tokenSections, ...(originalSections.length ? originalSections : normalizeHoverDocumentation(raw))]
+    tokenSections = tokenSections.map(section => ({ ...section, value: section.value.split('\n\n').map(paragraph =>
+      paragraph.startsWith('**作用：**') ? ''
+        : paragraph.startsWith('作用依据：') ? '' : paragraph).filter(Boolean).join('\n\n') }))
+  }
+  const translationNote = raw.length ? documentationTranslationNote(serverResult?.documentation_translation, projection) : []
+  const allContents = [...tokenSections, ...translationNote,
+    ...(originalSections.length ? [{ kind: 'markdown', value: 'Ctrl+Q 查看完整说明或原文。' }] : []), ...projection.sections]
   const sections = normalizeHoverDocumentation(allContents)
   if (!sections.length) return null
   const serverRange = serverResult?.range
   return {
-    sections, contents: hoverMarkdownStrings(allContents),
+    sections, originalSections, untranslated: projection.untranslated, contents: hoverMarkdownStrings(allContents),
     // The project function description can be inserted below this word's
     // category while leaving the original language-service sections intact.
-    tokenSection: description?.contents?.[0],
+    tokenSection: tokenSections[0],
+    ...(description?.symbol ? { symbol: description.symbol } : {}),
     ...(documentationTranslation ? { documentationTranslation } : {}),
     ...(serverResult?.documentation_translation && typeof serverResult.documentation_translation === 'object'
       ? { documentation_translation: { ...serverResult.documentation_translation } } : {}),
@@ -186,7 +201,7 @@ export function installTokenHoverProvider(monaco) {
     async provideHover(model, position, token) {
       if (token?.isCancellationRequested || model.isDisposed?.()) return null
       const version = revision(model), local = getTokenHover(model, position)
-      if (local?.localOnly) return local
+      if (local?.localOnly) return compactSymbolHover(local)
       const source = [...sources].find(candidate => candidate.matches(model))
       let result = local
       if (source) {
@@ -197,7 +212,7 @@ export function installTokenHoverProvider(monaco) {
         }
       }
       if (token?.isCancellationRequested || model.isDisposed?.() || revision(model) !== version) return null
-      return withTokenBusiness(model, position, result, token)
+      return compactSymbolHover(await withTokenBusiness(model, position, result, token))
     },
   })
   installations.set(monaco, provider)

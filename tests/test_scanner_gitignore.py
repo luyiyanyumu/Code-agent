@@ -6,6 +6,9 @@ import asyncio
 import os
 import shutil
 import subprocess
+import socket
+import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -134,8 +137,33 @@ def test_missing_or_timed_out_git_preserves_static_scan(tmp_path, monkeypatch, f
     def fail(*args, **kwargs):
         raise failure
 
-    monkeypatch.setattr(scanner.subprocess, "run", fail)
+    monkeypatch.setattr(scanner, "_git_run", fail)
     assert scanned(root) == {"output/Source.java"}
+
+
+def test_inventory_timeout_reaps_child_holding_inherited_output(tmp_path, monkeypatch):
+    # A real wrapper/child pair recreates the Windows pipe EOF hang. The child
+    # owns a port so cleanup is checked externally, not by a mocked kill call.
+    with socket.socket() as reserve:
+        reserve.bind(("127.0.0.1", 0))
+        port = reserve.getsockname()[1]
+    ready = tmp_path / "child-ready"
+    child = ("import socket,time,pathlib; s=socket.socket(); "
+             f"s.bind(('127.0.0.1',{port})); s.listen(); "
+             f"pathlib.Path({str(ready)!r}).write_text('ready'); "
+             "print('child inherited output',flush=True); time.sleep(60)")
+    parent = ("import subprocess,sys,time; "
+              f"subprocess.Popen([sys.executable,'-u','-c',{child!r}],close_fds=False); "
+              "time.sleep(60)")
+    monkeypatch.setattr(scanner, "GIT_IGNORE_TIMEOUT", 2)
+    started = time.monotonic()
+    with pytest.raises(subprocess.TimeoutExpired):
+        scanner._git_run([sys.executable, "-u", "-c", parent])
+    assert time.monotonic() - started < 6
+    assert ready.is_file(), "The real child must have started before timeout"
+    with socket.socket() as probe:
+        probe.settimeout(.3)
+        assert probe.connect_ex(("127.0.0.1", port)) != 0
 
 
 def test_incremental_scan_removes_old_copies_after_new_ignore_rule(tmp_path, agent_home):

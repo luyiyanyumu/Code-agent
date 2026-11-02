@@ -270,6 +270,19 @@ function markType(index, type) {
   }
 }
 
+function declarationModifiers(index, typeStart) {
+  const modifiers = []
+  // Read only this declaration's prefix. Skip annotation arguments as a unit,
+  // so words such as final/static in annotation values cannot become modifiers.
+  for (let i = typeStart - 1; i >= 0; i--) {
+    const word = index.tokens[i].word
+    if (word === ')' && index.pairs.has(i)) { i = index.pairs.get(i); continue }
+    if ([';', '{', '}', '(', ',', '=', ':', '->'].includes(word)) break
+    if (DECL_MODIFIERS.has(word)) modifiers.push(word)
+  }
+  return modifiers.reverse()
+}
+
 function simpleStatementEnd(index, start) {
   const { tokens, pairs } = index
   if (tokens[start]?.word === '{') return pairs.get(start) ?? null
@@ -381,9 +394,14 @@ function buildRoles(index) {
     const method = index.methodAt[i]
     const owner = index.typeAt[i]
     const methodLocal = method && (!owner || method.start > owner.start)
+      || owner && index.braceAt[i]?.start !== owner.start
     const category = parameter?.category || (methodLocal ? '局部变量' : owner ? '字段' : '变量')
     const description = category === '参数' ? '接收调用者传入的值。' : category === '记录组件' ? '声明记录类的一项数据，并关联同名访问器。' : category === '字段' ? '声明保存在类型或实例中的状态。' : '声明一个用于保存值或对象引用的变量。'
-    const role = { category, description, type: type.text, typeLabel: '声明类型', inferred: true, declaration: true, declarationTokenIndex: i }
+    const modifiers = declarationModifiers(index, type.start)
+    // Fields declared by interfaces and annotation types are implicitly public,
+    // static and final, even when none of those words appears in the source.
+    if (category === '字段' && ['接口', '注解类型'].includes(owner?.category)) modifiers.push('public', 'static', 'final')
+    const role = { category, description, type: type.text, typeLabel: '声明类型', modifiers: [...new Set(modifiers)], inferred: true, declaration: true, declarationTokenIndex: i }
     roles.set(i, role); markType(index, type)
     let scopeStart = 0, scopeEnd = tokens.length
     const controlHeader = index.controlHeaderAt[i]
@@ -394,6 +412,23 @@ function buildRoles(index) {
     if (controlHeader?.scopeEnd === null) declaration.uncertainRange = [controlHeader.end, controlHeader.uncertainEnd]
     if (!index.declarations.has(declaration.name)) index.declarations.set(declaration.name, [])
     index.declarations.get(declaration.name).push(declaration)
+    // A single declaration may bind several names (int a = f(), b = 2).
+    // Reuse its proven type/modifiers and scope, skipping initializer groups;
+    // parameter lists never share a declaration type across commas.
+    if (!parameter) {
+      for (let j = i + 1; j < tokens.length; j++) {
+        if ([';', ')', ':', '}'].includes(tokens[j].word)) break
+        if (['(', '[', '{'].includes(tokens[j].word) && pairs.has(j)) { j = pairs.get(j); continue }
+        if (tokens[j].word !== ',' || tokens[j + 1]?.kind !== 'identifier' || KEYWORDS[tokens[j + 1].word] || !['=', ';', ',', '['].includes(tokens[j + 2]?.word)) continue
+        const sibling = j + 1
+        if (roles.has(sibling)) continue
+        const siblingRole = { ...role, declarationTokenIndex: sibling }
+        roles.set(sibling, siblingRole)
+        const item = { ...declaration, i: sibling, name: tokens[sibling].word, role: siblingRole }
+        if (!index.declarations.has(item.name)) index.declarations.set(item.name, [])
+        index.declarations.get(item.name).push(item)
+      }
+    }
   }
 }
 
@@ -464,11 +499,12 @@ function hoverEvidence(contents, word) {
   }
   const signatureLines = javaBlocks(contents).flatMap(value => value.split(/\r\n?|\n/)).map(line => line.trim()).filter(Boolean)
   for (const line of signatureLines) {
+    const modifiers = line.match(/^(?:(?:public|protected|private|static|final|abstract|native|synchronized|default|strictfp)\s+)+/)?.[0].trim().split(/\s+/) || []
     const signature = line.replace(/^(?:(?:public|protected|private|static|final|abstract|native|synchronized|default|strictfp)\s+)+/, '')
     const method = signature.match(new RegExp(`^([\\p{L}\\p{N}_$.[\\]<>?, &]+?)\\s+(?:[\\p{L}\\p{N}_$.]+\\.)?${escaped}\\s*\\(`, 'u'))
     if (method && !/[=:]/.test(method[1]) && !/^\s*(?:return|Source)\b/.test(method[1])) return { category: '方法', description: '语言服务器提供了此方法的签名。', type: method[1].trim(), typeLabel: '返回类型' }
     const variable = signature.match(new RegExp(`^([\\p{L}\\p{N}_$.[\\]<>?, &]+?)\\s+((?:[\\p{L}\\p{N}_$.]+\\.)?)${escaped}(?:\\s*(?:[;=]|$)|\\s+-\\s+)`, 'u'))
-    if (variable && !/[=:]/.test(variable[1]) && !/^\s*(?:return|Source)\b/.test(variable[1])) return { category: variable[2] ? '字段' : '变量', description: '语言服务器提供了此符号的类型。', type: variable[1].trim(), typeLabel: '类型' }
+    if (variable && !/[=:]/.test(variable[1]) && !/^\s*(?:return|Source)\b/.test(variable[1])) return { category: variable[2] || modifiers.includes('static') ? '字段' : '变量', description: '语言服务器提供了此符号的类型。', type: variable[1].trim(), typeLabel: '类型', modifiers }
   }
   return null
 }
@@ -477,6 +513,17 @@ function localRole(index, token) {
   const i = token.codeIndex
   if (index.roles.has(i)) return index.roles.get(i)
   const before = index.tokens[i - 1]?.word
+  // A known source type may qualify its own static fields. Do not bind arbitrary
+  // receivers, a shadowing variable named like the type, or an ambiguous type.
+  if (before === '.' && index.tokens[i - 2]?.word !== 'this' && index.tokens[i - 3]?.word !== '.') {
+    const qualifier = index.tokens[i - 2]?.word
+    const shadowed = (index.declarations.get(qualifier) || []).some(item => i - 2 > item.scopeStart && i - 2 < item.scopeEnd && (i - 2 >= item.i || item.role.category === '字段'))
+    const owners = shadowed ? [] : index.typeRanges.filter(owner => owner.name === qualifier)
+    if (owners.length === 1) {
+      const field = (index.declarations.get(token.word) || []).find(item => item.role.category === '字段' && item.ownerStart === owners[0].start && item.role.modifiers?.includes('static'))
+      if (field) return { ...field.role, declaration: false, description: '引用此类型声明的静态字段。' }
+    }
+  }
   if (before !== '.' || index.tokens[i - 2]?.word === 'this') {
     const sameName = index.declarations.get(token.word) || []
     const explicitThis = before === '.'
@@ -493,6 +540,16 @@ function compatibleBinding(local, category) {
   return local.category === category
     || category === '变量' && ['参数', '局部变量', '字段', '记录组件'].includes(local.category)
     || local.category === '注解属性' && category === '方法'
+}
+
+function displayCategory(role) {
+  const modifiers = role.modifiers || []
+  const readonly = modifiers.includes('final') || modifiers.includes('readonly')
+  if (role.category === '字段' || role.category === '变量' && modifiers.includes('static')) {
+    return modifiers.includes('static') ? readonly ? '类常量' : '静态变量' : readonly ? '只读成员变量' : '成员变量'
+  }
+  if (role.category === '局部变量' && readonly) return '只读局部变量'
+  return role.category
 }
 
 function syntaxPurpose(role) {
@@ -513,6 +570,11 @@ function syntaxPurpose(role) {
     变量: '保存值或对象引用，供当前代码读取或赋值。',
     局部变量: '保存当前代码块中的临时数据，其名称仅在所属作用域内可用。',
     字段: '保存类或实例的状态，供所属类型的代码读取或更新。',
+    类常量: '由所属类型共享，初始化后不能重新赋值；若保存对象引用，对象内容仍可能改变。',
+    静态变量: '由所属类型的所有实例共享，可通过类型名称读取或更新。',
+    成员变量: '保存每个实例各自的状态，随所属对象使用。',
+    只读成员变量: '保存每个实例各自的状态，初始化后不能重新赋值；引用对象的内容仍可能改变。',
+    只读局部变量: '保存当前作用域内的值或引用，初始化后不能重新赋值；引用对象的内容仍可能改变。',
     方法: '封装可被调用的操作，接收参数并执行方法定义的逻辑。',
     方法调用: '执行目标方法，将实参传给它并取得结果或完成相应操作。',
     构造器: '创建实例时执行初始化，设置对象的初始状态。',
@@ -561,8 +623,13 @@ export function describeJavaToken({ text = '', offset, semanticToken = null, hov
     const semantic = modifiers.includes('constructor') ? SEMANTIC.constructor : SEMANTIC[semanticToken?.type]
     if (semantic) {
       const [category, description] = semantic
-      role = { category, description, type: evidence?.type || local.type, typeLabel: evidence?.typeLabel || local.typeLabel }
-      if (compatibleBinding(local, category)) role.declarationTokenIndex = local.declarationTokenIndex
+      const bound = compatibleBinding(local, category)
+      const signature = evidence && (compatibleBinding(evidence, category) || compatibleBinding({ category }, evidence.category)) ? evidence : null
+      // "variable" is generic in LSP; a compatible source binding still tells
+      // us whether this is a parameter, local, record component or field.
+      role = { ...(bound ? local : {}), category: category === '变量' && bound ? local.category : category, description,
+        type: signature?.type || (bound ? local.type : undefined), typeLabel: signature?.typeLabel || (bound ? local.typeLabel : undefined),
+        modifiers: [...new Set([...(bound ? local.modifiers || [] : []), ...(signature?.modifiers || []), ...modifiers])] }
       source = '语言服务器语义信息'
       if (local.category === '注解属性' && ['property', 'field', 'method', 'function', 'variable'].includes(semanticToken?.type)) {
         role = { ...role, category: local.category, description: local.description, typeLabel: '属性类型' }
@@ -570,12 +637,13 @@ export function describeJavaToken({ text = '', offset, semanticToken = null, hov
       }
     } else if (evidence) {
       // A bare variable signature cannot distinguish a parameter from a local; syntax can.
-      role = { ...local, ...evidence, category: evidence.category === '变量' && ['参数', '局部变量', '字段', '记录组件'].includes(local.category) ? local.category : evidence.category }
-      if (!compatibleBinding(local, evidence.category)) delete role.declarationTokenIndex
+      const bound = compatibleBinding(local, evidence.category)
+      role = { ...(bound ? local : {}), ...evidence, category: evidence.category === '变量' && bound ? local.category : evidence.category,
+        modifiers: [...new Set([...(bound ? local.modifiers || [] : []), ...(evidence.modifiers || [])])] }
       if (local.category === '注解属性' && evidence.category === '方法') role = { ...role, category: '注解属性', typeLabel: '属性类型' }
       source = '语言服务器签名'
     } else role = local
-    const attributes = modifiers.map(modifier => MODIFIERS[modifier]).filter(Boolean)
+    const attributes = (role.modifiers || modifiers).map(modifier => MODIFIERS[modifier]).filter(Boolean)
     if (attributes.length) role = { ...role, attributes: [...new Set(attributes)] }
   }
   const symbolPurpose = localOnly ? null : resolveJavaSymbolPurpose({ index, token, role, hoverContents, documentationTranslation })
@@ -585,8 +653,12 @@ export function describeJavaToken({ text = '', offset, semanticToken = null, hov
   const purpose = symbolPurpose?.source !== '语言服务器文档' && symbolPurpose
     || builtinPurpose || symbolPurpose
   if (builtinPurpose?.category && role.category === '标识符（语义尚未解析）') role = { ...role, category: builtinPurpose.category }
+  // Keep the stable binding category above for scope resolution and Javadoc.
+  // Only the final presentation uses the more precise, familiar terminology.
+  const category = displayCategory(role)
+  const fallbackPurpose = syntaxPurpose({ ...role, category })
   const displayWord = ['comment', 'documentation', 'string', 'textBlock'].includes(token.kind) && token.word.length > 64 ? token.word.slice(0, 61) + '…' : token.word
-  const lines = [`${code(displayWord)} · **${role.category}**`, `**作用：** ${purpose ? purposeText(purpose.text) : syntaxPurpose(role)}`]
+  const lines = [`${code(displayWord)} · **${category}**`, `**作用：** ${purpose ? purposeText(purpose.text) : fallbackPurpose}`]
   if (role.type) lines.push(`**${role.typeLabel || '类型'}：** ${code(role.type)}`)
   if (role.attributes?.length) lines.push(`**属性：** ${role.attributes.join('、')}`)
   else if (role.declaration) lines.push('**属性：** 声明位置')
@@ -596,7 +668,10 @@ export function describeJavaToken({ text = '', offset, semanticToken = null, hov
   else if (!localOnly) lines.push('作用依据：Java 语法用途。')
   if (purpose?.url) lines.push(`[${code(token.word)} 官方说明](${purpose.url})`)
   const declaration = Number.isInteger(role.declarationTokenIndex) ? index.tokens[role.declarationTokenIndex] : null
-  return { start: token.start, end: token.end, word: token.word, category: role.category, localOnly,
+  return { start: token.start, end: token.end, word: token.word, category, localOnly,
+    symbol: { name: displayWord, language: 'java', category, purpose: purpose?.text || fallbackPurpose,
+      ...(role.type ? { type: role.type, typeLabel: role.typeLabel || '类型' } : {}),
+      ...(role.attributes?.length ? { attributes: [...role.attributes] } : {}) },
     ...(declaration ? { declarationOffset: declaration.start } : {}),
-    purpose: purpose?.text || syntaxPurpose(role), contents: [{ kind: 'markdown', value: lines.join('\n\n') }] }
+    purpose: purpose?.text || fallbackPurpose, contents: [{ kind: 'markdown', value: lines.join('\n\n') }] }
 }

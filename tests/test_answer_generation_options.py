@@ -60,11 +60,14 @@ def test_quick_answer_body_for_chat_and_stream(stream, model):
     assert len(bodies) == 1
     body = bodies[0]
     assert body["max_tokens"] == 3072
-    assert body["thinking"] == {"type": "disabled"}
-    assert body["tool_choice"] == "none"
+    if "/" not in model:
+        assert body["thinking"] == {"type": "enabled"}
+        assert body["reasoning_effort"] == "high"
+    else:
+        assert "thinking" not in body and "reasoning_effort" not in body
     assert body["messages"] == MESSAGES
     assert set(body) <= {
-        "model", "messages", "max_tokens", "thinking", "tool_choice", "stream", "stream_options",
+        "model", "messages", "max_tokens", "thinking", "reasoning_effort", "stream", "stream_options",
     }
     assert provider.max_output_tokens == 32_768
     assert current_generation_options() is None
@@ -87,11 +90,14 @@ def test_request_cap_does_not_raise_configured_output_limit(configured, override
     ("gpt-4o-mini", [], True), ("custom-deepseek-flash", [], True),
     ("deepseek-v4-pro-preview", [], True),
 ])
-def test_thinking_switch_only_for_explicit_models_and_answer_only_request(model, tools, simple):
+def test_reasoning_capability_is_independent_of_request_shortcut(model, tools, simple):
     provider = OpenAICompatProvider(api_key="test-only", model=model)
     with generation_options(GenerationOptions(max_output_tokens=512, simple_answer=simple)):
         body = provider._body(MESSAGES, tools, False)
-    assert "thinking" not in body
+    if model == "deepseek-flash":
+        assert body["thinking"] == {"type": "enabled"} and body["reasoning_effort"] == "high"
+    else:
+        assert "thinking" not in body and "reasoning_effort" not in body
     assert "tool_choice" not in body
     assert body.get("tools", []) == [{"type": "function", "function": t} for t in tools]
 
@@ -101,6 +107,7 @@ def test_regular_request_body_remains_unchanged():
     expected = {
         "model": "deepseek-flash", "messages": MESSAGES, "max_tokens": 8192,
         "tools": [{"type": "function", "function": t} for t in TOOLS],
+        "thinking": {"type": "enabled"}, "reasoning_effort": "high",
     }
     assert provider._body(MESSAGES, TOOLS, False) == expected
     with generation_options(GenerationOptions(max_output_tokens=512, simple_answer=True)):
@@ -152,11 +159,10 @@ def test_shared_provider_concurrent_requests_keep_independent_options():
 
     asyncio.run(run())
     assert bodies["quick"]["max_tokens"] == 3072
-    assert bodies["quick"]["thinking"] == {"type": "disabled"}
     assert bodies["normal"]["max_tokens"] == 8192
     assert bodies["bounded"]["max_tokens"] == 512
-    assert "thinking" not in bodies["normal"]
-    assert "thinking" not in bodies["bounded"]
+    for body in bodies.values():
+        assert body["thinking"] == {"type": "enabled"} and body["reasoning_effort"] == "high"
     assert provider.max_output_tokens == 8192
 
 
@@ -200,7 +206,7 @@ def test_cancelled_request_cleans_options_before_next_request():
     asyncio.run(run())
     assert bodies[0]["max_tokens"] == 3072
     assert bodies[1]["max_tokens"] == 8192
-    assert "thinking" not in bodies[1]
+    assert bodies[1]["thinking"] == {"type": "enabled"} and bodies[1]["reasoning_effort"] == "high"
 
 
 def test_nested_options_restore_after_exception_and_are_immutable():

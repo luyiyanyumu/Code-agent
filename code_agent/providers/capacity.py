@@ -28,6 +28,12 @@ def context_window_for_model(model: str) -> int:
     return next((window for fragment, window in _CONTEXT_WINDOW_RULES if fragment in name), 131_072)
 
 
+def known_context_window_for_model(model: str) -> int | None:
+    """Distinguish a recognized capacity rule from the compatibility fallback."""
+    name = (model or "").lower()
+    return next((window for fragment, window in _CONTEXT_WINDOW_RULES if fragment in name), None)
+
+
 def normalize_capacity(value: Any, field: str) -> int | None:
     if value is None or (isinstance(value, str) and not value.strip()):
         return None

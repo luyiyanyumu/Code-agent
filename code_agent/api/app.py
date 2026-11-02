@@ -37,8 +37,10 @@ from code_agent.api.deps import CurrentUser, get_current_user, get_ws_user
 from code_agent.api.code_api import mount_code_api
 from code_agent.api.change_review_api import mount_change_review_api
 from code_agent.api.runtime_api import mount_runtime_api
+from code_agent.api.integration_api import mount_integration_api
 from code_agent.api.debug_api import mount_debug_api
 from code_agent.api.native_dialog_api import mount_native_dialog_api
+from code_agent.api.model_selection_api import mount_model_selection_api
 from code_agent.api.agent_settings_api import mount_agent_settings_api
 from code_agent.api.agent_team_api import mount_agent_team_api
 from code_agent.agent.project_team import ProjectTeam, TeamError
@@ -377,6 +379,12 @@ def create_app(provider_name: str | None = None) -> FastAPI:
             await project_team.aclose()
             from code_agent.codeintel import native_dialog
             await native_dialog.aclose()
+            await app.state.ide_integration.aclose()
+            proxy = app.state.integration_proxy
+            if hasattr(proxy, "aclose"):
+                await proxy.aclose()
+            elif hasattr(proxy, "close"):
+                await asyncio.to_thread(proxy.close)
             await app.state.ide_runtime.aclose()
             await app.state.ide_debug.close()
             change_reviews.close()
@@ -530,6 +538,7 @@ def create_app(provider_name: str | None = None) -> FastAPI:
     # 用"每次都重新解析"的工厂而不是缓存实例：模型路由/档位可以在设置里改，改完立刻生效。
     if code_intel is not None:
         code_intel.set_brief_provider(lambda: manager.router.resolve_default() if manager else None)
+    mount_model_selection_api(app, manager)
 
     # M18 · P3：LSP 代理（诊断回调直接写进索引 → 地图角标）
     from code_agent.codeintel.lsp import LspManager
@@ -632,6 +641,8 @@ def create_app(provider_name: str | None = None) -> FastAPI:
         batch_service=batch_service,
     )
     mount_runtime_api(app, projects_repo)
+    mount_integration_api(app, runtime=app.state.ide_runtime, project_service=code_service,
+                          design_service=app.state.frontend_design)
     mount_agent_team_api(app, service=code_service, team=project_team)
     mount_agent_settings_api(app)
     mount_native_dialog_api(app)
@@ -804,6 +815,8 @@ def create_app(provider_name: str | None = None) -> FastAPI:
             # live router, even when a provider rejects a reload.
             settings.save(previous)
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if code_intel is not None:
+            code_intel.notify_brief_configuration_changed()
         return _model_settings_view()
 
     # ------------------------------------------------------------------
@@ -848,8 +861,21 @@ def create_app(provider_name: str | None = None) -> FastAPI:
     @app.post("/api/v1/model-profiles")
     def add_model_profile(body: dict[str, Any], user: CurrentUser = Depends(get_current_user)) -> dict:
         require_admin(user)
+        values = dict(body)
+        use_current = values.pop("use_current", False)
+        if not isinstance(use_current, bool):
+            raise HTTPException(status_code=422, detail="use_current 必须是布尔值")
+        if use_current:
+            current = settings.model_config(provider=app.state.router.provider_name)
+            if values.get("id") or values.get("provider", current["provider"]) != current["provider"]:
+                raise HTTPException(status_code=422, detail="保存当前连接时不能更换提供方或覆盖其他连接")
+            # Capture the existing credential server-side; the browser receives
+            # only its configured state and never needs to read the key back.
+            if not values.get("api_key"):
+                values.pop("api_key", None)
+            values = {**current, **values}
         try:
-            return settings.save_profile(body)
+            return settings.save_profile(values)
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
 
@@ -1013,6 +1039,8 @@ def create_app(provider_name: str | None = None) -> FastAPI:
             store["active"] = prev_active
             settings._write_profiles(store)
             raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if code_intel is not None:
+            code_intel.notify_brief_configuration_changed()
 
     # ------------------------------------------------------------------
     # sessions
@@ -1084,7 +1112,7 @@ def create_app(provider_name: str | None = None) -> FastAPI:
             "tools": ["web_search", "web_fetch"],
             "how_to": "检索走 DeepSeek 的 Anthropic 兼容 Messages 接口 + 原生 web_search 工具；"
                       "端点用 CODE_AGENT_SEARCH_BASE_URL / config.json 的 search.base_url 配置，"
-                      "key 复用 DEEPSEEK_API_KEY（或 config.json 的 search_api_key）。",
+                      "官方端点可复用模型设置中的官方 DeepSeek 连接；其他端点需要独立检索密钥。",
         }
 
     @app.post("/api/v1/sessions/{session_id}/web")
@@ -1092,12 +1120,15 @@ def create_app(provider_name: str | None = None) -> FastAPI:
         session_id: str, body: dict[str, Any], user: CurrentUser = Depends(get_current_user)
     ) -> dict:
         """切换会话「联网」开关（M19）。关着时联网工具不出现在模型可见的 schema 里。"""
+        if type(body.get("enabled")) is not bool:
+            raise HTTPException(status_code=422, detail="enabled 必须是布尔值")
         try:
-            return manager.set_web_enabled(
-                session_id, user.user_id, bool(body.get("enabled"))
-            )
+            meta = manager.set_web_enabled(session_id, user.user_id, body["enabled"])
+            return {**meta, "web_enabled": bool(meta.get("web_enabled"))}
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
 
     @app.post("/api/v1/sessions/{session_id}/permission")
     def set_session_permission(
@@ -1146,6 +1177,8 @@ def create_app(provider_name: str | None = None) -> FastAPI:
             return manager.context_usage(session_id, user.user_id)
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
 
     # ------------------------------------------------------------------
     # workspaces（M14：侧栏工作区分组）
@@ -1297,6 +1330,8 @@ def create_app(provider_name: str | None = None) -> FastAPI:
         except TeamError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except SessionClosed as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
+        except ValueError as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except KeyError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc

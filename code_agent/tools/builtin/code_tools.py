@@ -24,7 +24,7 @@ from typing import Any
 
 from code_agent.codeintel.paths import is_ignored_dir
 from code_agent.tools.base import Tool, ToolContext, ToolError
-from code_agent.tools.builtin.tools_builtin import _WorkspaceBound
+from code_agent.tools.builtin.tools_builtin import ReadFileTool, _WorkspaceBound
 
 #: grep 单次返回的最大匹配数
 MAX_GREP_RESULTS = 80
@@ -307,6 +307,7 @@ class GrepTool(_FileQueryTool):
         target = _WorkspaceBound.resolve_read(ctx.workspace, raw_path)
         if not target.exists():
             raise ToolError(f"路径不存在: {raw_path}")
+        literal_stat = ReadFileTool._source_stat(target) if target.is_file() else None
         glob_filter = str(arguments.get("glob") or "").strip()
         requested_context = int(arguments.get("context") or 0)
         context_cap = 40 if target.is_file() else 5
@@ -379,7 +380,14 @@ class GrepTool(_FileQueryTool):
                 "如需更多上下文，按下方真实匹配的 file:line 调用 read_file，用 offset/limit 补齐该窗口。"
             )
         body = "\n---\n".join(hits) if hits else "(无匹配)"
-        return f"{head}\n{body}"
+        result = f"{head}\n{body}"
+        # Only a literal, stable single-file search can be reused as current
+        # source evidence. Directory scans keep their ordinary text contract.
+        if literal_stat is not None and scanned == 1 and literal_stat == ReadFileTool._source_stat(target):
+            from code_agent.tools.read_receipts import NativeReadResult
+
+            return NativeReadResult(result, source_stat=literal_stat)
+        return result
 
 
 def _glob_to_regex(pattern: str) -> "re.Pattern[str]":

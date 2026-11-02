@@ -432,6 +432,136 @@ def test_fill_without_provider_says_so(fillenv) -> None:
     assert "没有可用的模型" in result.aborted
 
 
+def test_missing_key_is_configuration_wait_without_model_calls_or_symbol_failures(fillenv) -> None:
+    from code_agent.codeintel import brief_fill
+
+    class MissingKey(FakeProvider):
+        name = "deepseek"
+        env_api_key = "DEEPSEEK_API_KEY"
+        api_key = ""
+        local_backend = False
+
+    intel, row = fillenv["intel"], fillenv["row"]
+    provider = MissingKey()
+    result = brief_fill_fill(intel._collect_targets(row, limit=0), provider, intel._brief_store(row))
+    assert not provider.calls
+    assert result.failed == result.batches == result.written == 0
+    assert result.block_reason == result.error_code == "model_not_configured"
+    assert result.action == "configure_model" and not result.errors
+    assert "设置" in result.aborted and "DEEPSEEK_API_KEY" not in result.aborted
+
+
+def test_local_compatible_model_without_key_can_generate_descriptions(fillenv, monkeypatch) -> None:
+    from code_agent.providers.openai_compat import OpenAICompatProvider
+
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    provider = OpenAICompatProvider(api_key="", base_url="http://127.0.0.1:11434/v1", model="local-model")
+    fake = FakeProvider()
+    monkeypatch.setattr(provider, "chat", fake.chat)
+    intel, row = fillenv["intel"], fillenv["row"]
+    result = brief_fill_fill(intel._collect_targets(row, limit=0), provider, intel._brief_store(row))
+    assert result.written > 0 and not result.block_reason and fake.calls
+
+
+@pytest.mark.parametrize("saved", [False, True])
+def test_brief_generator_uses_shared_router_saved_settings_and_environment_fallback(fillenv, monkeypatch, saved) -> None:
+    from code_agent import settings
+    from code_agent.agent.router import ModelRouter
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "fixture-environment-key")
+    monkeypatch.setenv("DEEPSEEK_BASE_URL", "https://environment.invalid")
+    settings.save({"provider": "deepseek", "model_default": "deepseek-flash",
+                   **({"api_key": "fixture-saved-key", "base_url": "https://saved.invalid"} if saved else {})})
+    router = ModelRouter()
+    provider = router.resolve_default()
+    assert provider.api_key == ("fixture-saved-key" if saved else "fixture-environment-key")
+    assert provider.base_url == ("https://saved.invalid" if saved else "https://environment.invalid")
+    assert provider.model == "deepseek-flash"
+    fake = FakeProvider()
+    monkeypatch.setattr(provider, "chat", fake.chat)
+    intel, row = fillenv["intel"], fillenv["row"]
+    intel.set_brief_provider(router.resolve_default)
+    asyncio.run(_auto_then_drain(intel, row))
+    assert intel.brief_fill_status(row)["state"] == "complete" and fake.calls
+
+
+def test_transport_error_stops_without_json_retry_another_batch_or_raw_error(fillenv) -> None:
+    class Disconnected(FakeProvider):
+        async def chat(self, messages, tools):
+            self.calls.append(messages)
+            raise RuntimeError("connection failed bearer fixture-private-token")
+
+    intel, row = fillenv["intel"], fillenv["row"]
+    provider = Disconnected()
+    result = brief_fill_fill(intel._collect_targets(row, limit=0), provider, intel._brief_store(row), batch=3)
+    assert len(provider.calls) == result.batches == 1
+    assert result.failed == 3 and not result.written
+    assert result.error_code == "model_request_failed" and result.action == "retry"
+    assert all("解析" not in error and "fixture-private-token" not in error for error in result.errors)
+
+
+def test_auth_failure_is_configuration_wait_and_not_twenty_four_failed_entities(fillenv) -> None:
+    class Unauthorized(FakeProvider):
+        async def chat(self, messages, tools):
+            self.calls.append(messages)
+            raise RuntimeError("HTTP 401: fixture-private-response")
+
+    intel, row = fillenv["intel"], fillenv["row"]
+    provider = Unauthorized()
+    result = brief_fill_fill(intel._collect_targets(row, limit=0), provider, intel._brief_store(row))
+    assert len(provider.calls) == 1 and result.failed == 0 and not result.errors
+    assert result.block_reason == "model_authentication_failed" and result.action == "configure_model"
+    assert "fixture-private-response" not in result.aborted
+
+
+def test_configuration_block_is_not_retried_by_polling_and_save_releases_it(fillenv) -> None:
+    class MissingKey(FakeProvider):
+        env_api_key = "DEEPSEEK_API_KEY"
+        api_key = ""
+        local_backend = False
+
+    intel, row = fillenv["intel"], fillenv["row"]
+    providers = [MissingKey()]
+    resolutions = []
+
+    def resolve():
+        resolutions.append(True)
+        return providers[0]
+
+    intel.set_brief_provider(resolve)
+    asyncio.run(_auto_then_drain(intel, row))
+    state = intel.brief_fill_status(row)
+    assert state["state"] == "waiting" and state["block_reason"] == "model_not_configured"
+    assert state["failed"] == 0 and not state["error"]
+    for _ in range(3):
+        assert not asyncio.run(_auto_then_drain(intel, row))["started"]
+    assert len(resolutions) == 1 and not providers[0].calls
+    providers[0] = FakeProvider()
+    intel.notify_brief_configuration_changed()
+    assert len(resolutions) == 1, "saving configuration must not itself call the model"
+    assert not intel.brief_fill_status(row)["block_reason"]
+    assert asyncio.run(_auto_then_drain(intel, row))["started"]
+    assert intel.brief_fill_status(row)["state"] == "complete"
+
+
+def test_settings_change_during_old_auth_failure_does_not_block_new_configuration(fillenv) -> None:
+    intel, row = fillenv["intel"], fillenv["row"]
+
+    class OldProvider(FakeProvider):
+        async def chat(self, messages, tools):
+            self.calls.append(messages)
+            intel.notify_brief_configuration_changed()
+            raise RuntimeError("HTTP 401: rejected old key")
+
+    provider = OldProvider()
+    intel.set_brief_provider(lambda: provider)
+    asyncio.run(_auto_then_drain(intel, row))
+    state = intel.brief_fill_status(row)
+    assert state["state"] == "waiting" and not state["block_reason"] and not state["error"]
+    assert state["retry_in"] == state["failed"] == 0
+    assert "配置已更新" in state["note"]
+
+
 def test_auto_fill_reuses_current_descriptions_without_another_model_call(fillenv) -> None:
     intel, row = fillenv["intel"], fillenv["row"]
     provider = FakeProvider()

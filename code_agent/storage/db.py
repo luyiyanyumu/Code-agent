@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS sessions (
   permission_mode TEXT NOT NULL DEFAULT 'workspace-write',
   loop_mode  TEXT NOT NULL DEFAULT 'classic', -- Legacy storage only; never exposed or used for execution.
   web_enabled INTEGER NOT NULL DEFAULT 0,
+  model_selection TEXT NOT NULL DEFAULT '',
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   closed_at  TEXT
@@ -229,6 +230,9 @@ class Database:
             # 会话级指定模型的入口已去掉（模型由"配置档案"决定），列也一起删掉：
             # 留着一列没人写的字段，下一个人会以为它还有用。
             "ALTER TABLE sessions DROP COLUMN model",
+            # DSH-style provider/model selection stores IDs only; credentials
+            # remain in connection settings. This does not revive legacy model.
+            "ALTER TABLE sessions ADD COLUMN model_selection TEXT NOT NULL DEFAULT ''",
         ):
             try:
                 self._conn.execute(ddl)
@@ -375,6 +379,12 @@ class SessionRepo:
         self.db.execute(
             "UPDATE sessions SET web_enabled=?, updated_at=? WHERE id=?",
             (1 if enabled else 0, now_iso(), session_id),
+        )
+
+    def set_model_selection(self, session_id: str, selection: str) -> None:
+        self.db.execute(
+            "UPDATE sessions SET model_selection=?,updated_at=? WHERE id=?",
+            (selection, now_iso(), session_id),
         )
 
     def set_project_binding(

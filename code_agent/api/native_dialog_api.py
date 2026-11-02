@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import asyncio
+import contextlib
 
 from fastapi import Depends, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field, field_validator
@@ -48,6 +50,39 @@ class FolderPick(BaseModel):
         return value.strip()
 
 
+async def _pick_until_disconnect(request: Request, start: str) -> dict:
+    # Cancellation belongs to this request's task, never a global "active"
+    # selector which could already belong to the next user request.
+    picker = asyncio.create_task(native_dialog.pick_folder(start))
+    stopped = asyncio.Event()
+
+    async def disconnected() -> None:
+        while not stopped.is_set():
+            gone = await request.is_disconnected()
+            # Starlette uses an AnyIO cancellation scope for this nonblocking
+            # receive. An explicit stop flag also survives a swallowed cancel.
+            if stopped.is_set() or gone:
+                return
+            await asyncio.sleep(0.1)
+
+    watcher = asyncio.create_task(disconnected())
+    try:
+        done, _ = await asyncio.wait({picker, watcher}, return_when=asyncio.FIRST_COMPLETED)
+        if picker in done:
+            return await picker
+        await watcher
+        picker.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await picker
+        raise HTTPException(499, "文件夹选择请求已断开")
+    finally:
+        stopped.set()
+        watcher.cancel()
+        if not picker.done():
+            picker.cancel()
+        await asyncio.gather(picker, watcher, return_exceptions=True)
+
+
 def mount_native_dialog_api(app):
     @app.post("/api/v1/code/fs/pick-folder")
     async def pick_folder(request: Request, body: FolderPick, user: CurrentUser = Depends(get_current_user)):
@@ -55,7 +90,7 @@ def mount_native_dialog_api(app):
         if not info["available"]:
             raise HTTPException(503 if local_request(request) else 403, info.get("reason") or "系统文件夹选择器不可用，请手动输入路径。")
         try:
-            return await native_dialog.pick_folder(body.start)
+            return await _pick_until_disconnect(request, body.start)
         except native_dialog.NativeDialogBusy as exc:
             raise HTTPException(409, str(exc)) from exc
         except native_dialog.NativeDialogUnavailable as exc:

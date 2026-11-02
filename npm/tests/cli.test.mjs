@@ -31,6 +31,7 @@ function fakeInstaller(calls, paths, overrides = {}) {
     }
     if (args.includes('pip') && overrides.pipCode) return { code: overrides.pipCode }
     if (args.at(-1) === 'import code_agent.server' && overrides.importCode) return { code: overrides.importCode }
+    if (args.includes('code_agent.harness') && overrides.harnessCode) return { code: overrides.harnessCode }
     return { code: 0 }
   }
 }
@@ -71,6 +72,7 @@ test('install preserves paths with spaces, checks imports, then skips all work o
   assert.deepEqual(calls[2].args.slice(0, 5), ['-I', '-X', 'utf8', '-m', 'pip'])
   assert.equal(calls[2].options.cwd, root)
   assert.deepEqual(calls[3].args, ['-I', '-X', 'utf8', '-c', 'import code_agent.server'])
+  assert.deepEqual(calls[4].args, ['-I', '-X', 'utf8', '-m', 'code_agent.harness', '--prepare'])
   assert.deepEqual(JSON.parse(await readFile(paths.ready, 'utf8')), release)
   assert.equal(existsSync(paths.lock), false)
   const before = calls.length
@@ -78,7 +80,7 @@ test('install preserves paths with spaces, checks imports, then skips all work o
   assert.equal(calls.length, before)
 })
 
-for (const [stage, overrides] of [['pip', { pipCode: 42 }], ['import', { importCode: 9 }]]) {
+for (const [stage, overrides] of [['pip', { pipCode: 42 }], ['import', { importCode: 9 }], ['harness', { harnessCode: 12 }]]) {
   test(`${stage} failure leaves no ready marker, releases lock, and a retry succeeds`, async t => {
     const { root, home } = await fixture(t)
     const paths = runtimePaths(home, release)
@@ -204,6 +206,20 @@ test('start uses installed runtime with caller cwd, persistent config, provider 
   assert.equal(calls[0].options.env.CODE_AGENT_HOME, home)
   assert.equal(calls[0].options.env.CODE_AGENT_WEB_DIST, join(root, 'web', 'dist'))
   assert.equal(calls[0].options.env.CODE_AGENT_ENV_FILE, join(home, '.env'))
+  assert.equal(calls[0].options.env.CODE_AGENT_HARNESS_NODE_DIR, join(root, 'code_agent', 'harness', 'node'))
+  assert.equal(calls[0].options.env.CODE_AGENT_NODE, process.execPath)
+})
+
+test('old Node versions fail before preparing any runtime', async t => {
+  const { root } = await fixture(t)
+  for (const nodeVersion of ['20.19.0', '22.13.9']) {
+    const errors = []
+    assert.equal(await main(['install'], {
+      root, nodeVersion, error: message => errors.push(message),
+      run() { assert.fail('unsupported Node must not start installation') },
+    }), 1)
+    assert.match(errors.join(), /Node.js 22.14/)
+  }
 })
 
 test('help and version do not require a Python runtime or built assets', async t => {

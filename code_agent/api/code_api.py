@@ -5,8 +5,8 @@
 `_err` 负责把领域异常翻成 HTTP 语义。
 
 错误语义（前端按这个写提示，不要靠猜）：
-- 404 项目/会话不存在或不属于当前用户（不区分"不存在"与"不是你的"）
-- 422 入参/路径不合法（越界、不存在、目录不是目录、文件是二进制…）
+- 404 项目/会话不存在或不属于当前用户；请求的文件确实不存在
+- 422 入参/路径不合法（越界、目录不是目录、文件是二进制…）
 - 409 目录不可用（项目被外部移动/删除）
 """
 
@@ -34,7 +34,7 @@ from code_agent.codeintel.file_search import files_catalog, search_text
 from code_agent.codeintel.logic import LogicError
 from code_agent.codeintel.parallel import BatchError
 from code_agent.codeintel.paths import ProjectPathError, safe_child
-from code_agent.codeintel.projects import TEMPLATES, ProjectService
+from code_agent.codeintel.projects import TEMPLATES, ProjectFileNotFoundError, ProjectService
 from code_agent.codeintel.service import FileSaveConflict
 from code_agent.codeintel.tasks import TaskError
 from code_agent.codeintel.vcs import check_command, probe_repo, run_git
@@ -203,6 +203,9 @@ async def git_overview(project: dict) -> dict:
 
 def _err(exc: Exception) -> HTTPException:
     """领域异常 → HTTP 状态码。集中一处，避免每个接口各写一遍 try/except 文案。"""
+    if isinstance(exc, ProjectFileNotFoundError):
+        return HTTPException(status_code=404, detail=str(exc),
+                             headers={"X-Code-Agent-Error-Code": exc.code})
     if isinstance(exc, KeyError):
         return HTTPException(status_code=404, detail=str(exc).strip("'\""))
     if isinstance(exc, ProjectPathError):
@@ -248,7 +251,7 @@ def mount_code_api(
         return service.get_owned(user.user_id, project_id)
 
     from code_agent.api.frontend_design_api import mount_frontend_design_api
-    mount_frontend_design_api(app, service=service, intel=intel)
+    app.state.frontend_design = mount_frontend_design_api(app, service=service, intel=intel)
 
     def _tree_owned(user: CurrentUser, project_id: str, tree: str = "main") -> dict:
         project = _owned(user, project_id)

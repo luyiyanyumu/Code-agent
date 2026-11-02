@@ -104,9 +104,18 @@ def test_approval_readmission_depth_failure_is_fatal_even_when_grant_is_denied(b
     limits = {"max_depth": 3, "max_parallel": 1}
     monkeypatch.setattr(e.team, "limits", lambda: dict(limits))
     e.manager.set_permission_mode(e.lead, e.user, "read-only")
-    parent = descendant(e, e.workers[0], "approval at depth two")
+    write_paths = ["approved-after-lost-slot.txt", "after-approval.txt"]
 
     async def scenario():
+        # Establish the real parent's responsibility through the same dispatch
+        # contract before creating a descendant that inherits those files.
+        owner = e.workers[0]
+        assign(e.manager.get_runtime(owner["session_id"], e.user),
+               OfflineProvider(script=[returned("file responsibility confirmed", 0)]))
+        await e.team.followup(e.lead, e.user, owner["session_id"], "Prepare assigned files",
+                              write_paths=write_paths)
+        await e.team._starts[owner["session_id"]]
+        parent = descendant(e, owner, "approval at depth two")
         runtime = e.manager.get_runtime(parent["session_id"], e.user)
         provider = OfflineProvider(script=[
             OfflineProvider.tool_call_turn("write_file", {"path": "approved-after-lost-slot.txt", "content": "must not execute",
@@ -116,7 +125,8 @@ def test_approval_readmission_depth_failure_is_fatal_even_when_grant_is_denied(b
         ])
         assign(runtime, provider)
         try:
-            await e.team.followup(e.lead, e.user, parent["session_id"], "write with approval")
+            await e.team.followup(e.lead, e.user, parent["session_id"], "write with approval",
+                                  write_paths=write_paths)
             task = e.team._starts[parent["session_id"]]
             await until(lambda: runtime.pending_approval() is not None
                         and parent["session_id"] not in e.team._capacity(parent["project_id"]).active)

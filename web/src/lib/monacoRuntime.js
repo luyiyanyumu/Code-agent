@@ -1,3 +1,4 @@
+import './editorLocale.js'
 // Import Monaco's editor API and the features used by this workbench. The 0.56
 // package root also initializes its separate LSP client and every language.
 // Register before standalone services initialize: the clipboard contribution

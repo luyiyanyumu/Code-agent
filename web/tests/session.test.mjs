@@ -63,7 +63,7 @@ function setup(t, kind = 'panel') {
       defineProps: () => ({ user: { role: 'admin' } }),
       onMounted() {}, onBeforeUnmount: (fn) => { unmount = fn },
     }
-    const expose = '({ selectSession, newSessionIn, closeStream, current, events, timeline, renderedTimeline, stats, usage, busy, phase, activityLabel, banner, approval, approvalError, approvalSubmitting, input, pendingFiles, send, onComposerKeydown, composing, stopRun, decide, rebuildTimeline, thinking, thinkSink, pushEvent, preview, openArtifact, closePreview, handlePickedFile, createWorkspace, deleteWorkspace, moveSession, renameSession, archiveSession, deleteSession, rewindTo, dismissQuestions, sessions, workspaces, collapsedGroups, question, qBusy, rewindBusy, lastStopReason })'
+    const expose = '({ selectSession, newSessionIn, closeStream, current, events, timeline, renderedTimeline, stats, usage, busy, phase, activityLabel, banner, approval, approvalError, approvalSubmitting, input, pendingFiles, send, onComposerKeydown, composing, stopRun, decide, rebuildTimeline, streaming, thinking, thinkSink, pushEvent, preview, openArtifact, closePreview, handlePickedFile, createWorkspace, deleteWorkspace, moveSession, renameSession, archiveSession, deleteSession, rewindTo, dismissQuestions, sessions, workspaces, collapsedGroups, question, qBusy, rewindBusy, lastStopReason })'
     state = scope.run(() => new Function(...Object.keys(bindings), `${script}\nreturn ${expose}`)(...Object.values(bindings)))
   }
   t.after(() => {
@@ -1213,3 +1213,35 @@ test('chat: dismiss confirmation guards the question group and preserves a repla
   assert.equal(s.question.value.id, 'replacement')
   assert.equal(s.qBusy.value, true)
 })
+
+
+for (const kind of ['panel', 'chat']) {
+  test(`${kind}: interrupted generation resets only uncommitted stream previews`, async t => {
+    const { state: s, socket } = setup(t, kind)
+    if (kind === 'panel') await s.load('recover')
+    else await s.selectSession('recover')
+    socket().open()
+    socket().emit(event(0, 'session_meta', { busy: true, phase: 'model' }))
+    socket().emit(event(0, 'thinking_delta', { text: 'completed thinking' }))
+    socket().emit(event(1, 'assistant_message', { text: 'completed message' }))
+    socket().emit(event(0, 'thinking_delta', { text: 'discarded thinking' }))
+    socket().emit(event(0, 'assistant_delta', { text: 'discarded answer' }))
+    assert.equal(s.streaming.value, 'discarded answer')
+    assert.equal(s.thinking.value, 'discarded thinking')
+    const oldEvents = s.events.value.length
+    socket().emit(event(0, 'session_meta', { kind: 'model_stream_reset', attempt: 1 }))
+    assert.equal(s.streaming.value, '')
+    assert.equal(s.thinking.value, '')
+    assert.equal(s.events.value.length, oldEvents)
+    assert.equal(s.events.value.find(e => e.seq === 1).payload.text, 'completed message')
+    assert.equal(s.events.value.find(e => e.seq === 1).payload.thinking, 'completed thinking')
+    assert.equal(s.busy.value, true)
+    assert.equal(s.phase.value, 'model')
+    socket().emit(event(0, 'thinking_delta', { text: 'recovered thinking' }))
+    socket().emit(event(0, 'assistant_delta', { text: 'recovered answer' }))
+    assert.equal(s.streaming.value, 'recovered answer')
+    socket().emit(event(2, 'assistant_message', { text: 'recovered answer' }))
+    assert.equal(s.events.value.find(e => e.seq === 2).payload.thinking, 'recovered thinking')
+    assert.ok(!s.events.value.some(e => e.payload?.thinking?.includes('discarded')))
+  })
+}

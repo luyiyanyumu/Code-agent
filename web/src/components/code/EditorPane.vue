@@ -2,6 +2,8 @@
 import UiIcon from '../ui/UiIcon.vue'
 import SymbolDocumentation from './SymbolDocumentation.vue'
 import CallHierarchyPanel from './CallHierarchyPanel.vue'
+import EditorActionMenu from './EditorActionMenu.vue'
+import { ideActions, ideActionState, ideCapability, ideKeybinding } from '../../lib/ideActions.js'
 // 编辑器面板（M18 · P2）：Monaco + 乐观锁保存 + 只读守卫。
 //
 // 界面上必须让"能不能写"一眼可见：只读时显示锁标记并禁用保存——
@@ -12,6 +14,7 @@ import { WorkspaceLanguageService } from '../../lib/workspaceLanguageService.js'
 import { getTokenHover, getJavaTokenTarget, registerTokenBusinessSource, withTokenBusiness, subscribeHoverDocumentationUpdates } from '../../lib/tokenHover.js'
 import { createBusinessMeaningSource, subscribeBusinessMeaning } from '../../lib/businessMeaning.js'
 import { editorPreferenceOptions, usePreferences } from '../../lib/preferences.js'
+import { createHoverDocumentationRefresh } from '../../lib/hoverDocumentationRefresh.js'
 
 const { preferences } = usePreferences()
 const editorOptions = computed(() => editorPreferenceOptions(preferences))
@@ -26,6 +29,7 @@ const props = defineProps({
   breakpoints: { type: Array, default: () => [] },
   debugLocation: { type: Object, default: null }, // { path, line }, current paused frame
   toolbarTarget: { type: Object, default: null },
+  compactToolbar: { type: Boolean, default: false },
   //: token 是"显式跳转序号"：父组件每次**用户主动**要跳转（点文件 / 点「打开实现」）就自增，
   //: 这样"父组件重渲染"不会造成跳转，而"用户要跳"仍然生效。
   readonly: { type: Boolean, default: true },
@@ -43,12 +47,17 @@ const dirty = ref(false)
 const error = ref('')
 const lspState = ref('idle')     // idle | connecting | ready | closed | error | unavailable
 const lspDetail = ref('')
+const lspStatusLabel = computed(() => ({ ready: '代码分析就绪', connecting: '代码分析连接中', unavailable: '代码分析未启用，查看配置', error: '代码分析连接失败，查看详情', closed: '代码分析重连中' })[lspState.value] || '代码分析未连接')
+const compactLspLabel = computed(() => ({ ready: '分析就绪', connecting: '连接中', unavailable: '分析未启用', error: '分析异常', closed: '重连中' })[lspState.value] || '分析未连接')
 //: 「无语言服务器」这个提示要能点开：否则用户只知道"没有"，不知道"装什么、怎么装"
 const lspPanel = ref(false)
 const lspList = ref([])
 const lspListLoading = ref(false)
 const lspListLoaded = ref(false)
 const lspCopied = ref('')
+const lspCopyError = ref('')
+const lspPanelEl = ref(null)
+const lspTrigger = ref(null)
 const showAllLsp = ref(false)
 const refreshedLanguageCatalog = ref(null)
 let lspListRequest = 0
@@ -60,7 +69,9 @@ let copyTimer = null
  * 再用项目级接口补齐 install_hint / 状态；服务端有缓存，第二次基本是瞬时的。
  */
 async function toggleLspPanel(refresh = false) {
+  const opening = !lspPanel.value
   lspPanel.value = refresh ? true : !lspPanel.value
+  if (opening && lspPanel.value) nextTick(() => lspPanelEl.value?.querySelector('[aria-label="关闭代码分析设置"]')?.focus())
   if (!lspPanel.value || !props.projectId) return
   if (refresh) {
     lspListLoaded.value = false
@@ -104,15 +115,22 @@ async function toggleLspPanel(refresh = false) {
   }
 }
 
-async function copyInstall(command) {
+function closeLspPanel() {
+  lspPanel.value = false
+  nextTick(() => lspTrigger.value?.focus())
+}
+
+async function copyLspText(text) {
+  lspCopyError.value = ''
   try {
-    await navigator.clipboard.writeText(command)
+    await navigator.clipboard.writeText(text)
     if (disposed) return
-    lspCopied.value = command
+    lspCopied.value = text
     if (copyTimer) clearTimeout(copyTimer)
     copyTimer = setTimeout(() => { lspCopied.value = '' }, 1500)
   } catch {
     lspCopied.value = ''
+    lspCopyError.value = '复制失败，请手动选择并复制内容。'
   }
 }
 
@@ -160,6 +178,7 @@ let documentationRequest = 0
 let cancelDocumentation = null
 let documentationTarget = null
 let documentationBusinessRequest = 0
+let nativeHoverRefresh = null
 const languageCapabilities = computed(() => {
   languageRevision.value
   const capabilities = {}
@@ -168,9 +187,14 @@ const languageCapabilities = computed(() => {
   }
   return capabilities
 })
-const hasLanguageTools = computed(() => !!(
-  languageCapabilities.value.documentFormattingProvider || languageCapabilities.value.documentSymbolProvider
-  || languageCapabilities.value.workspaceSymbolProvider))
+const editorCommands = computed(() => ideActions.map(item => ideActionState(item, {
+  capabilities: languageCapabilities.value, language: props.file?.lang,
+  readonly: effectiveReadonly.value, busy: languageActionBusy.value || symbolBusy.value, ready: !!props.file,
+})))
+const commandState = id => editorCommands.value.find(item => item.id === id)
+const navigationCommands = computed(() => editorCommands.value.filter(item => item.group === 'navigation'))
+const refactorCommands = computed(() => editorCommands.value.filter(item => item.group === 'refactor'))
+const hasLanguageTools = computed(() => !!props.file && !plainFile.value)
 const languageEnvironment = computed(() => {
   languageRevision.value
   return workspaceLanguage?.clientsFor(props.file?.lang).find(client => client.environment?.python || client.environment?.lombok)?.environment || {}
@@ -219,6 +243,7 @@ const encodingReadonly = computed(() => fileReadonly.value && props.file?.readon
 const tooLarge = computed(() => fileReadonly.value && !encodingReadonly.value)
 const canSave = computed(() => !props.readonly && !fileReadonly.value && dirty.value && !props.saving)
 const effectiveReadonly = computed(() => props.readonly || fileReadonly.value)
+const canEdit = computed(() => !!props.file && !effectiveReadonly.value)
 const plainFile = computed(() => ['text', 'plaintext', 'unknown', ''].includes(props.file?.lang || '') || /(?:^|\/)\.(?:gitignore|gitattributes|dockerignore|ignore)$/.test(props.file?.path || ''))
 
 function documentKey() {
@@ -469,7 +494,10 @@ async function mount() {
     // Register after the source's subscription so its cache is invalidated
     // before an already open explanation reads the updated function record.
     editorDisposables.push({ dispose: subscribeBusinessMeaning(change => { void refreshBusinessDocumentation(change) }) })
-    editorDisposables.push({ dispose: subscribeHoverDocumentationUpdates(change => { void refreshLanguageDocumentation(change) }) })
+    editorDisposables.push({ dispose: subscribeHoverDocumentationUpdates(change => {
+      void refreshLanguageDocumentation(change)
+      nativeHoverRefresh?.refresh(change)
+    }) })
     if (!documentModels.has(activeDocument.key)) documentModels.set(activeDocument.key, new Set())
     documentModels.get(activeDocument.key).add(model)
     dirty.value = activeDocument.baseline == null || initialText !== activeDocument.baseline
@@ -511,10 +539,18 @@ async function mount() {
       hover: { enabled: true, delay: 350, sticky: true },
     })
     const themeSubscription = mod.followEditorTheme?.(monacoRef)
+    nativeHoverRefresh = createHoverDocumentationRefresh({ editor, contextForModel(candidate) {
+      const context = activeDocument
+      if (disposed || candidate !== editor?.getModel() || !context || context.key !== documentKey()) return null
+      const client = languageClient('hoverProvider')
+      return { projectId: context.projectId, tree: context.tree || 'main', uri: context.uri,
+        version: client?.documents?.get(context.uri)?.version }
+    } })
+    editorDisposables.push(nativeHoverRefresh)
     if (themeSubscription) editorDisposables.push(themeSubscription)
     model.updateOptions?.({ tabSize: preferences.editorTabSize, insertSpaces: true })
     editor.onDidChangeModelContent(() => {
-      if (symbolDocumentation.value) closeDocumentation(false)
+      if (symbolDocumentation.value) retainPinnedDocumentation()
       hierarchy.value = lensReferences.value = null
       if (suppress || handlingContent) return
       handlingContent = true
@@ -545,12 +581,12 @@ async function mount() {
       keybindings: [monacoRef.KeyMod.CtrlCmd | monacoRef.KeyCode.KeyS],
       run: () => save(),
     })
-    editorDisposables.push(editor.addAction({
-      id: 'code-agent.symbol-documentation',
-      label: '查看完整说明',
-      contextMenuGroupId: 'navigation',
-      contextMenuOrder: 3,
-      run: () => showDocumentation(),
+    for (const item of ideActions) editorDisposables.push(editor.addAction({
+      id: item.id === 'documentation' ? 'code-agent.symbol-documentation' : `code-agent.ide.${item.id}`,
+      label: item.id === 'documentation' ? '查看完整说明' : item.label,
+      ...(item.keys ? { keybindings: [ideKeybinding(item, monacoRef)], keybindingContext: 'editorTextFocus' } : {}),
+      ...(item.id === 'documentation' ? { contextMenuGroupId: 'navigation', contextMenuOrder: 3 } : {}),
+      run: () => runIdeCommand(item.id),
     }))
     for (const kind of ['call', 'type']) editorDisposables.push(editor.addAction({
       id: `code-agent.${kind}-hierarchy`, label: kind === 'call' ? '查看调用层级' : '查看类型层级',
@@ -764,6 +800,43 @@ function closeDocumentation(focus = true) {
   if (focus) editor?.focus()
 }
 
+function retainPinnedDocumentation() {
+  const document = symbolDocumentation.value
+  const keep = document?.pinned && !document.loading && document.projectId === props.projectId && document.tree === (props.tree || 'main')
+  closeDocumentation(false)
+  if (keep) symbolDocumentation.value = { ...document, detached: true }
+}
+function toggleDocumentationPin() {
+  if (symbolDocumentation.value) symbolDocumentation.value = { ...symbolDocumentation.value, pinned: !symbolDocumentation.value.pinned }
+}
+function documentationKey(event) {
+  if (!event.defaultPrevented && symbolDocumentation.value && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'q') {
+    event.preventDefault(); event.stopPropagation(); toggleDocumentationPin()
+  }
+}
+
+// Both the initial query and background refreshes publish the complete reader
+// model. Explicit optional values clear facts from an earlier refresh rather
+// than leaving stale symbol/business details behind in the retained panel.
+function fullDocumentationContent(result) {
+  return {
+    sections: result?.sections || [],
+    originalSections: result?.originalSections || [],
+    source: result?.source,
+    symbol: result?.symbol,
+    tokenSection: result?.tokenSection,
+    symbolSection: result?.symbolSection,
+    businessBaseSections: result?.businessBaseSections,
+    businessSection: result?.businessSection,
+    business: result?.business,
+    businessReadError: result?.businessReadError,
+    untranslated: result?.untranslated,
+    documentationTranslation: result?.documentationTranslation,
+    documentation_translation: result?.documentation_translation,
+    _code_agent_original: result?._code_agent_original,
+  }
+}
+
 async function refreshBusinessDocumentation(change) {
   const target = documentationTarget
   if (!target || !target.current() || !symbolDocumentation.value || target.model.getLanguageId?.() !== 'java'
@@ -782,7 +855,8 @@ async function refreshBusinessDocumentation(change) {
   if (!current() || (!result?.business && !result?.businessReadError)) return false
   target.lookup = result.businessLookup || target.lookup
   target.entityId = result.business?.entity?.id || target.entityId
-  symbolDocumentation.value = { ...symbolDocumentation.value, sections: result.sections || target.base.sections || [] }
+  symbolDocumentation.value = { ...symbolDocumentation.value, ...fullDocumentationContent(result),
+    sections: result.sections || target.base.sections || [], originalSections: result.originalSections || target.base.originalSections || [] }
   return true
 }
 
@@ -799,13 +873,27 @@ async function refreshLanguageDocumentation(change) {
     const word = target.model.getWordAtPosition?.(target.position), column = change.position.character + 1
     if (word ? column < word.startColumn || column >= word.endColumn : column !== target.position.column) return false
   }
-  if (symbolDocumentation.value.loading) { target.languageRefreshNeeded = true; return false }
+  if (target.queryPending || symbolDocumentation.value.loading) { target.languageRefreshNeeded = true; return false }
   return showDocumentation({ refreshTarget: target })
 }
 
-async function showDocumentation({ refreshTarget = null } = {}) {
+async function retryDocumentationTranslation() {
+  const target = documentationTarget
+  if (!target || !target.current() || target.queryPending || symbolDocumentation.value?.detached
+    || symbolDocumentation.value?.documentation_translation?.status === 'pending') return false
+  return showDocumentation({ refreshTarget: target, retryTranslation: true })
+}
+
+async function showDocumentation({ refreshTarget = null, retryTranslation = false } = {}) {
   const client = languageClient('hoverProvider'), instance = editor, model = editor?.getModel(), context = activeDocument
-  if ((!client && props.file?.lang !== 'java') || !model || !context?.uri || context.key !== documentKey()) return false
+  if (!model || !context?.uri || context.key !== documentKey()) return false
+  if (!client && props.file?.lang !== 'java') {
+    instance.focus()
+    await instance.getAction?.('editor.action.showHover')?.run()
+    return true
+  }
+  const previous = refreshTarget ? symbolDocumentation.value : null
+  const pinned = !!previous?.pinned
   closeDocumentation(false)
   symbolPanel.value = false
   lspPanel.value = false
@@ -826,28 +914,32 @@ async function showDocumentation({ refreshTarget = null } = {}) {
   const current = () => !disposed && request === documentationRequest && editor === instance && activeDocument === context
     && context.key === documentKey() && context.projectId === props.projectId && context.tree === props.tree
     && model === editor?.getModel() && model.getVersionId?.() === version && !cancelled
-  const target = { model, context, position: { ...position }, current, base: null, lookup: null, entityId: '', refreshNeeded: false, languageRefreshNeeded: false }
+  const target = { model, context, position: { ...position }, current, base: null, lookup: null, entityId: '', refreshNeeded: false, languageRefreshNeeded: false, queryPending: true }
   documentationTarget = target
-  symbolDocumentation.value = { title, path: context.path, line: position.lineNumber, sections: [], loading: true, error: '' }
+  symbolDocumentation.value = { ...(previous || { sections: [] }), title, path: context.path, line: position.lineNumber, projectId: context.projectId, tree: context.tree || 'main', pinned, loading: !previous, error: '',
+    ...(retryTranslation ? { documentation_translation: { language: 'zh-CN', source: 'configured-model', status: 'pending' } } : {}) }
   if (!refreshTarget) void nextTick(() => { if (current()) documentationRef.value?.$el?.focus?.() })
   try {
     workspaceLanguage?.flushDocument(context.uri)
-    const languageResult = client ? await client.hover(context.uri, position, token) : getTokenHover(model, position)
+    if (retryTranslation && !client) throw new Error('language service unavailable')
+    const languageResult = client ? await client.hover(context.uri, position, token, { retryTranslation }) : getTokenHover(model, position)
     if (!current()) return false
     target.base = languageResult
     const result = await withTokenBusiness(model, position, languageResult, token)
     if (!current()) return false
     target.lookup = result?.businessLookup || null
     target.entityId = result?.business?.entity?.id || ''
-    symbolDocumentation.value = { ...symbolDocumentation.value, sections: result?.sections || [], source: result?.source, loading: false,
-      ...(result?.documentation_translation ? { documentation_translation: result.documentation_translation } : {}),
-      ...(result && Object.hasOwn(result, '_code_agent_original') ? { _code_agent_original: result._code_agent_original } : {}) }
+    target.queryPending = false
+    symbolDocumentation.value = { ...symbolDocumentation.value, ...fullDocumentationContent(result), loading: false }
     if (target.refreshNeeded) void refreshBusinessDocumentation({ projectId: context.projectId, tree: context.tree })
     if (target.languageRefreshNeeded) void refreshLanguageDocumentation({ projectId: context.projectId, tree: context.tree, uri: context.uri })
     return true
   } catch (cause) {
     if (current()) {
-      symbolDocumentation.value = { ...symbolDocumentation.value, loading: false, error: cause.message || '暂时无法读取说明' }
+      target.queryPending = false
+      symbolDocumentation.value = previous ? { ...symbolDocumentation.value, loading: false, error: '',
+        documentation_translation: { language: 'zh-CN', source: 'configured-model', status: 'failed', retryable: true, error_code: client ? 'request_failed' : 'provider_unavailable' } }
+        : { ...symbolDocumentation.value, loading: false, error: cause.message || '暂时无法读取说明' }
       if (target.languageRefreshNeeded) void refreshLanguageDocumentation({ projectId: context.projectId, tree: context.tree, uri: context.uri })
     }
     return false
@@ -859,7 +951,8 @@ async function showDocumentation({ refreshTarget = null } = {}) {
 
 async function formatDocument() {
   const client = languageClient('documentFormattingProvider'), instance = editor, model = editor?.getModel(), context = activeDocument
-  if (!client || !model || !context || context.key !== documentKey() || context.path !== props.file?.path || effectiveReadonly.value || languageActionBusy.value) return false
+  if (!model || !context || context.key !== documentKey() || context.path !== props.file?.path || effectiveReadonly.value || languageActionBusy.value) return false
+  if (!client) return languageEditorAction('editor.action.formatDocument', 'documentFormattingProvider', true)
   const request = ++languageActionRequest, version = model.getVersionId?.()
   languageActionBusy.value = true; error.value = ''
   try {
@@ -883,14 +976,43 @@ async function formatDocument() {
   finally { if (request === languageActionRequest) languageActionBusy.value = false }
 }
 
-function languageEditorAction(action, capability) {
-  if (activeDocument?.key !== documentKey() || effectiveReadonly.value || !languageCapabilities.value[capability] || languageActionBusy.value) return false
+function languageEditorAction(action, capability, writes = ideActions.some(item => item.action === action && item.writes)) {
+  if (activeDocument?.key !== documentKey() || writes && effectiveReadonly.value || !ideCapability(languageCapabilities.value, props.file?.lang, capability) || languageActionBusy.value) return false
+  if (activeDocument?.uri) workspaceLanguage?.flushDocument(activeDocument.uri)
   editor?.focus()
   const command = editor?.getAction?.(action)
   if (!command && !editor?.trigger) return false
   const result = command ? command.run() : editor.trigger('code-agent.language', action, {})
   result?.catch?.(e => { if (!disposed) error.value = e.message })
   return true
+}
+
+function runEditorCommand(id) {
+  if (!editor || !props.file || activeDocument?.key !== documentKey()) return false
+  const actions = { undo: 'undo', redo: 'redo', find: 'actions.find', replace: 'editor.action.startFindReplaceAction', selectAll: 'editor.action.selectAll', gotoLine: 'editor.action.gotoLine' }
+  if (!actions[id] || (['undo', 'redo', 'replace'].includes(id) && (props.readonly || fileReadonly.value))) return false
+  editor.focus()
+  const action = editor.getAction?.(actions[id])
+  const result = action ? action.run() : editor.trigger('code-agent.menu', actions[id], {})
+  result?.catch?.(cause => { if (!disposed) error.value = cause.message })
+  return true
+}
+
+function runIdeCommand(id) {
+  const item = commandState(id)
+  if (!item || item.disabled) { if (item?.reason) error.value = item.reason; return false }
+  error.value = ''
+  if (id === 'documentation') {
+    if (symbolDocumentation.value && !symbolDocumentation.value.detached) { toggleDocumentationPin(); return true }
+    return showDocumentation()
+  }
+  if (id === 'format') return formatDocument()
+  if (id === 'symbols') {
+    if (languageCapabilities.value.documentSymbolProvider || languageCapabilities.value.workspaceSymbolProvider) return toggleSymbolPanel()
+    return languageEditorAction('editor.action.quickOutline', 'documentSymbolProvider')
+  }
+  if (id === 'callHierarchy' || id === 'typeHierarchy') return showHierarchy(id === 'callHierarchy' ? 'call' : 'type')
+  return languageEditorAction(item.action, item.capability, item.writes)
 }
 
 async function loadSymbols() {
@@ -1037,13 +1159,13 @@ function markSaved(text) {
 }
 
 defineExpose({ applyExternal, markSaved, notifySaved, notifyResourceChanges, setConflict, jumpToHighlight, snapshot, releaseDocument, toggleBreakpoint,
-  formatDocument, showDocumentation, showHierarchy, focus: () => editor?.focus() })
+    formatDocument, showDocumentation, showHierarchy, runIdeCommand, runEditorCommand, save, canSave, canEdit, commandState, focus: () => editor?.focus() })
 
 // 分别比较身份值：保存会替换 file 元数据对象，不能因此重建编辑器或回退到陈旧的视图状态。
 watch(
   [() => props.projectId, () => props.tree, () => props.documentKey, () => props.file?.uri || props.file?.path],
   async () => {
-    closeDocumentation(false)
+    retainPinnedDocumentation()
     hierarchy.value = lensReferences.value = null
     flushDocument()
     editorVersion += 1
@@ -1132,7 +1254,7 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="pane" :data-highlight-line="highlightLine || ''">
+  <div class="pane" :class="{ 'compact-toolbar': compactToolbar }" :data-highlight-line="highlightLine || ''">
     <div v-if="!file" class="empty muted">
       <span class="empty-icon"><UiIcon name="file-code" :size="30" /></span>
       <h3>从一个文件开始</h3>
@@ -1142,9 +1264,9 @@ onBeforeUnmount(() => {
     </div>
 
     <template v-else>
-      <div class="bar">
-        <span class="path mono" :title="file.path">{{ file.path }}</span>
-        <span class="chip">{{ file.lang }}</span>
+      <div class="bar" :aria-label="compactToolbar ? '文件信息' : undefined">
+        <span class="path mono" :title="file.path"><template v-if="compactToolbar"><template v-for="(part, index) in file.path.split(/[\\/]/)" :key="index"><UiIcon v-if="index" class="breadcrumb-separator" name="chevron-right" :size="11" /><span :class="{ 'breadcrumb-file': index === file.path.split(/[\\/]/).length - 1 }">{{ part }}</span></template></template><template v-else>{{ file.path }}</template></span>
+        <span class="chip language-chip">{{ file.lang }}</span>
         <span v-if="file.secret" class="chip warn">疑似密钥</span>
         <span v-if="encodingReadonly" class="chip warn" :title="file.encoding_warning">
           {{ file.encoding === 'utf-8+gb18030' ? '混合编码' : '非 UTF-8' }}·只读
@@ -1157,10 +1279,15 @@ onBeforeUnmount(() => {
           v-if="!plainFile"
           class="lsp as-button"
           :class="lspState"
-          :title="lspDetail || '点开看这台机器上装了哪些语言服务器、缺什么、怎么装'"
+          ref="lspTrigger"
+          :aria-label="lspStatusLabel"
+          aria-haspopup="dialog"
+          :aria-expanded="lspPanel"
+          :title="`${lspStatusLabel}。${lspDetail || '点开查看语言服务状态与配置'}`"
           @click="toggleLspPanel()"
         >
-          <template v-if="lspState === 'ready'">代码分析就绪</template>
+          <template v-if="compactToolbar">{{ compactLspLabel }}</template>
+          <template v-else-if="lspState === 'ready'">代码分析就绪</template>
           <template v-else-if="lspState === 'connecting'">代码分析连接中…</template>
           <template v-else-if="lspState === 'unavailable'">代码分析未启用 · 配置</template>
           <template v-else-if="lspState === 'error'">代码分析连接失败 · 详情</template>
@@ -1170,20 +1297,18 @@ onBeforeUnmount(() => {
         <span class="muted meta">
           {{ file.total_lines ?? '—' }} 行 · {{ Math.max(1, Math.round((file.size || 0) / 1024)) }}KB
         </span>
-        <button class="primary sm" :disabled="!canSave" @click="save">
+        <button class="primary sm" :class="{ 'compact-save': compactToolbar }" :disabled="!canSave" title="保存 · Ctrl+S" @click="save">
           {{ saving ? '保存中…' : '保存' }}
         </button>
       </div>
 
       <Teleport :to="toolbarTarget" :disabled="!toolbarTarget">
-        <div v-if="!plainFile && hasLanguageTools" class="language-tools" :class="{ 'in-workbench': !!toolbarTarget }" aria-label="代码工具">
-          <button v-if="languageCapabilities.documentFormattingProvider" class="language-tool" :disabled="effectiveReadonly || languageActionBusy || symbolBusy"
-            :title="fileReadonly ? '当前文件仅支持只读预览' : readonly ? '开启人工编辑后可整理格式' : '整理当前文件格式，可一次撤销'"
-            @click="formatDocument">{{ languageActionBusy ? '整理中…' : '整理格式' }}</button>
-          <button v-if="languageCapabilities.documentSymbolProvider || languageCapabilities.workspaceSymbolProvider"
-            class="language-tool" :class="{ active: symbolPanel }" :aria-expanded="symbolPanel" aria-controls="language-symbol-panel"
-            :disabled="languageActionBusy"
-            title="查找当前文件或工作区的函数、类和变量" @click="toggleSymbolPanel">代码导航</button>
+        <div v-if="!compactToolbar && !plainFile && hasLanguageTools" class="language-tools" :class="{ 'in-workbench': !!toolbarTarget }" aria-label="代码工具">
+          <button class="language-tool" :disabled="commandState('complete').disabled" :title="commandState('complete').reason || '代码补全 · Ctrl+Space'" @click="runIdeCommand('complete')">补全</button>
+          <button class="language-tool" :disabled="commandState('parameters').disabled" :title="commandState('parameters').reason || '参数信息 · Ctrl+Shift+Space'" @click="runIdeCommand('parameters')">参数</button>
+          <EditorActionMenu label="代码导航" :items="navigationCommands" @select="runIdeCommand" />
+          <EditorActionMenu label="重构" :items="refactorCommands" @select="runIdeCommand" />
+          <button class="language-tool" :disabled="commandState('format').disabled" :title="commandState('format').reason || '整理格式 · Ctrl+Alt+L，可撤销'" @click="runIdeCommand('format')">{{ languageActionBusy ? '整理中…' : '整理格式' }}</button>
         </div>
       </Teleport>
 
@@ -1211,13 +1336,11 @@ onBeforeUnmount(() => {
         </div>
       </div>
 
-      <!-- 语言服务器面板：如实说明"这台机器上有没有装、缺什么、装完怎么生效"。
-           只显示探测结果与安装命令，不在应用里替用户下载安装。 -->
-      <div v-if="lspPanel" class="lsp-panel card">
+      <!-- Distinguish service health, installation guidance and executable paths. -->
+      <div v-if="lspPanel" ref="lspPanelEl" class="lsp-panel card" role="dialog" aria-label="代码分析设置" @keydown.esc.stop="closeLspPanel">
         <div class="lsp-head">
-          <b>代码分析设置</b>
-          <span class="lsp-language muted">{{ file.lang }}</span>
-          <span class="spacer" />
+          <span class="lsp-title"><b>代码分析设置</b><span class="lsp-language muted">{{ file.lang }}</span></span>
+          <div class="lsp-head-actions">
           <button
             v-if="lspList.length"
             class="ghost tiny"
@@ -1225,7 +1348,8 @@ onBeforeUnmount(() => {
             @click="showAllLsp = !showAllLsp"
           >{{ showAllLsp ? '只看相关' : '显示全部' }}</button>
           <button class="ghost tiny" title="重新探测（刚装完服务器时用，不必重启后端）" @click="toggleLspPanel(true)">重新探测</button>
-          <button class="ghost tiny" aria-label="关闭代码分析设置" @click="lspPanel = false">×</button>
+          </div>
+          <button class="ghost tiny lsp-close" aria-label="关闭代码分析设置" @click="closeLspPanel">×</button>
         </div>
         <div class="lsp-runtime" aria-label="当前语言服务状态">
           <div v-for="server in runtimeServers" :key="server.id" class="lsp-runtime-row">
@@ -1252,24 +1376,25 @@ onBeforeUnmount(() => {
           探测结果为空：后端可能还没扫描这个项目，或 LSP 模块未启用。
         </div>
         <ul v-else class="lsp-list">
-          <li v-for="s in shownServers" :key="s.id">
+          <li v-for="s in shownServers" :key="s.id" :data-server-id="s.id">
+            <div class="lsp-server-heading">
             <span class="st" :class="s.state">
               {{ s.state === 'installed' ? '命令已找到' : s.state === 'missing' ? '未找到' : '已禁用' }}
             </span>
             <span class="nm">{{ s.name }}</span>
             <span class="langs muted tiny">{{ (s.languages || []).join('/') }}</span>
-            <span class="spacer" />
-            <button
-              v-if="s.state !== 'installed' && s.install_hint"
-              class="ghost tiny mono hintbtn"
-              :title="`复制安装命令：${s.install_hint}`"
-              @click="copyInstall(s.install_hint)"
-            >{{ lspCopied === s.install_hint ? '已复制' : s.install_hint }}</button>
-            <span v-else-if="s.resolved_command" class="lsp-command muted tiny mono" :title="s.resolved_command">
-              {{ s.resolved_command }}
-            </span>
+            </div>
+            <div v-if="s.state !== 'installed' && s.install_hint" class="lsp-server-detail">
+              <div class="lsp-detail-heading"><span class="muted tiny">安装说明</span><button class="ghost tiny" :aria-label="`复制 ${s.name} 安装说明`" @click="copyLspText(s.install_hint)">{{ lspCopied === s.install_hint ? '已复制' : '复制说明' }}</button></div>
+              <p class="lsp-install-hint">{{ s.install_hint }}</p>
+            </div>
+            <div v-else-if="s.resolved_command" class="lsp-server-detail">
+              <div class="lsp-detail-heading"><span class="muted tiny">命令路径</span><button class="ghost tiny" :aria-label="`复制 ${s.name} 命令路径`" @click="copyLspText(s.resolved_command)">{{ lspCopied === s.resolved_command ? '已复制' : '复制路径' }}</button></div>
+              <code class="lsp-command muted tiny mono">{{ s.resolved_command }}</code>
+            </div>
           </li>
         </ul>
+        <p v-if="lspCopyError" class="lsp-copy-error tiny" role="alert">{{ lspCopyError }}</p>
         <div v-if="languageEnvironment.python" class="lsp-foot tiny">
           <b>Python 解释器</b> · {{ languageEnvironment.interpreter_source === 'project-venv' ? '项目 .venv' : '服务环境' }}
           <div class="mono lsp-interpreter-path">{{ languageEnvironment.python }}</div>
@@ -1290,7 +1415,7 @@ onBeforeUnmount(() => {
       </div>
 
       <div ref="hostEl" class="editor" />
-      <SymbolDocumentation v-if="symbolDocumentation" ref="documentationRef" :document="symbolDocumentation" @close="closeDocumentation()" />
+      <SymbolDocumentation v-if="symbolDocumentation" ref="documentationRef" :document="symbolDocumentation" :pinned="!!symbolDocumentation.pinned" @keydown="documentationKey" @toggle-pin="toggleDocumentationPin" @retry-translation="retryDocumentationTranslation" @close="closeDocumentation()" />
       <CallHierarchyPanel v-if="hierarchy" v-bind="hierarchy" @navigate="navigateHierarchy" @close="closeLanguageNavigation" />
       <aside v-if="lensReferences" class="language-symbol-panel card lens-references" aria-label="CodeLens 引用" @keydown.esc.stop="closeLanguageNavigation">
         <div class="symbol-head"><b>{{ lensReferences.title }}</b><span class="spacer" /><button class="ghost" aria-label="关闭引用" @click="closeLanguageNavigation">×</button></div>
@@ -1305,45 +1430,88 @@ onBeforeUnmount(() => {
 
 <style scoped>
 .pane { display: flex; flex-direction: column; flex: 1; min-width: 0; min-height: 0; height: 100%; position: relative; }
-.editor { --ide-hover-width: 560px; }
+.editor { --ide-hover-width: 500px; }
 /* Keep Monaco's placement, focus, resizing and diagnostic actions; constrain only its reading surface. */
 .editor :deep(.monaco-resizable-hover) {
-  border-radius: 9px;
+  border-radius: 10px;
   border-color: var(--vscode-editorHoverWidget-border, var(--border));
-  box-shadow: 0 8px 26px #14213d1a, 0 2px 5px #14213d08;
+  box-shadow: var(--shadow-pop);
 }
 .editor :deep(.monaco-hover) {
   --vscode-hover-maxWidth: min(var(--ide-hover-width), calc(100vw - 40px)) !important;
   background: var(--panel);
   color: var(--text);
   border-color: var(--border);
-  border-radius: 9px;
+  border-radius: 10px;
   max-width: min(var(--ide-hover-width), calc(100vw - 40px)) !important;
 }
 .editor :deep(.monaco-hover-content) {
   font-size: 13px !important;
-  line-height: 1.65 !important;
+  line-height: 1.6 !important;
   max-width: min(var(--ide-hover-width), calc(100vw - 40px)) !important;
 }
-.editor :deep(.monaco-hover .hover-row .hover-row-contents) { flex: 1; }
-.editor :deep(.monaco-hover .markdown-hover) { padding: 10px 14px; overflow-wrap: anywhere; }
+.editor :deep(.monaco-hover .hover-row .hover-row-contents) { flex: 1; min-width: 0; }
+.editor :deep(.monaco-hover .markdown-hover) { padding: 11px 14px; overflow-wrap: anywhere; }
 .editor :deep(.monaco-hover .markdown-hover h1),
 .editor :deep(.monaco-hover .markdown-hover h2),
-.editor :deep(.monaco-hover .markdown-hover h3),
+.editor :deep(.monaco-hover .markdown-hover h3) { font-size: 14px; line-height: 1.5; margin: 0 0 9px; font-weight: 650; color: var(--text); }
 .editor :deep(.monaco-hover .markdown-hover h4),
 .editor :deep(.monaco-hover .markdown-hover h5),
-.editor :deep(.monaco-hover .markdown-hover h6) { font-size: 13px; line-height: 1.6; margin: 12px 0 5px; font-weight: 600; }
-.editor :deep(.monaco-hover .markdown-hover p) { margin: 5px 0; line-height: 1.7; }
+.editor :deep(.monaco-hover .markdown-hover h6) { font-size: 12px; line-height: 1.5; margin: 11px 0 4px; font-weight: 600; color: var(--text-2); }
+.editor :deep(.monaco-hover .markdown-hover p) { margin: 6px 0; line-height: 1.6; }
+.editor :deep(.monaco-hover .markdown-hover strong) { font-weight: 600; }
 .editor :deep(.monaco-hover .markdown-hover ul),
-.editor :deep(.monaco-hover .markdown-hover ol) { margin: 6px 0; padding-left: 20px; }
-.editor :deep(.monaco-hover .markdown-hover li) { margin: 3px 0; line-height: 1.7; }
-.editor :deep(.monaco-hover .markdown-hover hr) { margin: 10px 0; border-color: var(--border); }
-.editor :deep(.monaco-hover .markdown-hover code) { font-size: 12px; border-radius: 4px; padding: 1px 4px; }
-.editor :deep(.monaco-hover .markdown-hover pre) { margin: 0; padding: 8px 10px; border-radius: 5px; background: var(--panel-soft); white-space: pre-wrap; overflow-wrap: anywhere; }
-.editor :deep(.monaco-hover .markdown-hover pre code) { padding: 0; line-height: 1.65; }
+.editor :deep(.monaco-hover .markdown-hover ol) { margin: 6px 0; padding-left: 18px; }
+.editor :deep(.monaco-hover .markdown-hover li) { margin: 3px 0; line-height: 1.6; }
+.editor :deep(.monaco-hover .markdown-hover hr) { margin: 10px 0; border: 0; border-top: 1px solid var(--border); }
+.editor :deep(.monaco-hover .markdown-hover code) { font-size: 12px; border-radius: 4px; padding: 1px 4px; background: var(--panel-soft); color: var(--text); overflow-wrap: anywhere; white-space: normal; }
+.editor :deep(.monaco-hover .markdown-hover h3 code) { padding: 0; background: transparent; font-size: 14px; }
+.editor :deep(.monaco-hover .markdown-hover pre) { margin: 8px 0; padding: 9px 11px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel-soft); white-space: pre-wrap; overflow-wrap: anywhere; }
+.editor :deep(.monaco-hover .markdown-hover pre code) { padding: 0; line-height: 1.6; background: transparent; white-space: pre-wrap; }
+.editor :deep(.monaco-hover .markdown-hover table) { width: 100%; margin: 8px 0; border-collapse: collapse; border-spacing: 0; font-size: 12px; line-height: 1.5; }
+.editor :deep(.monaco-hover .markdown-hover th),
+.editor :deep(.monaco-hover .markdown-hover td) { padding: 5px 7px; border: 1px solid var(--border); text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+.editor :deep(.monaco-hover .markdown-hover th) { background: var(--panel-soft); color: var(--text-2); font-weight: 600; }
+.editor :deep(.monaco-hover .markdown-hover td:first-child) { width: 66px; color: var(--muted); white-space: normal; }
+/* The compact preview uses a label/value table, not a second pair of headings.
+   Keep genuine server tables intact when they provide column names. */
+.editor :deep(.monaco-hover .markdown-hover h3 ~ table thead:has(th:empty):not(:has(th:not(:empty)))) { display: none; }
+.editor :deep(.monaco-hover .markdown-hover h3 ~ table:has(thead th:empty):not(:has(thead th:not(:empty))) td) { border: 0; background: transparent; padding: 3px 0; }
+.editor :deep(.monaco-hover .markdown-hover h3 ~ table:has(thead th:empty):not(:has(thead th:not(:empty))) td + td) { padding-left: 9px; }
+.editor :deep(.monaco-hover .markdown-hover blockquote) { margin: 10px 0 0; padding: 7px 0 0; border: 0; border-top: 1px solid var(--border); color: var(--muted); font-size: 11px; line-height: 1.5; }
+.editor :deep(.monaco-hover .markdown-hover blockquote p) { margin: 0; font-size: inherit; line-height: inherit; }
 .editor :deep(.monaco-hover .hover-row:first-child .markdown-hover > :first-child) { margin-top: 0; }
+.editor :deep(.monaco-hover .markdown-hover > :last-child) { margin-bottom: 0; }
 .editor :deep(.monaco-hover .hover-row:not(:first-child)) { border-top: 1px solid var(--vscode-editorHoverWidget-border, var(--border)); }
-.editor :deep(.monaco-hover .hover-row .actions) { font-size: 11px; padding: 5px 12px; }
+.editor :deep(.monaco-hover .hover-row .actions) { font-size: 11px; padding: 5px 14px; color: var(--muted); }
+.editor :deep(.suggest-widget), .editor :deep(.suggest-details), .editor :deep(.parameter-hints-widget) { border-radius: 10px; border-color: var(--border); background: var(--panel); color: var(--text); box-shadow: var(--shadow-pop); }
+.editor :deep(.suggest-widget) { max-width: calc(100vw - 40px); }
+.editor :deep(.suggest-widget .monaco-list-row) { font-size: 13px; }
+.editor :deep(.suggest-widget .details-label) { color: var(--muted); font-size: 12px; }
+.editor :deep(.suggest-details) { max-width: min(500px, calc(100vw - 40px)); }
+.editor :deep(.suggest-details .body) { position: relative; }
+/* The same raw detail remains available to Monaco's candidate list. Its
+   formatted signature appears once in our documentation card instead. */
+.editor :deep(.suggest-details:has(.docs .rendered-markdown > h3:first-child > code) .header .type) { display: none !important; }
+.editor :deep(.suggest-details:has(.docs .rendered-markdown > h3:first-child > code) .header) { padding: 0; margin: 0; }
+.editor :deep(.suggest-details:has(.docs .rendered-markdown > h3:first-child > code) .header .codicon-close) { position: absolute; top: 7px; right: 7px; z-index: 1; color: var(--muted); }
+.editor :deep(.suggest-details .docs) { margin: 0; padding: 11px 14px; font-family: var(--font-sans, system-ui, sans-serif); font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; }
+.editor :deep(.suggest-details > .monaco-scrollable-element > .body > .docs.markdown-docs) { padding: 11px 14px; }
+.editor :deep(.suggest-details > .monaco-scrollable-element > .body > .docs.markdown-docs > .rendered-markdown) { padding: 0; }
+.editor :deep(.suggest-details .docs h3) { padding-right: 22px; margin: 0 0 9px; font-size: 14px; line-height: 1.5; font-weight: 650; }
+.editor :deep(.suggest-details .docs h3 code) { padding: 0; background: transparent; font-size: inherit; }
+.editor :deep(.suggest-details .docs p) { margin: 6px 0; line-height: 1.6; }
+.editor :deep(.suggest-details .docs code) { padding: 1px 4px; border-radius: 4px; background: var(--panel-soft); font-size: 12px; }
+.editor :deep(.suggest-details .docs pre), .editor :deep(.suggest-details .docs .monaco-tokenized-source) { margin: 8px 0; padding: 9px 11px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel-soft); white-space: pre-wrap; overflow-wrap: anywhere; }
+.editor :deep(.suggest-details .docs .monaco-tokenized-source) { font-size: 12px !important; line-height: 1.6 !important; white-space: pre-wrap !important; overflow-wrap: anywhere; max-width: 100%; min-width: 0; box-sizing: border-box; }
+.editor :deep(.suggest-details .docs .monaco-tokenized-source span) { white-space: pre-wrap !important; overflow-wrap: anywhere; }
+.editor :deep(.suggest-details .docs pre code) { padding: 0; background: transparent; white-space: pre-wrap; }
+.editor :deep(.suggest-details .docs ul), .editor :deep(.suggest-details .docs ol) { padding-left: 18px; margin: 6px 0; }
+.editor :deep(.suggest-details .docs table) { max-width: 100%; border-collapse: collapse; font-size: 12px; }
+.editor :deep(.suggest-details .docs th), .editor :deep(.suggest-details .docs td) { padding: 4px 6px; border: 1px solid var(--border); overflow-wrap: anywhere; }
+.editor :deep(.suggest-details .docs blockquote) { margin: 10px 0 0; padding: 7px 0 0; border: 0; border-top: 1px solid var(--border); font-size: 11px; color: var(--muted); }
+.editor :deep(.suggest-details .docs blockquote p) { margin: 0; font-size: inherit; }
+.editor :deep(.suggest-details .docs .rendered-markdown > :last-child) { margin-bottom: 0; }
 @media (max-width: 700px) { .editor { --ide-hover-width: calc(100vw - 44px); } }
 .empty { display: flex; flex-direction: column; gap: 12px; align-items: center; justify-content: center; height: 100%; padding: 32px; font-size: var(--fs-sm); text-align: center; background: var(--panel); }
 .empty-icon { display: grid; place-items: center; width: 64px; height: 64px; margin-bottom: 5px; color: var(--accent); border-radius: 14px; background: var(--accent-soft); }
@@ -1375,6 +1543,26 @@ onBeforeUnmount(() => {
   border: 1px solid transparent; cursor: pointer; font: inherit; font-size: var(--fs-xs);
 }
 .lsp.as-button:hover { border-color: currentColor; }
+.compact-toolbar .bar { container-type: inline-size; container-name: code-editor-header; min-height: 30px; height: 30px; gap: 6px; padding: 2px 9px; flex-wrap: nowrap; }
+.compact-toolbar .bar .path { display: flex; align-items: center; gap: 3px; flex: 1 1 auto; min-width: 32px; max-width: none; font-size: var(--fs-2xs); }
+.compact-toolbar .bar .path > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.compact-toolbar .breadcrumb-file { color: var(--text); }
+.compact-toolbar .breadcrumb-separator { flex-shrink: 0; color: var(--faint); }
+.compact-toolbar .bar > .spacer { display: none; }
+.compact-toolbar .bar .chip { font-size: var(--fs-2xs); padding: 1px 4px; }
+.compact-toolbar .bar .lsp { max-width: 112px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding: 1px 4px; font-size: var(--fs-2xs); }
+.compact-toolbar .bar .meta { font-size: var(--fs-2xs); }
+.compact-toolbar .bar .compact-save { min-height: 23px; padding: 1px 6px; border-color: transparent; background: transparent; color: var(--accent); font-size: var(--fs-2xs); box-shadow: none; }
+.compact-toolbar .bar .compact-save:disabled { color: var(--muted); opacity: .65; }
+.compact-toolbar .bar .compact-save:hover:not(:disabled) { background: var(--accent-soft); }
+@container code-editor-header (max-width: 520px) {
+  .compact-toolbar .bar .meta, .compact-toolbar .bar .language-chip { display: none; }
+  .compact-toolbar .bar .lsp { max-width: 90px; }
+}
+@media (max-width: 600px) {
+  .pane.compact-toolbar .bar { min-height: 30px; height: 30px; padding: 2px 7px; gap: 4px; flex-wrap: nowrap; }
+  .pane.compact-toolbar .bar .path { flex-basis: auto; max-width: none; }
+}
 .language-tools { display: flex; align-items: center; gap: var(--sp-1); min-width: 0; min-height: 32px; flex: none; padding: 2px 10px; border-bottom: 1px solid var(--border); background: var(--panel-soft); }
 .language-tools.in-workbench { min-height: 28px; padding: 0; border-bottom: 0; background: transparent; }
 .language-tool { padding: var(--sp-1) var(--sp-2); font-size: var(--fs-xs); min-height: 26px; background: transparent; border: 1px solid transparent; white-space: nowrap; }
@@ -1399,10 +1587,12 @@ onBeforeUnmount(() => {
 /* 语言服务器面板 */
 .lsp-panel {
   position: absolute; right: 10px; top: 42px; z-index: 20; width: min(520px, calc(100% - 20px)); max-height: min(640px, calc(100% - 52px));
-  overflow: auto; padding: var(--sp-2) var(--sp-2-5); font-size: var(--fs-xs); box-shadow: var(--shadow-pop);
+  box-sizing: border-box; overflow: auto; overscroll-behavior: contain; padding: var(--sp-2) var(--sp-2-5); font-size: var(--fs-xs); box-shadow: var(--shadow-pop);
 }
-.lsp-head { display: flex; align-items: center; gap: var(--sp-2); margin-bottom: var(--sp-1-5); flex-wrap: wrap; row-gap: var(--sp-1); }
-.lsp-head .spacer { flex: 1; }
+.lsp-head { position: relative; display: flex; align-items: center; gap: var(--sp-2); margin-bottom: var(--sp-1-5); padding-right: 26px; flex-wrap: wrap; row-gap: var(--sp-1); }
+.lsp-title { display: flex; align-items: center; gap: var(--sp-2); min-width: 0; }
+.lsp-head-actions { display: flex; align-items: center; gap: var(--sp-1); flex: none; margin-left: auto; }
+.lsp-head .lsp-close { position: absolute; top: 0; right: 0; }
 .lsp-language { font-size: 11px; padding: 1px 5px; border-radius: 4px; background: var(--panel-soft); }
 .lsp-runtime { padding: 9px 0 11px; border-bottom: 1px solid var(--border); }
 .lsp-runtime-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 5px; font-size: 12px; }
@@ -1412,18 +1602,22 @@ onBeforeUnmount(() => {
 .lsp-features span { padding: 2px 6px; border: 1px solid var(--border); border-radius: 4px; color: var(--muted); font-size: 11px; }
 .lsp-features .available { color: var(--text-2); background: var(--panel-soft); border-color: transparent; }
 .lsp-catalog-summary { padding: 9px 0 4px; font-size: 11px; }
-.lsp-command { flex-basis: 100%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }
+.lsp-command { display: block; min-width: 0; max-width: 100%; padding: 0; border-radius: 0; background: transparent; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; line-height: 1.6; user-select: text; }
 .lsp-list { list-style: none; margin: 0; padding: 0; }
 .lsp-list li {
-  display: flex; align-items: center; gap: var(--sp-1-5); padding: var(--sp-1) var(--sp-0-5); border-bottom: 1px solid var(--border); min-width: 0; flex-wrap: wrap;
+  display: flex; flex-direction: column; gap: var(--sp-1-5); padding: var(--sp-2) var(--sp-0-5); border-bottom: 1px solid var(--border); min-width: 0;
 }
+.lsp-server-heading { display: flex; align-items: baseline; flex-wrap: wrap; gap: var(--sp-1-5); min-width: 0; width: 100%; }
+.lsp-server-detail { min-width: 0; width: 100%; }
+.lsp-detail-heading { display: flex; align-items: center; gap: var(--sp-2); margin-bottom: var(--sp-1); }
+.lsp-detail-heading button { margin-left: auto; flex: none; font-size: var(--fs-2xs); }
+.lsp-install-hint { margin: 0; color: var(--text-2); white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; user-select: text; }
+.lsp-copy-error { margin: var(--sp-2) 0; color: var(--err); }
 .lsp-list .st { flex: none; font-size: var(--fs-xs); padding: 0 5px; border-radius: var(--r-sm); background: var(--hover); color: #475569; }
 .lsp-list .st.installed { background: #ecfdf5; color: #047857; }
 .lsp-list .st.missing { background: #fffbeb; color: #92400e; }
 .lsp-list .st.unavailable { background: var(--hover); color: #94a3b8; }
-.lsp-list .nm { flex: none; font-weight: var(--fw-semibold); }
-.lsp-list .spacer { flex: 1; }
-.hintbtn { font-size: var(--fs-xs); max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lsp-list .nm { min-width: 0; font-weight: var(--fw-semibold); overflow-wrap: anywhere; }
 .lsp-foot { margin-top: var(--sp-1-5); }
 button.sm { padding: 3px var(--sp-2-5); font-size: var(--fs-xs); }
 

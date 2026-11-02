@@ -13,6 +13,8 @@ import { computed, defineAsyncComponent, nextTick, onBeforeUnmount, onMounted, r
 import { api } from '../api.js'
 import UiIcon from '../components/ui/UiIcon.vue'
 import AgentLogo from '../components/ui/AgentLogo.vue'
+import IdeMenuBar from '../components/code/IdeMenuBar.vue'
+import IdeCommandPalette from '../components/code/IdeCommandPalette.vue'
 import FileTree from '../components/code/FileTree.vue'
 import EditorPane from '../components/code/EditorPane.vue'
 import AiPanel from '../components/code/AiPanel.vue'
@@ -25,6 +27,7 @@ import RuntimePanel from '../components/code/RuntimePanel.vue'
 import DebugPanel from '../components/code/DebugPanel.vue'
 import { changeReviews } from '../lib/changeReviewClient.js'
 import { documentKey, useWorkbench } from '../composables/useWorkbench.js'
+import { isMissingProjectFile } from '../lib/fileErrors.js'
 import { useNavigation } from '../composables/useNavigation.js'
 import { useProjectAccess } from '../composables/useProjectAccess.js'
 import { useFunctionDescriptions } from '../composables/useFunctionDescriptions.js'
@@ -33,27 +36,50 @@ import { useDialog } from '../composables/useDialog.js'
 import { prepareWorkspaceEdit, assertPlanCurrent, findPlanDocument } from '../lib/workspaceEdits.js'
 import { useProjectAgentTeam } from '../lib/agentTeam.js'
 import { useProjectConversations } from '../composables/useProjectConversations.js'
+import { desktopRuntime, createWorkbenchLeaveGuard } from '../lib/desktopRuntime.js'
+import { readIdeLayout, persistIdeLayout } from '../lib/ideLayout.js'
+import { flattenIdeCommands } from '../lib/ideCommands.js'
+import { ideActions } from '../lib/ideActions.js'
 
 // Optional IDE tools are fetched on first use, then remain mounted to retain their state.
 const MindMap = defineAsyncComponent(() => import('../components/code/MindMap.vue'))
 const FrontendDesign = defineAsyncComponent(() => import('../components/code/FrontendDesign.vue'))
+const IntegrationPanel = defineAsyncComponent(() => import('../components/code/IntegrationPanel.vue'))
 const PatchPanel = defineAsyncComponent(() => import('../components/code/PatchPanel.vue'))
 const SourceControl = defineAsyncComponent(() => import('../components/code/SourceControl.vue'))
 const WorkItemsPanel = defineAsyncComponent(() => import('../components/code/WorkItemsPanel.vue'))
 const ChangesPanel = defineAsyncComponent(() => import('../components/code/ChangesPanel.vue'))
 
-const props = defineProps({ user: { type: Object, required: true }, visible: { type: Boolean, default: true } })
-const emit = defineEmits(['open-settings'])
+const props = defineProps({ user: { type: Object, required: true }, visible: { type: Boolean, default: true }, desktopState: { type: Object, default: null } })
+const emit = defineEmits(['open-settings', 'open-desktop'])
+const desktopAvailable = desktopRuntime.available()
+const integratedTitlebar = desktopRuntime.integratedTitlebar()
+const desktopHealthLabel = computed(() => {
+  const services = props.desktopState?.services
+  if (!services?.length) return '应用状态'
+  return services.every(service => service.state === 'healthy') ? '应用运行正常' : services.some(service => service.state === 'starting' || service.state === 'stopping') ? '应用正在准备' : '应用需要检查'
+})
 const dialog = useDialog()
+const leaveDialog = useDialog()
 const workbench = useWorkbench({ storageKey: `code-agent-workbench-v1:${props.user?.id || props.user?.user_id || 'local'}` })
 const documents = workbench.documents
 const activeDocumentKey = workbench.activeKey
+const activeFileError = computed(() => {
+  const doc = workbench.activeDocument.value, message = doc?.readError || doc?.saveError || ''
+  return message && !message.includes(doc.path) ? `${doc.path}：${message}` : message
+})
 const manualReadonly = ref(false)
 const quickOpen = ref(false)
 const quickMode = ref('files')
-const leftVisible = ref(true)
-const rightVisible = ref(true)
-const problemsVisible = ref(false)
+let layoutStorage = null
+try { layoutStorage = globalThis.localStorage } catch { /* Layout remains usable without storage. */ }
+const initialLayout = readIdeLayout(layoutStorage)
+const leftVisible = ref(initialLayout.left)
+const rightVisible = ref(initialLayout.right)
+const problemsVisible = ref(initialLayout.bottom)
+const bottomHeight = ref(initialLayout.bottomHeight)
+const focusMode = ref(false)
+const commandPaletteOpen = ref(false)
 const closingDocument = ref(null)
 const conflictDialog = ref(null)
 const languageEditPreview = ref(null)
@@ -66,9 +92,10 @@ const editorSelection = ref(null)
 const contextEnabled = ref(true)
 const navigation = useNavigation()
 const navigationBusy = ref(false)
-const bottomTab = ref('problems')
-const runtimeActivated = ref(false)
-const debugActivated = ref(false)
+const bottomTab = ref(initialLayout.bottomTab)
+const runtimeActivated = ref(initialLayout.bottom && ['terminal', 'run', 'output', 'tests'].includes(initialLayout.bottomTab))
+const debugActivated = ref(initialLayout.bottom && initialLayout.bottomTab === 'debug')
+const integrationActivated = ref(initialLayout.bottom && initialLayout.bottomTab === 'integration')
 const runtimeRef = ref(null)
 const debugRef = ref(null)
 const debugLocation = ref(null)
@@ -110,8 +137,9 @@ const mapActivated = ref(false)
 const designActivated = ref(false)
 const designAssistantVisible = ref(false)
 const designAiResult = ref(null)
-const leftShown = computed(() => leftVisible.value && centerView.value !== 'design')
-const rightShown = computed(() => rightVisible.value && (centerView.value !== 'design' || designAssistantVisible.value))
+const leftShown = computed(() => !focusMode.value && leftVisible.value && centerView.value !== 'design')
+const rightShown = computed(() => !focusMode.value && rightVisible.value && (centerView.value !== 'design' || designAssistantVisible.value))
+const bottomShown = computed(() => !focusMode.value && problemsVisible.value)
 const mobilePanel = ref('center')
 const rightTab = ref('ai')           // ai | patches
 const changesVisible = computed(() => props.visible !== false && rightShown.value && rightTab.value === 'changes')
@@ -277,8 +305,8 @@ const codeContext = computed(() => {
 // ---- 三栏宽度（可拖，记忆到 localStorage） ----
 const LEFT_KEY = 'code-agent-code-left'
 const RIGHT_KEY = 'code-agent-code-right'
-const leftWidth = ref(Number(localStorage.getItem(LEFT_KEY)) || 264)
-const rightWidth = ref(Number(localStorage.getItem(RIGHT_KEY)) || 380)
+const leftWidth = ref(Number(layoutStorage?.getItem(LEFT_KEY)) || 248)
+const rightWidth = ref(Number(layoutStorage?.getItem(RIGHT_KEY)) || 340)
 
 function startDrag(side, ev) {
   dragCleanup?.()
@@ -296,8 +324,7 @@ function startDrag(side, ev) {
   }
   const onUp = () => {
     dragCleanup?.()
-    localStorage.setItem(LEFT_KEY, String(leftWidth.value))
-    localStorage.setItem(RIGHT_KEY, String(rightWidth.value))
+    try { layoutStorage?.setItem(LEFT_KEY, String(leftWidth.value)); layoutStorage?.setItem(RIGHT_KEY, String(rightWidth.value)) } catch { }
   }
   dragCleanup = () => {
     window.removeEventListener('mousemove', onMove)
@@ -311,6 +338,77 @@ function startDrag(side, ev) {
 const gridStyle = computed(() => ({
   gridTemplateColumns: `${leftShown.value ? leftWidth.value : 0}px minmax(0, 1fr) ${rightShown.value ? rightWidth.value : 0}px`,
 }))
+
+watch([leftVisible, rightVisible, problemsVisible, bottomTab, bottomHeight], () => persistIdeLayout(layoutStorage, {
+  left: leftVisible.value, right: rightVisible.value, bottom: problemsVisible.value, bottomTab: bottomTab.value, bottomHeight: bottomHeight.value,
+}))
+function resizeBottom(value) { bottomHeight.value = Math.max(160, Math.min(600, Math.round(value))) }
+function startBottomDrag(event) {
+  dragCleanup?.(); event.preventDefault()
+  const startY = event.clientY, height = bottomHeight.value
+  const move = next => resizeBottom(height + startY - next.clientY)
+  dragCleanup = () => { window.removeEventListener('mousemove', move); window.removeEventListener('mouseup', release); dragCleanup = null }
+  const release = () => dragCleanup?.()
+  window.addEventListener('mousemove', move); window.addEventListener('mouseup', release)
+}
+function restoreDefaultLayout() {
+  focusMode.value = false; leftVisible.value = true; rightVisible.value = true; problemsVisible.value = false
+  leftWidth.value = 248; rightWidth.value = 340; bottomHeight.value = 260; bottomTab.value = 'problems'; rightTab.value = 'ai'
+  mobilePanel.value = 'center'; designAssistantVisible.value = false
+  try { layoutStorage?.setItem(LEFT_KEY, '248'); layoutStorage?.setItem(RIGHT_KEY, '340') } catch { }
+}
+function showRightTool(tab) {
+  const active = rightShown.value && rightTab.value === tab && (!compactWorkbench() || mobilePanel.value === 'assistant')
+  focusMode.value = false; rightTab.value = tab
+  if (active && mobilePanel.value !== 'projects') { rightVisible.value = false; if (compactWorkbench()) mobilePanel.value = 'center' }
+  else { rightVisible.value = true; if (centerView.value === 'design') designAssistantVisible.value = true; mobilePanel.value = 'assistant' }
+}
+function compactWorkbench() { return typeof window !== 'undefined' && window.innerWidth <= 1100 }
+async function saveCurrentDocument() { return editorRef.value?.save?.() }
+async function saveAllDocuments() {
+  if (!project.value || saving.value || manualReadonly.value) return
+  captureEditor()
+  const pid = project.value.id
+  let count = 0
+  for (const doc of [...documents.value].filter(item => item.dirty && item.projectId === pid)) {
+    if (project.value?.id !== pid || !await saveFile({ key: doc.key, path: doc.path, text: doc.text, sha1: doc.sha1 })) return
+    count++
+  }
+  if (count && project.value?.id === pid) notice.value = `已保存 ${count} 个文件${documents.value.some(doc => doc.dirty) ? '，仍有新的未保存修改' : ''}`
+}
+const ideMenus = computed(() => {
+  const hasFile = !!file.value, hasProject = !!project.value && project.value.available !== false
+  const writable = hasFile && editorRef.value?.canEdit && !languageEditBusy.value
+  const command = (id, label, shortcut, disabled = false, extra = {}) => ({ id, label, shortcut, disabled, ...extra })
+  const language = id => { const row = editorRef.value?.commandState?.(id); return row ? command(`language:${id}`, row.label, row.shortcut, row.disabled, { title: row.reason }) : command(`language:${id}`, ideActions.find(item => item.id === id)?.label || id, '', true) }
+  return [
+    { id: 'file', label: '文件', items: [command('open-folder', '打开文件夹…', 'Ctrl+Shift+O', projectBusy.value || loading.value), command('new-project', '新建项目…', '', projectBusy.value), command('open-path', '通过路径打开项目…', '', projectBusy.value), {separator:true}, command('save', '保存', 'Ctrl+S', !editorRef.value?.canSave), command('save-all', '全部保存', 'Ctrl+Shift+S', !hasProject || saving.value || manualReadonly.value || !documents.value.some(doc => doc.dirty)), {separator:true}, command('close-file', '关闭当前文件', '', !hasFile)] },
+    { id: 'edit', label: '编辑', items: [command('edit:undo', '撤销', 'Ctrl+Z', !writable), command('edit:redo', '重做', 'Ctrl+Shift+Z', !writable), {separator:true}, command('edit:find', '文件内查找', 'Ctrl+F', !hasFile), command('edit:replace', '文件内替换', 'Ctrl+H', !writable), command('edit:selectAll', '全选', 'Ctrl+A', !hasFile), {separator:true}, language('complete'), language('parameters'), language('format'), command('toggle-readonly', '人工编辑只读', '', !hasProject, {checked:manualReadonly.value})] },
+    { id: 'navigate', label: '导航', items: [command('quick-open', '搜索文件…', 'Ctrl+P', !hasProject), command('search-content', '搜索项目代码…', 'Ctrl+Shift+F', !hasProject), command('edit:gotoLine', '跳转到行…', 'Ctrl+G', !hasFile), {separator:true}, command('back', '后退', 'Alt+←', navigationBusy.value || !navigation.canBack.value), command('forward', '前进', 'Alt+→', navigationBusy.value || !navigation.canForward.value), {separator:true}, ...['definition','implementation','references','symbols','rename','quickFix','refactor'].map(language)] },
+    { id: 'view', label: '视图', items: [command('commands', '命令面板…', 'Ctrl+Shift+P'), command('files', '项目文件', 'Ctrl+B', false, {checked:leftShown.value}), command('assistant', 'AI 助手', '', false, {checked:rightShown.value && rightTab.value === 'ai'}), command('git', '源代码管理', '', !hasProject, {checked:rightShown.value && rightTab.value === 'git'}), {separator:true}, command('editor', '编辑器', '', false, {checked:centerView.value === 'file'}), command('map', '思维导图', '', !hasProject, {checked:centerView.value === 'map'}), command('design', '前端设计', '', !hasProject, {checked:centerView.value === 'design'}), {separator:true}, command('focus', '专注模式', 'Ctrl+Shift+F12', false, {checked:focusMode.value}), command('reset-layout', '恢复默认布局')] },
+    { id: 'run', label: '运行', items: [command('run', '运行当前文件', 'Ctrl+F5', !hasFile || executionBusy.value || saving.value || !hasProject), command('debug', '调试当前文件', 'F5', !debugSupported.value || executionBusy.value || saving.value), command('breakpoint', '切换断点', 'F9', !hasFile), {separator:true}, ...[{id:'terminal',label:'终端',key:'Ctrl+`'}, {id:'run',label:'运行配置'}, {id:'debug',label:'调试面板'}, {id:'integration',label:'前后端联调'}, {id:'problems',label:'问题'}, {id:'output',label:'输出'}, {id:'tests',label:'测试'}].map(tab => command(`bottom:${tab.id}`, tab.label, tab.key, !hasProject && tab.id !== 'problems'))] },
+    { id: 'help', label: '帮助', items: [command('commands', '查找全部命令…', 'Ctrl+Shift+P'), command('settings', '设置', 'Ctrl+,'), ...(desktopAvailable ? [command('application', '应用状态与日志')] : []), command('keyboard-settings', '快捷键设置')] },
+  ]
+})
+async function onIdeCommand(id) {
+  const item = flattenIdeCommands(ideMenus.value).find(row => row.id === id)
+  if (!item) return
+  if (id.startsWith('language:')) return editorRef.value?.runIdeCommand?.(id.slice(9))
+  if (id.startsWith('edit:')) return editorRef.value?.runEditorCommand?.(id.slice(5))
+  if (id.startsWith('bottom:')) return showBottom(id.slice(7))
+  const actions = {
+    'open-folder': openProjectFolder, 'new-project': () => promptOpenProject('create'), 'open-path': () => promptOpenProject('path'),
+    save: saveCurrentDocument, 'save-all': saveAllDocuments, 'close-file': () => closeDocument(activeDocumentKey.value),
+    'quick-open': () => openWorkspaceSearch('files'), 'search-content': () => openWorkspaceSearch('content'),
+    back: () => navigateHistory(-1), forward: () => navigateHistory(1), commands: () => { commandPaletteOpen.value = true },
+    files: toggleFileSidebar, assistant: () => showRightTool('ai'), git: () => showRightTool('git'),
+    editor: () => { centerView.value = 'file'; mobilePanel.value = 'center' }, map: () => { captureEditor(); centerView.value = 'map'; mobilePanel.value = 'center' }, design: openFrontendDesign,
+    focus: () => { focusMode.value = !focusMode.value; mobilePanel.value = 'center'; nextTick(() => editorRef.value?.focus?.()) },
+    'reset-layout': restoreDefaultLayout, 'toggle-readonly': () => { manualReadonly.value = !manualReadonly.value }, run: runCurrent, debug: () => runDebug(), breakpoint: () => editorRef.value?.toggleBreakpoint?.(),
+    settings: () => emit('open-settings'), 'keyboard-settings': () => emit('open-settings', 'general'), application: () => emit('open-desktop'),
+  }
+  return actions[id]?.()
+}
 
 function captureEditor() {
   const snapshot = editorRef.value?.snapshot?.()
@@ -342,11 +440,27 @@ function activateDocument(key) {
   fileRequest += 1
   fileBusy.value = false
   if (!workbench.activate(key)) return
+  banner.value = ''
   fileLine.value = 0
   syncActiveDocument()
   navigation.visit(currentLocation(), previous)
   centerView.value = 'file'
   mobilePanel.value = 'center'
+  const doc = workbench.activeDocument.value
+  if (doc?.needsReload || doc?.file?.missing || doc?.readError) void openFile({ path: doc.path }, { recordNavigation: false })
+}
+
+function dismissFileError() {
+  banner.value = ''
+  const doc = workbench.activeDocument.value
+  if (doc) doc.readError = doc.saveError = ''
+}
+
+async function reloadActiveDocument() {
+  const doc = workbench.activeDocument.value
+  if (!doc || fileBusy.value) return false
+  captureEditor()
+  return openFile({ path: doc.path }, { recordNavigation: false, reload: true })
 }
 
 function onEditorChange({ key, text }) {
@@ -495,9 +609,8 @@ async function restoreDocument(doc, pid, version) {
     if (doc.needsReload) workbench.updateExternal(doc.key, fresh)
   } catch (e) {
     if (!isCurrentProject(pid, version) || !documents.value.includes(doc) || !doc.needsReload) return
-    doc.file = { ...doc.file, path: doc.path, missing: true }
-    doc.needsReload = false
-    banner.value = `${doc.path}：${e.message}。恢复的草稿仍保留。`
+    workbench.markReadError(doc.key, `${e.message || '文件读取失败，请重试'}${doc.dirty ? '。恢复的草稿仍保留。' : ''}`,
+      { missing: isMissingProjectFile(e) })
   }
   if (isCurrentProject(pid, version) && file.value?.key === doc.key) syncActiveDocument()
 }
@@ -544,12 +657,17 @@ async function navigateHistory(direction) {
   finally { navigationBusy.value = false }
 }
 function showBottom(tab) {
+  focusMode.value = false
   centerView.value = 'file'
   bottomTab.value = tab
   problemsVisible.value = true
   mobilePanel.value = 'center'
   if (['terminal', 'run', 'output', 'tests'].includes(tab)) runtimeActivated.value = true
   if (tab === 'debug') debugActivated.value = true
+  if (tab === 'integration') {
+    integrationActivated.value = true
+    bottomHeight.value = Math.max(bottomHeight.value, 480)
+  }
 }
 function onBreakpoint(point) {
   const index = breakpoints.value.findIndex(b => b.path === point.path && b.line === point.line)
@@ -594,7 +712,8 @@ async function runDebug(options = {}) {
 }
 function onWorkbenchKey(ev) {
   if (props.visible === false) return
-  if (ev.defaultPrevented) return
+  if (ev.defaultPrevented || ev.isComposing || ev.keyCode === 229) return
+  if (commandPaletteOpen.value) return
   if (pickerOpen.value) {
     if (ev.key === 'Escape') { ev.preventDefault(); dismissProjectForm() }
     if (ev.key === 'Tab') {
@@ -629,10 +748,18 @@ function onWorkbenchKey(ev) {
     }
     return
   }
+  if ((ev.ctrlKey || ev.metaKey) && !ev.altKey && ev.shiftKey && ev.key.toLowerCase() === 'p') { ev.preventDefault(); commandPaletteOpen.value = true; return }
+  if (ev.target?.closest?.('[role="menu"], [role="menubar"]')) return
   if (centerView.value === 'file' && ev.altKey && !ev.ctrlKey && !ev.metaKey && ['ArrowLeft', 'ArrowRight'].includes(ev.key)) { ev.preventDefault(); navigateHistory(ev.key === 'ArrowLeft' ? -1 : 1); return }
   if (ev.key === 'F5' && centerView.value === 'file') { ev.preventDefault(); if (ev.ctrlKey || ev.metaKey) runCurrent(); else if (debugRef.value?.isPaused?.()) { showBottom('debug'); debugRef.value?.continue?.() } else runDebug(); return }
   if (ev.key === 'F9' && centerView.value === 'file') { ev.preventDefault(); editorRef.value?.toggleBreakpoint?.(); return }
   if (!(ev.ctrlKey || ev.metaKey) || ev.altKey) return
+  if (ev.key === 'F12' && ev.shiftKey) { ev.preventDefault(); void onIdeCommand('focus'); return }
+  if (ev.key.toLowerCase() === 's') { ev.preventDefault(); if (ev.shiftKey) void saveAllDocuments(); else void saveCurrentDocument(); return }
+  if (!ev.shiftKey && file.value && centerView.value === 'file' && ['f', 'h', 'g'].includes(ev.key.toLowerCase())) {
+    ev.preventDefault(); editorRef.value?.runEditorCommand?.({ f: 'find', h: 'replace', g: 'gotoLine' }[ev.key.toLowerCase()]); return
+  }
+  if (ev.key === '`') { ev.preventDefault(); if (project.value) showBottom('terminal'); return }
   if (ev.key.toLowerCase() === 'o' && ev.shiftKey) { ev.preventDefault(); openProjectFolder(); return }
   if (ev.key.toLowerCase() === 'p' && !ev.shiftKey) { ev.preventDefault(); openWorkspaceSearch('files') }
   if (ev.key.toLowerCase() === 'f' && ev.shiftKey) { ev.preventDefault(); openWorkspaceSearch('content') }
@@ -642,6 +769,10 @@ function beforeLeave(ev) {
   captureEditor(); workbench.flush()
   if (workbench.hasUnsaved.value) { ev.preventDefault(); ev.returnValue = '' }
 }
+const disposeDesktopGuard = desktopRuntime.registerLeaveGuard(createWorkbenchLeaveGuard({
+  capture: () => captureEditor(), flush: () => workbench.flush(), hasUnsaved: () => workbench.hasUnsaved.value,
+  storageError: () => workbench.storageError.value, confirm: message => leaveDialog.open({ title: '仍要离开工作区？', details: message, confirmText: '仍然离开', cancelText: '继续编辑', tone: 'warning' }),
+}))
 
 // ---- 数据流 ----
 function loadProjects() { return projectAccess.init() }
@@ -744,7 +875,7 @@ function stopDiagnosticsPolling() {
   diagTimer = null
 }
 
-async function openFile(f, { recordNavigation = true } = {}) {
+async function openFile(f, { recordNavigation = true, reload = false } = {}) {
   if (!project.value) return false
   captureEditor()
   const previous = currentLocation()
@@ -753,7 +884,7 @@ async function openFile(f, { recordNavigation = true } = {}) {
   const request = ++fileRequest
   const key = documentKey(pid, 'main', f.path)
   const existing = documents.value.find(doc => doc.key === key)
-  if (existing && !existing.needsReload) {
+  if (existing && !reload && !existing.needsReload && !existing.file?.missing && !existing.readError) {
     workbench.activate(key)
     syncActiveDocument()
     fileLine.value = f.line || 0
@@ -762,6 +893,7 @@ async function openFile(f, { recordNavigation = true } = {}) {
     centerView.value = 'file'
     mobilePanel.value = 'center'
     fileBusy.value = false
+    banner.value = ''
     if (recordNavigation) navigation.visit({ path: f.path, line: f.line || currentLocation()?.line || 1, column: f.column || currentLocation()?.column || 1 }, previous)
     return true
   }
@@ -772,6 +904,7 @@ async function openFile(f, { recordNavigation = true } = {}) {
     if (!isCurrentProject(pid, version) || request !== fileRequest) return
     if (file.value?.path !== result.path) selectedSymbol.value = null
     workbench.openFile(result, { projectId: pid, tree: 'main' })
+    banner.value = ''
     syncActiveDocument()
     fileLine.value = f.line || 1
     fileColumn.value = f.column || 1
@@ -782,7 +915,11 @@ async function openFile(f, { recordNavigation = true } = {}) {
     return true
   } catch (e) {
     if (!isCurrentProject(pid, version) || request !== fileRequest) return
-    banner.value = `${f.path}：${e.message}`
+    if (existing && documents.value.includes(existing)) {
+      workbench.markReadError(existing.key, e.message || '文件读取失败，请重试', { missing: isMissingProjectFile(e) })
+      if (file.value?.key === existing.key) syncActiveDocument()
+      else banner.value = `无法打开「${f.path}」：${e.message}`
+    } else banner.value = `无法打开「${f.path}」：${e.message}`
     return false
   } finally {
     if (isCurrentProject(pid, version) && request === fileRequest) fileBusy.value = false
@@ -812,21 +949,27 @@ function openFrontendDesign() {
   mobilePanel.value = 'center'
 }
 function toggleAssistantPanel() {
+  if (compactWorkbench() || rightTab.value !== 'ai') { showRightTool('ai'); return }
+  if (focusMode.value) { focusMode.value = false; rightVisible.value = true; return }
   if (centerView.value === 'design') {
     designAssistantVisible.value = !rightShown.value
     if (designAssistantVisible.value) rightVisible.value = true
   } else rightVisible.value = !rightVisible.value
 }
 function showProjectPanel() {
+  focusMode.value = false
   if (centerView.value === 'design') centerView.value = 'file'
   leftVisible.value = true
   mobilePanel.value = 'projects'
 }
 function toggleFileSidebar() {
+  if (compactWorkbench()) { if (mobilePanel.value === 'projects') mobilePanel.value = 'center'; else showProjectPanel(); return }
+  if (focusMode.value) { focusMode.value = false; leftVisible.value = true; mobilePanel.value = 'projects'; return }
   if (centerView.value === 'design') { showProjectPanel(); return }
   leftVisible.value = !leftVisible.value
 }
 function showAssistantPanel() {
+  focusMode.value = false
   rightVisible.value = true
   if (centerView.value === 'design') designAssistantVisible.value = true
   mobilePanel.value = 'assistant'
@@ -1001,11 +1144,13 @@ async function saveFile({ key, path, text, sha1 }) {
   const pid = project.value.id
   const version = projectVersion
   const docKey = key || file.value?.key
+  const savingDocument = documents.value.find(doc => doc.key === docKey)
   const sessionId = session.value?.id || ''
   const isCurrentFile = () => isCurrentProject(pid, version) && (docKey ? file.value?.key === docKey : file.value?.path === path)
   saving.value = true
   banner.value = ''
   notice.value = ''
+  if (savingDocument) workbench.markSaveError(docKey, '')
   try {
     let result
     try {
@@ -1016,8 +1161,10 @@ async function saveFile({ key, path, text, sha1 }) {
       if (!isCurrentProject(pid, version)) return false
       if (docKey) workbench.updateExternal(docKey, fresh)
       if (isCurrentFile() && docKey) syncActiveDocument()
-      conflictDialog.value = { key: docKey, path, text, fresh }
-      notice.value = '磁盘内容已变化，你的草稿已保留，请对比后选择'
+      if (isCurrentFile()) {
+        conflictDialog.value = { key: docKey, path, text, fresh }
+        notice.value = '磁盘内容已变化，你的草稿已保留，请对比后选择'
+      }
       return false
     }
     if (docKey) workbench.markSaved(docKey, { text, sha1: result.sha1 || sha1, total_lines: result.lines })
@@ -1038,7 +1185,15 @@ async function saveFile({ key, path, text, sha1 }) {
     }
     return true
   } catch (e) {
-    if (isCurrentProject(pid, version)) banner.value = e.message
+    if (isCurrentProject(pid, version)) {
+      if (savingDocument && documents.value.includes(savingDocument)) {
+        if (isMissingProjectFile(e)) {
+          workbench.markSaveError(docKey, '')
+          workbench.markReadError(docKey, e.message, { missing: true })
+          if (isCurrentFile()) syncActiveDocument()
+        } else workbench.markSaveError(docKey, e.message || '保存失败，草稿已保留。')
+      } else if (isCurrentFile()) banner.value = e.message
+    }
     return false
   } finally {
     if (isCurrentProject(pid, version)) saving.value = false
@@ -1111,22 +1266,23 @@ async function onPatchesChanged(result) {
     const changedDoc = documents.value.find(doc => compare(doc.path) === compare(path))
     if (!changedDoc) return
     const key = changedDoc.key
+    const baselineFile = changedDoc.file
     try {
       const fresh = await api.code.file(pid, path)
-      if (!isCurrentProject(pid, version) || !documents.value.some(doc => doc.key === key)) return
+      if (!isCurrentProject(pid, version) || !documents.value.includes(changedDoc) || changedDoc.file !== baselineFile) return
       captureEditor()
       const doc = workbench.updateExternal(key, fresh)
       if (file.value?.key === key) syncActiveDocument()
       if (doc?.dirty) { notice.value = '磁盘更新已检测到，未保存的草稿仍保留'; return }
       editorRef.value?.notifySaved?.({ key, path, uri: fresh.uri, text: fresh.text })
     } catch (cause) {
-      if (isCurrentProject(pid, version) && cause?.status === 404 && documents.value.some(doc => doc.key === key)) {
+      if (isCurrentProject(pid, version) && isMissingProjectFile(cause) && documents.value.includes(changedDoc) && changedDoc.file === baselineFile) {
         captureEditor()
         if (!changedDoc.dirty && result?.batch) {
           workbench.close(key); releaseClosedDocument(changedDoc); syncActiveDocument()
           return
         }
-        changedDoc.file = { ...changedDoc.file, missing: true }
+        workbench.markReadError(key, cause.message || '文件已不存在，草稿仍保留。', { missing: true })
         if (file.value?.key === key) syncActiveDocument()
       }
     }
@@ -1207,6 +1363,7 @@ onBeforeUnmount(() => {
   workbench.dispose()
   window.removeEventListener('keydown', onWorkbenchKey)
   window.removeEventListener('beforeunload', beforeLeave)
+  disposeDesktopGuard()
   disposed = true
   indexProgress.reset()
   functionDescriptions.reset()
@@ -1216,20 +1373,35 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="code" :class="`mobile-${mobilePanel}`">
-    <div class="workbench-bar">
-      <button class="layout-toggle" title="文件侧栏 · Ctrl+B" :aria-pressed="leftShown" aria-label="切换文件侧栏" @click="toggleFileSidebar"><UiIcon name="panel-left" :size="16" /></button>
-      <AgentLogo class="workbench-brand" />
+  <div class="code" :class="[`mobile-${mobilePanel}`, { 'focus-mode': focusMode }]">
+    <header class="ide-titlebar" :class="{ 'integrated-titlebar': integratedTitlebar }">
+      <AgentLogo class="ide-brand" />
+      <IdeMenuBar :menus="ideMenus" @command="onIdeCommand" />
+      <span class="ide-title-spacer" />
       <button class="quick-trigger" :disabled="!project" title="搜索文件或代码 · Ctrl+P / Ctrl+Shift+F" aria-label="搜索文件或代码" @click="openWorkspaceSearch('files')"><span><UiIcon name="search" :size="14" />搜索文件或代码</span><kbd>Ctrl+P</kbd></button>
+      <span class="ide-project-caption" :title="project?.root_path || ''">{{ project?.name || 'Code-agent 工作区' }}</span>
+    </header>
+    <div class="workbench-bar">
+      <div class="editor-navigation" role="group" aria-label="代码导航">
+        <button class="workbench-action" :disabled="navigationBusy || !navigation.canBack.value" title="后退 · Alt+←" aria-label="导航后退" @click="navigateHistory(-1)"><UiIcon name="arrow-left" :size="15" /></button>
+        <button class="workbench-action" :disabled="navigationBusy || !navigation.canForward.value" title="前进 · Alt+→" aria-label="导航前进" @click="navigateHistory(1)"><UiIcon name="arrow-right" :size="15" /></button>
+      </div>
       <div class="workspace-view-switcher" role="group" aria-label="工作区视图">
         <button type="button" :class="{ active: centerView === 'file' }" :aria-pressed="centerView === 'file'" @click="centerView = 'file'; mobilePanel = 'center'"><UiIcon name="code" :size="15" />编辑器</button>
         <button type="button" :class="{ active: centerView === 'map' }" :aria-pressed="centerView === 'map'" :disabled="!project || project.available === false" @click="captureEditor(); centerView = 'map'; mobilePanel = 'center'"><UiIcon name="layers" :size="15" />思维导图</button>
         <button type="button" :class="{ active: centerView === 'design' }" :aria-pressed="centerView === 'design'" :disabled="!project || project.available === false" @click="openFrontendDesign"><UiIcon name="edit" :size="15" />前端设计</button>
       </div>
       <span class="spacer" />
+      <button v-if="focusMode" class="workbench-action focus-exit" @click="onIdeCommand('focus')">退出专注模式</button>
+      <div class="ide-run-controls" role="toolbar" aria-label="运行工具">
+        <button class="workbench-action run-config-trigger" :disabled="!project" title="打开运行配置" @click="showBottom('run')">{{ file?.path?.split('/').pop() || '运行配置' }}<UiIcon name="chevron-down" :size="12" /></button>
+        <button class="workbench-action run-trigger" :disabled="!file || executionBusy || saving || !project?.available" title="保存后运行 · Ctrl+F5" aria-label="运行当前文件" @click="runCurrent"><UiIcon name="play" :size="15" /></button>
+        <button class="workbench-action" :disabled="!debugSupported || executionBusy || saving" title="保存后调试 Python / Java · F5" aria-label="调试当前文件" @click="runDebug()"><UiIcon name="bug" :size="15" /></button>
+        <button class="workbench-action" :class="{active: bottomShown && bottomTab === 'integration'}" :disabled="!project?.available" aria-label="前后端联调" title="前后端联调：启动、预览、接口和日志" @click="showBottom('integration')"><UiIcon name="server" :size="15" /><span>联调</span></button>
+      </div>
       <button class="workbench-action assistant-trigger" :class="{ active: rightShown }" :aria-pressed="rightShown" aria-label="AI 面板" @click="toggleAssistantPanel"><UiIcon name="sparkles" :size="14" /><span>AI 面板</span></button>
       <button class="workbench-action editing-trigger" :class="{ active: manualReadonly }" :aria-pressed="manualReadonly" :aria-label="manualReadonly ? '编辑只读' : '允许编辑'" :disabled="!project" :title="manualReadonly ? '允许人工编辑和设计保存，AI权限独立控制' : '将人工编辑和设计保存设为只读，AI权限独立控制'" @click="manualReadonly = !manualReadonly"><UiIcon :name="manualReadonly ? 'shield' : 'edit'" :size="14" /><span>{{ manualReadonly ? '编辑只读' : '允许编辑' }}</span></button>
-      <button class="workbench-action settings-trigger" title="设置 · Ctrl+," aria-label="打开设置" @click="emit('open-settings')"><UiIcon name="settings" :size="16" /><span>设置</span></button>
+      <div ref="editorToolsTarget" class="editor-code-tools" hidden />
     </div>
     <div class="workspace-switcher" aria-label="代码工作区面板">
       <button :class="{ active: mobilePanel === 'projects' }" :aria-pressed="mobilePanel === 'projects'" @click="showProjectPanel">项目与文件</button>
@@ -1243,6 +1415,17 @@ onBeforeUnmount(() => {
         <button v-if="indexRefresh?.state === 'error' || indexStatusError" :disabled="indexRetrying" @click="indexProgress.retry()">{{ indexRetrying ? '重试中…' : '重试' }}</button>
       </span>
     </div>
+    <div class="ide-shell">
+      <nav class="activity-bar" aria-label="工具窗口">
+        <button :class="{active:leftShown}" :aria-pressed="leftShown" aria-label="项目文件" title="项目文件 · Ctrl+B" @click="toggleFileSidebar"><UiIcon name="folder" :size="20" /></button>
+        <button :disabled="!project" aria-label="搜索文件或代码" title="搜索项目代码 · Ctrl+Shift+F" @click="openWorkspaceSearch('content')"><UiIcon name="search" :size="20" /></button>
+        <button :class="{active:rightShown && rightTab === 'git'}" :aria-pressed="rightShown && rightTab === 'git'" :disabled="!project" aria-label="源代码管理" title="源代码管理" @click="showRightTool('git')"><UiIcon name="git-branch" :size="20" /></button>
+        <button :class="{active:bottomShown && ['run','debug'].includes(bottomTab)}" :disabled="!project" aria-label="运行与调试" title="运行与调试" @click="showBottom('debug')"><UiIcon name="bug" :size="20" /></button>
+        <button :class="{active:rightShown && rightTab === 'ai'}" :aria-pressed="rightShown && rightTab === 'ai'" aria-label="AI 助手" title="AI 助手" @click="showRightTool('ai')"><UiIcon name="sparkles" :size="20" /></button>
+        <span class="spacer" />
+        <button aria-label="打开命令面板" title="命令面板 · Ctrl+Shift+P" @click="commandPaletteOpen = true"><UiIcon name="terminal" :size="19" /></button>
+        <button class="settings-trigger" title="设置 · Ctrl+," aria-label="打开设置" @click="emit('open-settings')"><UiIcon name="settings" :size="20" /></button>
+      </nav>
     <div class="layout" :style="gridStyle">
       <!-- 左：项目 + 文件树 -->
       <aside v-show="leftShown" class="left">
@@ -1259,17 +1442,6 @@ onBeforeUnmount(() => {
 
       <!-- 中：地图 / 文件 / 空态 -->
       <main class="center">
-        <div v-show="centerView === 'file'" class="editor-workbench-tools" role="toolbar" aria-label="编辑器工具">
-          <div class="editor-navigation" role="group" aria-label="代码导航">
-            <button class="workbench-action" :disabled="navigationBusy || !navigation.canBack.value" title="后退 · Alt+←" aria-label="导航后退" @click="navigateHistory(-1)"><UiIcon name="arrow-left" :size="15" /></button>
-            <button class="workbench-action" :disabled="navigationBusy || !navigation.canForward.value" title="前进 · Alt+→" aria-label="导航前进" @click="navigateHistory(1)"><UiIcon name="arrow-right" :size="15" /></button>
-          </div>
-          <button class="workbench-action" :class="{ active: problemsVisible && bottomTab === 'problems' }" @click="problemsVisible && bottomTab === 'problems' ? problemsVisible = false : showBottom('problems')">问题 {{ diagCounts.error + diagCounts.warning || '' }}</button>
-          <button class="workbench-action" :class="{ active: problemsVisible && bottomTab === 'terminal' }" @click="showBottom('terminal')"><UiIcon name="terminal" :size="14" />终端</button>
-          <button class="workbench-action" :disabled="!file || executionBusy || saving" title="保存后运行 · Ctrl+F5" @click="runCurrent"><UiIcon name="play" :size="14" />运行</button>
-          <button class="workbench-action" :disabled="!debugSupported || executionBusy || saving" title="保存后调试 Python / Java · F5" @click="runDebug()"><UiIcon name="bug" :size="14" />调试</button>
-          <div ref="editorToolsTarget" class="editor-code-tools" />
-        </div>
         <EditorTabs v-show="centerView === 'file'" :documents="documents" :active-key="activeDocumentKey" @select="activateDocument" @close="closeDocument" />
         <div v-if="workbench.storageError.value" class="draft-warning">{{ workbench.storageError.value }}，草稿仍在当前工作区，请保存文件。</div>
         <div v-if="file?.conflict && centerView === 'file'" class="draft-warning">磁盘内容已变化，当前显示的是你的草稿。保存时会进行冲突检查。</div>
@@ -1277,6 +1449,11 @@ onBeforeUnmount(() => {
         <div v-if="banner" class="banner">
           <span>{{ banner }}</span>
           <button class="ghost" @click="banner = ''">×</button>
+        </div>
+        <div v-if="activeFileError && centerView === 'file'" class="banner file-error" role="alert">
+          <span>{{ activeFileError }}</span>
+          <button v-if="file?.needsReload || file?.missing" class="ghost" :disabled="fileBusy" @click="reloadActiveDocument">{{ fileBusy ? '读取中…' : '重新读取' }}</button>
+          <button class="ghost" aria-label="关闭当前文件错误提示" @click="dismissFileError">×</button>
         </div>
         <div v-if="fileBusy" class="muted center-hint">读取中…</div>
         <ProjectPicker v-else-if="!project" :meta="meta" :projects="projects" :loading="loading" :phase="projectPhase" :error="projectError" :initial-mode="pickerMode" :location-selection="projectLocationSelection"
@@ -1294,6 +1471,7 @@ onBeforeUnmount(() => {
           @open-file="openFile"
           @select="onSelectNode"
           @ask="onAsk"
+          @open-settings="emit('open-settings', $event)"
           @error="(m) => (banner = m)"
         />
         <FrontendDesign
@@ -1309,6 +1487,7 @@ onBeforeUnmount(() => {
           @ask="onDesignAsk"
           @saved="onDesignSaved"
           @error="banner = $event"
+          @integration="showBottom('integration')"
         />
         <EditorPane
           v-if="project"
@@ -1316,6 +1495,7 @@ onBeforeUnmount(() => {
           v-show="centerView === 'file'"
           ref="editorRef"
           :toolbar-target="editorToolsTarget"
+          :compact-toolbar="true"
           :file="file"
           :highlight="fileLine ? { start: fileLine, end: fileLine, column: fileColumn, token: fileJump } : null"
           :readonly="manualReadonly || languageEditBusy || !project.available || file?.missing || file?.needsReload"
@@ -1339,11 +1519,22 @@ onBeforeUnmount(() => {
           @language-edit="onLanguageEdit"
           @language-symbol="onLanguageSymbol"
         />
-        <div v-if="problemsVisible || runtimeActivated || debugActivated" v-show="centerView === 'file' && problemsVisible" class="bottom-panel">
-          <div class="bottom-tabs"><button v-for="tab in [{ id: 'problems', label: '问题' }, { id: 'terminal', label: '终端' }, { id: 'run', label: '运行' }, { id: 'output', label: '输出' }, { id: 'tests', label: '测试' }, { id: 'debug', label: '调试' }]" :key="tab.id" :class="{ active: bottomTab === tab.id }" @click="showBottom(tab.id)">{{ tab.label }}</button><span v-if="bottomTab === 'problems'" class="muted">{{ diagCounts.error }} 错误 · {{ diagCounts.warning }} 警告</span><span class="spacer" /><button class="ghost" aria-label="关闭问题面板" title="关闭底部面板" @click="problemsVisible = false">×</button></div>
-          <ProblemsPanel v-show="bottomTab === 'problems'" :project-id="project?.id || ''" tree="main" :seq="diagnostics?.seq || 0" :visible="props.visible !== false && centerView === 'file' && problemsVisible && bottomTab === 'problems'" @open-file="openFile" />
-          <RuntimePanel v-if="project && runtimeActivated" v-show="['terminal', 'run', 'output', 'tests'].includes(bottomTab)" ref="runtimeRef" :project-id="project.id" :file="file" :active-tab="bottomTab" :visible="props.visible !== false && centerView === 'file' && problemsVisible && ['terminal', 'run', 'output', 'tests'].includes(bottomTab)" @open-file="openFile" />
-          <DebugPanel v-if="project && debugActivated" v-show="bottomTab === 'debug'" ref="debugRef" :project-id="project.id" :file="file" :breakpoints="breakpoints" :visible="props.visible !== false && centerView === 'file' && problemsVisible && bottomTab === 'debug'" @open-file="openFile" @breakpoints="breakpoints = $event" @location="debugLocation = $event" @start-request="runDebug" @error="banner = $event" />
+        <div v-if="problemsVisible || runtimeActivated || debugActivated || integrationActivated" v-show="centerView === 'file' && bottomShown" class="bottom-panel" :style="{height: `${bottomHeight}px`}">
+          <div class="bottom-resizer" role="separator" aria-label="调整底部面板高度" aria-orientation="horizontal" tabindex="0" :aria-valuemin="160" :aria-valuemax="600" :aria-valuenow="bottomHeight" @mousedown="startBottomDrag" @keydown.up.prevent="resizeBottom(bottomHeight + 16)" @keydown.down.prevent="resizeBottom(bottomHeight - 16)" />
+          <div class="bottom-tabs"><button v-for="tab in [{ id: 'problems', label: '问题' }, { id: 'terminal', label: '终端' }, { id: 'run', label: '运行' }, { id: 'output', label: '输出' }, { id: 'tests', label: '测试' }, { id: 'debug', label: '调试' }, { id: 'integration', label: '联调' }]" :key="tab.id" :class="{ active: bottomTab === tab.id }" @click="showBottom(tab.id)">{{ tab.label }}</button><span v-if="bottomTab === 'problems'" class="muted">{{ diagCounts.error }} 错误 · {{ diagCounts.warning }} 警告</span><span class="spacer" /><button class="ghost" aria-label="关闭底部面板" title="关闭底部面板" @click="problemsVisible = false">×</button></div>
+          <ProblemsPanel v-show="bottomTab === 'problems'" :project-id="project?.id || ''" tree="main" :seq="diagnostics?.seq || 0" :visible="props.visible !== false && centerView === 'file' && bottomShown && bottomTab === 'problems'" @open-file="openFile" />
+          <RuntimePanel v-if="project && runtimeActivated" v-show="['terminal', 'run', 'output', 'tests'].includes(bottomTab)" ref="runtimeRef" :project-id="project.id" :file="file" :active-tab="bottomTab" :visible="props.visible !== false && centerView === 'file' && bottomShown && ['terminal', 'run', 'output', 'tests'].includes(bottomTab)" @open-file="openFile" />
+          <DebugPanel v-if="project && debugActivated" v-show="bottomTab === 'debug'" ref="debugRef" :project-id="project.id" :file="file" :breakpoints="breakpoints" :visible="props.visible !== false && centerView === 'file' && bottomShown && bottomTab === 'debug'" @open-file="openFile" @breakpoints="breakpoints = $event" @location="debugLocation = $event" @start-request="runDebug" @error="banner = $event" />
+          <IntegrationPanel v-if="project && integrationActivated" v-show="bottomTab === 'integration'" :project-id="project.id" :visible="props.visible !== false && centerView === 'file' && bottomShown && bottomTab === 'integration'" @open-file="openFile" @error="banner = $event" @expand="bottomHeight = Math.min(600, Math.max(bottomHeight, 560))" />
+        </div>
+        <div v-if="centerView === 'file' && !bottomShown" class="tool-window-strip" role="toolbar" aria-label="底部工具窗口">
+          <button @click="showBottom('problems')"><UiIcon name="warning" :size="13" />问题<span v-if="diagCounts.error + diagCounts.warning" class="tool-count">{{ diagCounts.error + diagCounts.warning }}</span></button>
+          <button :disabled="!project" @click="showBottom('terminal')"><UiIcon name="terminal" :size="14" />终端</button>
+          <button :disabled="!project" @click="showBottom('run')"><UiIcon name="play" :size="13" />运行</button>
+          <button :disabled="!project" @click="showBottom('debug')"><UiIcon name="bug" :size="13" />调试</button>
+          <button :disabled="!project" @click="showBottom('integration')"><UiIcon name="server" :size="13" />联调</button>
+          <button :disabled="!project" @click="showBottom('output')">输出</button>
+          <span class="spacer" /><button v-if="focusMode" @click="onIdeCommand('focus')">退出专注模式</button>
         </div>
       </main>
 
@@ -1395,6 +1586,7 @@ onBeforeUnmount(() => {
           :team-error="agentTeam.error.value"
           :team-acting="agentTeam.acting.value"
           @conversation-select="selectConversation"
+            @open-settings="emit('open-settings', $event)"
           @conversation-create="createConversation"
           @conversation-delete="deleteConversation"
           @conversation-refresh="conversations.refresh()"
@@ -1444,8 +1636,10 @@ onBeforeUnmount(() => {
         />
       </aside>
     </div>
+    </div>
 
     <div class="status">
+      <button v-if="desktopAvailable" type="button" class="desktop-status-trigger" aria-label="应用状态" :title="desktopHealthLabel" @click="emit('open-desktop')"><UiIcon name="server" :size="12" /><span>{{ desktopHealthLabel }}</span></button>
       <span v-if="project" class="mono ellipsis">{{ project.root_path }}</span>
       <span v-else class="muted status-ready"><i />代码工作区已就绪</span>
       <span class="spacer" />
@@ -1467,6 +1661,7 @@ onBeforeUnmount(() => {
       <span v-else-if="diagnostics && !diagCounts.error && !diagCounts.warning" class="muted">无诊断问题</span>
       <span v-if="meta && !meta.git_available" class="muted">未检测到 git</span>
     </div>
+    <IdeCommandPalette :open="commandPaletteOpen" :menus="ideMenus" @close="commandPaletteOpen = false" @command="onIdeCommand" />
     <QuickOpen :project-id="project?.id || ''" :open="quickOpen" :initial-mode="quickMode" @mode-change="quickMode = $event" @close="quickOpen = false" @open-file="openFile" />
     <div v-if="languageEditBusy" class="language-edit-loading" role="status">正在准备代码修改预览…</div>
     <button v-if="languageEditUndo && !languageEditPreview" class="language-undo" :disabled="manualReadonly || languageEditBusy" @click="undoLanguageEdit" title="整批撤销最近一次语言服务修改">撤销代码修改</button>
@@ -1534,6 +1729,7 @@ onBeforeUnmount(() => {
 .index-refresh { flex-shrink: 0; display: inline-flex; align-items: center; gap: 6px; font-size: var(--fs-2xs); color: var(--muted); padding-left: 6px; }
 .index-refresh.warning { color: var(--warn); }.index-refresh button { min-height: 22px; padding: 2px 6px; font-size: inherit; }
 .draft-warning { font-size: var(--fs-xs); line-height: 1.6; padding: 7px 14px; color: var(--warn); background: var(--warn-soft); border-bottom: 1px solid var(--border); }
+.file-error > span { flex: 1; min-width: 0; }.file-error > button { flex: none; white-space: nowrap; }
 .banner { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 9px 14px; font-size: var(--fs-xs); background: var(--err-soft); color: var(--err); border-bottom: 1px solid var(--border); overflow-wrap: anywhere; }
 .center-hint { padding: 24px; font-size: var(--fs-sm); }
 .bottom-panel { height: 320px; max-height: 48%; min-height: 160px; flex: none; border-top: 1px solid var(--border-strong); background: var(--panel); display: flex; flex-direction: column; overflow: hidden; }
@@ -1546,6 +1742,8 @@ onBeforeUnmount(() => {
 .status > .ellipsis { min-width: 0; max-width: 45%; }.status-ready { display: inline-flex; align-items: center; gap: 7px; }.status-ready i { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); }
 .spacer { flex: 1; min-width: 0; }.diag-sum { display: flex; gap: 9px; }
 .status button.diag-sum { min-height: 20px; padding: 0; border: 0; background: transparent; font-size: inherit; }
+.status button.desktop-status-trigger { display: inline-flex; align-items: center; gap: 5px; min-height: 20px; padding: 0 5px; border: 0; border-radius: 4px; background: transparent; color: var(--text-2); font-size: inherit; flex-shrink: 0; }
+.status button.desktop-status-trigger:hover { background: var(--hover); color: var(--accent); }
 .diag-sum .err { color: var(--err); }.diag-sum .warn { color: var(--warn); }.ellipsis { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .workbench-modal { position: absolute; inset: 0; z-index: 60; background: #20273555; backdrop-filter: blur(3px); display: flex; align-items: center; justify-content: center; padding: 24px; }
 .workbench-modal > section { width: 460px; max-width: 100%; max-height: 100%; overflow: auto; padding: 26px; background: var(--panel); border: 1px solid var(--border); border-radius: 12px; box-shadow: 0 20px 70px #20273530; }
@@ -1561,7 +1759,7 @@ onBeforeUnmount(() => {
 @media (max-width: 1350px) { .workbench-action { gap: 4px; padding: 4px 6px; }.quick-trigger { width: min(260px, 24vw); }.right-tabs { overflow-x: auto; scrollbar-width: thin; }.right-tabs > button { padding: 0 7px; } }
 @media (max-width: 1100px) {
   .workbench-bar { gap: 8px; padding: 0 8px; }.workbench-brand { margin-right: 0; padding-right: 8px; }.quick-trigger { width: auto; flex: 1 1 180px; min-width: 100px; gap: 8px; }.quick-trigger kbd { display: none; }.layout-toggle { display: none; }
-  .workspace-switcher { display: flex; flex: none; gap: 4px; padding: 6px 10px; border-bottom: 1px solid var(--border); background: var(--panel-soft); }
+  .workspace-switcher { display: none; }
   .workspace-switcher button { flex: 1; min-height: 29px; padding: 4px 6px; font-size: var(--fs-xs); border-color: transparent; background: transparent; color: var(--muted); border-radius: 5px; }
   .workspace-switcher button.active { background: var(--panel); color: var(--accent); box-shadow: 0 1px 3px #20273510; border-color: var(--border); }
   .layout { grid-template-columns: minmax(0, 1fr) !important; }.layout > .left, .layout > .right, .layout > .center { display: none; min-width: 0; }
@@ -1577,5 +1775,33 @@ onBeforeUnmount(() => {
   .workbench-modal { padding: 12px; }.workbench-modal > section { padding: 20px; }.workbench-modal.project-modal > section { padding: 0; }
   .conflict-compare { grid-template-columns: 1fr; gap: 12px; }.conflict-compare textarea { height: 120px; }.modal-actions { gap: 6px; }.bottom-tabs > .muted { display: none; }.status { gap: 12px; }
 }
+.ide-titlebar { display: flex; align-items: center; gap: 12px; height: 35px; flex: none; min-width: 0; padding: 0 12px; border-bottom: 1px solid var(--border); background: var(--panel-soft); }
+.ide-brand { padding-right: 10px; border-right: 1px solid var(--border); }.ide-brand :deep(.agent-logo__mark) { width: 22px; height: 22px; }
+.ide-title-spacer { flex: 1; min-width: 0; }.ide-titlebar .quick-trigger { flex: 0 1 350px; width: min(350px, 28vw); min-height: 25px; padding: 2px 8px; border-radius: 4px; }
+.ide-project-caption { max-width: 150px; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--fs-2xs); color: var(--muted); }
+.workbench-bar { height: 37px; min-height: 37px; gap: 8px; background: var(--panel); padding: 0 9px; }
+.workspace-view-switcher { height: 100%; padding: 0; gap: 1px; background: transparent; border: 0; border-radius: 0; }
+.workspace-view-switcher > button { height: 100%; padding: 4px 12px; border: 0; border-radius: 0; box-shadow: none; }
+.workspace-view-switcher > button.active, .workspace-view-switcher > button.active:hover { background: var(--accent-soft); border: 0; box-shadow: inset 0 -2px var(--accent); }
+.ide-run-controls { display: flex; flex: none; align-items: center; gap: 2px; padding-right: 7px; margin-right: 2px; border-right: 1px solid var(--border); }
+.run-config-trigger { max-width: 175px; overflow: hidden; text-overflow: ellipsis; }.run-trigger { color: var(--ok); }
+.focus-exit { color: var(--accent); background: var(--accent-soft); }
+.ide-shell { display: flex; flex: 1; min-height: 0; min-width: 0; overflow: hidden; }
+.activity-bar { display: flex; flex-direction: column; flex: 0 0 44px; min-width: 0; padding: 3px 0; border-right: 1px solid var(--border); background: var(--panel-soft); }
+.activity-bar > button { display: flex; align-items: center; justify-content: center; flex: none; min-height: 42px; width: 43px; border: 0; border-radius: 0; padding: 0; box-shadow: none; color: var(--muted); background: transparent; }
+.activity-bar > button:hover:not(:disabled) { color: var(--text); background: var(--hover); }.activity-bar > button.active { color: var(--accent); background: var(--accent-soft); box-shadow: inset 2px 0 var(--accent); }
+.activity-bar > button:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
+.ide-shell > .layout { flex: 1; min-width: 0; }
+.tool-window-strip { display: flex; align-items: center; flex: none; min-width: 0; min-height: 29px; gap: 2px; padding: 0 7px; border-top: 1px solid var(--border); background: var(--panel-soft); overflow-x: auto; scrollbar-width: thin; }
+.tool-window-strip > button { display: inline-flex; align-items: center; gap: 5px; flex: none; padding: 3px 8px; min-height: 27px; color: var(--muted); background: transparent; border: 0; border-radius: 3px; font-size: var(--fs-2xs); }
+.tool-window-strip > button:hover:not(:disabled) { color: var(--text); background: var(--hover); }.tool-count { padding: 0 4px; min-width: 15px; border-radius: 3px; background: var(--hover); color: var(--text-2); }
+.bottom-panel { position: relative; max-height: 65%; min-height: 160px; }.bottom-resizer { position: absolute; height: 7px; top: -3px; left: 0; right: 0; z-index: 5; cursor: ns-resize; touch-action: none; }
+.bottom-resizer:hover, .bottom-resizer:focus-visible { background: color-mix(in srgb, var(--accent) 35%, transparent); outline: none; }
+.status { min-height: 24px; padding-top: 2px; padding-bottom: 2px; }
+@media (max-width: 1100px) { .ide-titlebar { gap: 8px; padding: 0 8px; }.ide-project-caption { display: none; }.ide-titlebar .quick-trigger { flex: 0 1 260px; min-width: 100px; }.ide-shell .layout { grid-template-columns: minmax(0, 1fr) !important; }.workspace-switcher { padding: 3px 8px; }.workspace-switcher button { min-height: 26px; }.activity-bar { flex-basis: 40px; }.activity-bar > button { width: 39px; min-height: 40px; } }
+@media (max-width: 900px) { .workbench-bar { display: flex; flex-wrap: wrap; min-height: 37px; height: auto; gap: 3px 5px; padding: 0 6px; }.workbench-bar .workspace-view-switcher { flex: 1; min-height: 35px; }.workspace-view-switcher > button { padding: 4px 8px; }.workbench-bar .editor-navigation { display: none; }.ide-titlebar .quick-trigger { min-width: 28px; width: 28px; flex: 0 0 28px; border: 0; background: transparent; padding: 4px; }.ide-titlebar .quick-trigger > span { font-size: 0; gap: 0; }.ide-titlebar .quick-trigger kbd, .ide-title-spacer { display: none; }.ide-titlebar :deep(.ide-menubar) { flex: 1; }.run-config-trigger { max-width: 120px; } }
+@media (max-width: 600px) { .ide-titlebar { gap: 5px; padding: 0 5px; }.ide-brand { padding-right: 5px; }.workbench-bar .workspace-view-switcher { flex: 1 0 100%; }.workbench-bar > .spacer { display: flex; }.ide-run-controls { margin-left: auto; border-right: 0; padding-right: 0; }.workbench-bar .assistant-trigger, .workbench-bar .editing-trigger { width: 28px; min-height: 29px; padding: 3px; }.workbench-bar .workspace-view-switcher > button { min-width: 0; }.workspace-switcher { display: none; }.ide-shell .activity-bar { flex-basis: 36px; }.ide-shell .activity-bar > button { width: 35px; min-height: 39px; }.tool-window-strip { padding: 0 3px; }.tool-window-strip > button { padding: 3px 6px; }.bottom-panel { max-height: 62%; }.focus-exit { font-size: var(--fs-2xs); }.status { gap: 9px; padding-left: 8px; } }
 @media (prefers-reduced-motion: reduce) { .drag { transition: none; } }
+.ide-titlebar.integrated-titlebar { padding-right: 146px; -webkit-app-region: drag; app-region: drag; user-select: none; }
+.ide-titlebar.integrated-titlebar :deep(button), .ide-titlebar.integrated-titlebar :deep(input), .ide-titlebar.integrated-titlebar :deep(a), .ide-titlebar.integrated-titlebar :deep(select), .ide-titlebar.integrated-titlebar :deep([role="menubar"]) { -webkit-app-region: no-drag; app-region: no-drag; }
 </style>

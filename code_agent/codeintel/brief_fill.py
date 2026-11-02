@@ -30,6 +30,18 @@ MAX_BRIEF_CHARS = 200
 class TargetChanged(ValueError):
     """A generated explanation no longer belongs to the current source."""
 
+
+def configuration_issue(provider: Any) -> str:
+    """Inspect the resolved provider, never a second source of model settings."""
+    if provider is None or str(getattr(provider, "name", "")) == "offline":
+        return "没有可用的模型，请在设置 → 模型与连接中配置。"
+    # Fake/custom providers need no vendor-specific fields. Remote compatible
+    # providers use the same key/local-backend rule as their actual chat call.
+    if (getattr(provider, "env_api_key", None) and not getattr(provider, "api_key", "")
+            and not getattr(provider, "local_backend", False)):
+        return "模型尚未配置 API Key，请在设置 → 模型与连接中保存配置。"
+    return ""
+
 SYSTEM_PROMPT = """你在给一份代码导图补"这个符号是干什么的"。
 
 读者是同事：他要在导图上扫一眼就知道这段代码管什么，然后决定要不要点进去看。
@@ -180,6 +192,9 @@ class FillResult:
     model: str = ""
     aborted: str = ""
     source_changed: bool = False
+    error_code: str = ""
+    block_reason: str = ""
+    action: str = ""
 
     def view(self) -> dict:
         return {
@@ -192,6 +207,9 @@ class FillResult:
             "model": self.model,
             "aborted": self.aborted,
             "source_changed": self.source_changed,
+            "error_code": self.error_code,
+            "block_reason": self.block_reason,
+            "action": self.action,
         }
 
 
@@ -212,8 +230,10 @@ async def fill(
     单批失败会重试一次（把 JSON 要求再说死一点），仍失败就记进 `errors` 并继续下一批。
     """
     result = FillResult(total=len(targets), model=str(getattr(provider, "model", "") or ""))
-    if provider is None:
-        result.aborted = "没有可用的模型"
+    if issue := configuration_issue(provider):
+        result.aborted = issue
+        result.error_code = result.block_reason = "model_not_configured"
+        result.action = "configure_model"
         return result
     if not targets:
         return result
@@ -229,17 +249,33 @@ async def fill(
         chunk = targets[start : start + max(1, batch)]
         result.batches += 1
         got: dict[int, str] = {}
+        request_failed = False
         for attempt in (False, True):
             try:
                 turn = await asyncio.wait_for(provider.chat(build_messages(chunk, strict=attempt), []), timeout=timeout)
-            except Exception as exc:  # noqa: BLE001 —— 网络/额度问题：记下来，别把整轮炸掉
-                result.errors.append(f"第 {result.batches} 批调用失败：{exc}"[:200])
-                turn = None
+            except Exception as exc:  # noqa: BLE001
+                # The provider already applies its transport retry policy.
+                # A call exception is not a malformed answer and cannot be
+                # repaired by requesting stricter JSON or another batch.
+                request_failed = True
+                if re.match(r"^HTTP (?:401|403)(?:\D|$)", str(exc)):
+                    result.error_code = result.block_reason = "model_authentication_failed"
+                    result.action = "configure_model"
+                    result.aborted = "模型连接验证失败，请在设置 → 模型与连接中检查 API Key。"
+                else:
+                    result.error_code = "model_request_failed"
+                    result.action = "retry"
+                    result.aborted = "模型调用未完成，已暂停补全；请检查网络和模型连接后重试。"
+                    result.errors.append(f"第 {result.batches} 批模型调用未完成。")
+                    result.failed += len(chunk)
+                break
             got = parse_briefs(getattr(turn, "text", "") or "", len(chunk)) if turn else {}
             if got:
                 break
             if not attempt:
                 result.errors.append(f"第 {result.batches} 批回答解析不了，重试一次")
+        if request_failed:
+            break
         if not got:
             result.failed += len(chunk)
             consecutive += 1

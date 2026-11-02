@@ -21,6 +21,7 @@ async function setup(t, client = {}, overrides = {}) {
     action: async (...args) => { calls.push(['action', ...args]); return state({ seq: 3, status: 'running', frame_id: null, stack: [], variables: [] }) },
     breakpoints: async (...args) => { calls.push(['breakpoints', ...args]); return state({ breakpoints: args[2] }) },
     variables: async () => ({ variables: [{ name: 'items', value: '[1,2]', variablesReference: 6 }] }),
+    evaluate: async (...args) => { calls.push(['evaluate', ...args]); return { ...args[2], result: '4', type: 'int', variablesReference: 0 } },
     ...client,
   }
   const scope = effectScope()
@@ -31,7 +32,7 @@ async function setup(t, client = {}, overrides = {}) {
     defineExpose: methods => { exposed = methods }, onBeforeUnmount: fn => { unmount = fn },
     setTimeout: fn => { timers.set(++timerId, fn); return timerId }, clearTimeout: id => timers.delete(id),
   })
-  scope.run(() => vm.runInContext(`${source}\nglobalThis.subject = { meta, session, error, path, argsText, cwd, expanded, canStart, language, javaRequest, mainClass, projectName, attachHost, attachPort, stopOnEntry, adapter, selectedLanguage, applyState, start, requestStart, refresh, action, toggleVariable, syncBreakpoints, selectFrame, refreshEnvironment }`, context))
+  scope.run(() => vm.runInContext(`${source}\nglobalThis.subject = { meta, session, error, path, argsText, cwd, expanded, canStart, language, javaRequest, mainClass, projectName, attachHost, attachPort, stopOnEntry, adapter, selectedLanguage, applyState, start, requestStart, refresh, action, toggleVariable, syncBreakpoints, selectFrame, refreshEnvironment, expression, evaluation, evaluationError, evaluating, watches, canEvaluate, evaluateExpression, addWatch, removeWatch, refreshWatches, watchRows, evaluationRows }`, context))
   await settle()
   t.after(() => { unmount(); scope.stop() })
   return { s: context.subject, props, events, timers, calls, exposed }
@@ -157,6 +158,78 @@ test('console polling merges by sequence and frame choice emits relative locatio
 })
 
 const javaMeta = { available: true, languages: ['python', 'java'], adapters: { python: { available: true }, java: { available: true, bundle_found: true, requests: ['launch', 'attach'] } } }
+
+test('expression evaluation sends the current frame and pause and expands returned objects', async t => {
+  const { s, calls } = await setup(t, { evaluate: async (...args) => {
+    calls.push(['evaluate', ...args]); return { ...args[2], result: '[1,2]', type: 'list', variablesReference: 25 }
+  } })
+  s.expression.value = 'nested.items'
+  await s.evaluateExpression()
+  assert.equal(calls.some(([name]) => name === 'evaluate'), false)
+  s.applyState(state())
+  await s.evaluateExpression()
+  assert.deepEqual(clone(calls.find(([name]) => name === 'evaluate')[3]), { expression: 'nested.items', frame_id: 10, pause_seq: 1, context: 'repl' })
+  assert.equal(s.evaluation.value.result, '[1,2]')
+  await s.toggleVariable(s.evaluationRows.value[0])
+  assert.equal(s.evaluationRows.value[1].name, 'items')
+})
+
+test('watches evaluate once per stop/frame, never on ordinary polling, and can be removed', async t => {
+  const { s, calls } = await setup(t)
+  s.applyState(state()); s.expression.value = 'number + 1'
+  await s.addWatch()
+  assert.equal(s.watches.value.length, 1)
+  assert.equal(calls.filter(([name]) => name === 'evaluate').length, 1)
+  s.applyState(state({ seq: 2 })); await settle()
+  assert.equal(calls.filter(([name]) => name === 'evaluate').length, 1)
+  await s.selectFrame(s.session.value.stack[0])
+  assert.equal(calls.some(([name]) => name === 'state'), false)
+  s.applyState(state({ seq: 3, frame_id: 11 })); await settle()
+  assert.equal(calls.filter(([name]) => name === 'evaluate').length, 2)
+  s.applyState(state({ seq: 4, status: 'running', frame_id: null })); await settle()
+  assert.equal(s.watches.value[0].result, null)
+  s.applyState(state({ seq: 5, pause_seq: 3 })); await settle()
+  assert.equal(calls.filter(([name]) => name === 'evaluate').length, 3)
+  await s.addWatch()
+  assert.match(s.evaluationError.value, /已在/)
+  assert.equal(calls.filter(([name]) => name === 'evaluate').length, 3)
+  s.removeWatch(s.watches.value[0].id)
+  s.applyState(state({ seq: 6, pause_seq: 4 })); await settle()
+  assert.equal(calls.filter(([name]) => name === 'evaluate').length, 3)
+})
+
+test('late expression results cannot survive resume, frame switch, or project switch', async t => {
+  const pending = []
+  const { s, props } = await setup(t, { evaluate: () => { const value = deferred(); pending.push(value); return value.promise } })
+  s.applyState(state()); s.expression.value = 'number'
+  const first = s.evaluateExpression()
+  s.applyState(state({ seq: 2, frame_id: 11 }))
+  pending[0].resolve({ result: 'old frame', variablesReference: 5 }); await first
+  assert.equal(s.evaluation.value, null)
+  const second = s.evaluateExpression()
+  await s.action('continue')
+  pending[1].resolve({ result: 'old stop' }); await second
+  assert.equal(s.evaluation.value, null)
+  s.applyState(state({ seq: 4, pause_seq: 3 }))
+  const watching = s.addWatch()
+  props.projectId = 'other'; await settle()
+  pending[2].resolve({ result: 'other project' }); await watching
+  assert.equal(s.watches.value.length, 0)
+  assert.equal(s.evaluation.value, null)
+})
+
+test('removed pending watch stays removed and invalid expressions remain visible as local errors', async t => {
+  const reply = deferred()
+  const { s } = await setup(t, { evaluate: () => reply.promise })
+  s.applyState(state()); s.expression.value = 'nested'
+  const waiting = s.addWatch(), id = s.watches.value[0].id
+  s.removeWatch(id)
+  reply.resolve({ result: 'late', variablesReference: 4 }); await waiting
+  assert.equal(s.watches.value.length, 0)
+  s.expression.value = ' '
+  await s.evaluateExpression()
+  assert.match(s.evaluationError.value, /请输入/)
+})
 test('Java auto/F5 launch supports entry selection, options and Java-only breakpoints through the parent save request', async t => {
   const { s, events, calls, exposed } = await setup(t, { meta: async () => javaMeta, start: async (project, payload) => { calls.push(['start', project, payload]); return state({ path: payload.path, language: 'java', request: payload.java.request, main_class: payload.java.main_class }) } },
     { file: { path: 'src/Main.java' }, breakpoints: [{ path: 'src/Main.java', line: 8 }, { path: 'other.py', line: 4 }] })

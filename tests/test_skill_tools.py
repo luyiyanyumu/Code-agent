@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 from pathlib import Path
 
@@ -68,6 +69,25 @@ def test_skill_search_parses_json_output(tmp_path, monkeypatch):
     monkeypatch.setattr("code_agent.tools.builtin.skill_tools._run_cli", fake_run)
     out = asyncio.run(SkillSearchTool().execute({"query": "pdf"}, ToolContext("s", tmp_path)))
     assert "pdf-tools" in out and "PDF 工具" in out and "v1.2.0" in out
+
+
+def test_real_background_cli_keeps_stdout_stderr_without_a_console(tmp_path, monkeypatch):
+    from code_agent.tools.builtin import skill_tools as module
+
+    cli = tmp_path / "local_cli.py"
+    cli.write_text(
+        "import ctypes,json,os,sys\n"
+        "console=bool(ctypes.windll.kernel32.GetConsoleWindow()) if os.name=='nt' else False\n"
+        "print(json.dumps({'console':console,'args':sys.argv[1:]}))\n"
+        "print('local-cli-stderr',file=sys.stderr)\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(module, "cli_path", lambda: cli)
+    code, stdout, stderr = asyncio.run(module._run_cli(["search", "fixture"], timeout=5))
+    result = json.loads(stdout)
+    assert code == 0
+    assert result == {"console": False, "args": ["--skip-self-upgrade", "search", "fixture"]}
+    assert "local-cli-stderr" in stderr
 
 
 def test_skill_install_verifies_files_landed(tmp_path, monkeypatch):

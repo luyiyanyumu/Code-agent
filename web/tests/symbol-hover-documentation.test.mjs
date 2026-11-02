@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { describeSymbolHover } from '../src/lib/symbolHoverDocumentation.js'
+import { describeSymbolHover, chineseDocumentationProjection } from '../src/lib/symbolHoverDocumentation.js'
 
 function model(language, name = 'read') {
   return { getLanguageId: () => language, getValue: () => name,
@@ -49,15 +49,85 @@ test('unknown categories and signature-only responses never become invented beha
   assert.equal(noName.symbol.name, undefined)
 })
 
+test('service modifiers refine binding names without inventing language-specific constants or local scope', () => {
+  for (const language of ['typescript', 'python', 'rust', 'cpp', 'csharp', 'go']) {
+    for (const [type, flags, category] of [
+      ['variable', [], '变量'], ['variable', ['readonly'], '只读变量'],
+      ['variable', ['static'], '静态变量'], ['variable', ['static', 'readonly'], '只读静态变量'],
+      ['field', [], '成员变量'], ['field', ['readonly'], '只读成员变量'],
+      ['field', ['static'], '静态变量'], ['field', ['readonly', 'static'], '只读静态变量'],
+      ['property', [], '属性'], ['property', ['readonly'], '只读属性'],
+      ['property', ['static'], '静态属性'], ['property', ['readonly', 'static'], '只读静态属性'],
+      ['parameter', ['readonly'], '参数'], ['enumMember', [], '枚举常量'],
+    ]) {
+      const serverResult = { contents: { language, value: 'SET_CREATE_TIME' } }
+      const semanticToken = { type, modifiers: flags }
+      const before = JSON.stringify({ serverResult, semanticToken })
+      const hover = describeSymbolHover({ model: model(language, 'SET_CREATE_TIME'), position: { lineNumber: 1, column: 2 },
+        serverResult, semanticToken })
+      assert.equal(hover.symbol.category, category, `${language}: ${type}/${flags}`)
+      assert.equal(hover.symbol.semanticType, type)
+      assert.match(hover.sections[0].value, /语言服务语义信息/)
+      assert.doesNotMatch(hover.sections[0].value, /类常量|局部变量/)
+      assert.deepEqual(hover.sections.at(-1), { kind: 'code', language, value: 'SET_CREATE_TIME' })
+      if (flags.includes('readonly')) assert.ok(hover.symbol.attributes.includes('只读'))
+      if (flags.includes('static')) assert.ok(hover.symbol.attributes.includes('静态'))
+      assert.equal(JSON.stringify({ serverResult, semanticToken }), before)
+    }
+  }
+})
+
+test('uppercase names, readonly examples and unrelated modifiers cannot change a binding category', () => {
+  const contents = { kind: 'markdown', value: '(variable) SET_CREATE_TIME: string\n\n中文说明。\n\n```typescript\nclass Example { static readonly value = 1 }\n```' }
+  const hover = describeSymbolHover({ model: model('typescript', 'SET_CREATE_TIME'), position: { lineNumber: 1, column: 2 },
+    serverResult: { contents }, semanticToken: { type: 'variable', modifiers: ['defaultLibrary', 'declaration', 'deprecated'] } })
+  assert.equal(hover.symbol.category, '变量')
+  assert.deepEqual(hover.symbol.attributes, ['标准库', '声明位置', '已弃用'])
+  assert.equal(hover.sections.at(-1).value, contents.value)
+  assert.doesNotMatch(hover.sections[0].value, /常量|静态变量|只读变量|局部变量/)
+  const unknown = describeSymbolHover({ model: model('typescript'), position: { lineNumber: 1, column: 2 },
+    serverResult: { contents: '说明。' }, semanticToken: { type: 'vendor-binding', modifiers: ['static', 'readonly'] } })
+  assert.equal(unknown.symbol.category, undefined)
+  assert.equal(unknown.symbol.semanticType, undefined)
+})
+
 test('pending and failed translation status is visible without claiming model translation succeeded', () => {
-  for (const [status, label] of [['pending', '正在准备中文说明'], ['failed', '当前保留语言服务原文']]) {
+  for (const [status, label] of [['pending', '正在翻译中文说明'], ['failed', '翻译失败']]) {
     const hover = describeSymbolHover({ model: model('rust'), position: { lineNumber: 1, column: 2 },
       serverResult: { contents: { kind: 'plaintext', value: 'Returns a readable value.' },
         documentation_translation: { language: 'zh-CN', source: 'configured-model', status } } })
     assert.ok(hover.sections.some(section => section.value.includes(label)))
     assert.equal(hover.documentation_translation.status, status)
     assert.ok(!hover.sections.some(section => section.value.includes('模型翻译，')))
+    assert.ok(!hover.sections.some(section => section.value.includes('Returns a readable value.')))
+    assert.ok(hover.originalSections.some(section => section.value === 'Returns a readable value.'))
   }
+})
+
+test('Chinese projection retains code examples and mixed technical Chinese while preserving all unready prose', () => {
+  const contents = [
+    { language: 'typescript', value: 'function read(value: string): Promise<string>' },
+    { kind: 'markdown', value: '使用 Promise 返回读取结果。\n\nReturns the result asynchronously.\n\n```typescript\nconst value = await read("English identifier");\n```\n\n参数 `value` 是输入字符串。' },
+    { kind: 'plaintext', value: '<strong>This is literal original documentation.</strong>' },
+  ]
+  const before = JSON.stringify(contents)
+  const result = chineseDocumentationProjection({ contents }, 'typescript')
+  assert.match(result.sections.map(section => section.value).join('\n'), /使用 Promise|参数 `value`/)
+  assert.match(result.sections.map(section => section.value).join('\n'), /English identifier/)
+  assert.doesNotMatch(result.sections.map(section => section.value).join('\n'), /Returns the result asynchronously|literal original documentation/)
+  assert.equal(result.untranslated, true)
+  assert.deepEqual(result.originalSections, [{ kind: 'code', language: 'typescript', value: contents[0].value }, ...contents.slice(1)])
+  assert.equal(JSON.stringify(contents), before)
+})
+
+test('unavailable translated prose never fabricates Chinese purpose or successful translation status', () => {
+  const hover = describeSymbolHover({ model: model('python'), position: { lineNumber: 1, column: 2 },
+    serverResult: { contents: [{ language: 'python', value: 'def read() -> str' }, 'Returns a readable value.'] } })
+  assert.equal(hover.symbol.purpose, undefined)
+  assert.equal(hover.symbol.returnType, 'str')
+  assert.equal(hover.documentation_translation, undefined)
+  assert.ok(hover.sections.some(section => section.value.includes('尚未翻译')))
+  assert.ok(hover.originalSections.some(section => section.value === 'Returns a readable value.'))
 })
 
 test('explicit server labels provide categories when semantic tokens are unavailable', () => {

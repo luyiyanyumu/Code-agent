@@ -19,8 +19,9 @@ from code_agent.storage.jsonl import TranscriptStore
 # ----------------------------------------------------------------------
 # 动态历史预算
 # ----------------------------------------------------------------------
-def test_dynamic_budget_scales_with_window() -> None:
-    """同一份 system/tools，窗口越大历史预算越大；小窗口不低于下限。"""
+def test_dynamic_budget_scales_with_window(monkeypatch) -> None:
+    """窗口内的可用空间缩放，同时尊重运维配置的历史软上限。"""
+    monkeypatch.setenv("CODE_AGENT_HISTORY_BUDGET", "2000000")
     small = dynamic_history_budget(32_768, system_chars=2_000, tools_chars=3_000)
     big = dynamic_history_budget(1_000_000, system_chars=2_000, tools_chars=3_000)
     assert big > small
@@ -29,6 +30,9 @@ def test_dynamic_budget_scales_with_window() -> None:
     assert 10_000 < small < 60_000
     # 1M 窗口接近 50% × 2.2 ≈ 1.1M 字符
     assert big > 500_000
+    monkeypatch.setenv("CODE_AGENT_HISTORY_BUDGET", "24000")
+    assert dynamic_history_budget(32_768, system_chars=2_000, tools_chars=3_000) == 24_000
+    assert dynamic_history_budget(1_000_000, system_chars=2_000, tools_chars=3_000) == 24_000
 
 
 def test_dynamic_budget_falls_back_without_window(monkeypatch) -> None:

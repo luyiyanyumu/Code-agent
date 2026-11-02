@@ -13,9 +13,13 @@ openai_compat 用于内网网关 / vLLM / Ollama 等 OpenAI 兼容后端）。
 
 from __future__ import annotations
 
+import hashlib
+import json
+
 from code_agent.providers import create_provider
 from code_agent.providers.base import Provider
 from code_agent.providers.capacity import effective_model_capacity
+from code_agent.providers.reasoning import resolve_reasoning_effort
 from code_agent.settings import model_config
 
 #: 支持非 offline 的 provider 名（其余视为配置错误，早失败）
@@ -44,6 +48,7 @@ class ModelRouter:
                 f"未知 provider：{self.provider_name!r}（可选：{', '.join(KNOWN_PROVIDERS)}）"
             )
         self._cache: dict[str, Provider] = {}
+        self._retired: list[Provider] = []
         #: 显式指定的"默认 provider"（测试 / 嵌入用）。**独立于 `_cache`**，
         #: 理由见 `provider_override`。
         self._override: Provider | None = None
@@ -101,6 +106,38 @@ class ModelRouter:
             raise ValueError("模型名不能为空")
         return self._provider(name)
 
+    def resolve_configured_provider(self, config: dict, model: str, reasoning_effort: str | None = None) -> Provider:
+        """Resolve a session's saved connection without changing global routing.
+
+        Providers are immutable once constructed. The shared pool keeps their
+        lifetime tied to this router, while an in-flight loop retains its own
+        captured instance across subsequent session selections.
+        """
+        from code_agent.providers.base import is_local_base_url
+
+        name = str(config.get("provider") or "")
+        if name not in KNOWN_PROVIDERS or not model:
+            raise ValueError("模型连接不可用，请重新选择模型")
+        captured = {field: config.get(field) for field in (
+            "provider", "api_key", "base_url", "proxy_mode", "context_window", "max_output_tokens")}
+        captured["model"] = model
+        captured["reasoning_effort"] = resolve_reasoning_effort(name, model, reasoning_effort)
+        # Credentials influence pool identity, but never become cache/log text.
+        digest = hashlib.sha256(json.dumps(captured, sort_keys=True).encode()).hexdigest()
+        key = "session-selection:" + digest
+        if key not in self._cache:
+            if name == "offline":
+                provider = create_provider("offline")
+            else:
+                kwargs = {field: captured[field] for field in (
+                    "base_url", "proxy_mode", "context_window", "max_output_tokens", "reasoning_effort") if captured[field] is not None}
+                kwargs["model"] = model
+                kwargs["api_key"] = captured["api_key"] or (
+                    "not-needed" if is_local_base_url(str(captured.get("base_url") or "")) else "")
+                provider = create_provider(name, **kwargs)
+            self._cache[key] = provider
+        return self._cache[key]
+
     @property
     def provider_override(self) -> Provider | None:
         """直接指定"默认 provider"（测试与嵌入用），读回当前覆盖值。
@@ -141,6 +178,7 @@ class ModelRouter:
                 f"未知 provider：{cfg['provider']!r}（可选：{', '.join(KNOWN_PROVIDERS)}）"
             )
         self.provider_name = cfg["provider"]
+        self._retired.extend(self._cache.values())
         self._cache.clear()
 
     def model_name(self) -> str:
@@ -167,12 +205,17 @@ class ModelRouter:
         覆盖值也算在内：它以前就住在缓存里、会被这里关掉，独立出去之后
         必须显式带进来，否则那条连接池会漏。
         """
-        providers = list(self._cache.values())
+        providers = list(self._cache.values()) + self._retired
         if self._override is not None:
             providers.append(self._override)
+        seen: set[int] = set()
         for provider in providers:
+            if id(provider) in seen:
+                continue
+            seen.add(id(provider))
             aclose = getattr(provider, "aclose", None)
             if aclose is not None:
                 await aclose()
         self._cache.clear()
+        self._retired.clear()
         self._override = None

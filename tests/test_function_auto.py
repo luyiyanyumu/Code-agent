@@ -154,7 +154,7 @@ def test_module_hash_uses_readme_and_config_inventory_without_repeated_model_cal
     asyncio.run(scenario())
 
 
-def test_missing_provider_is_truthful_and_has_cooldown_between_status_polls(env, monkeypatch):
+def test_missing_provider_waits_for_configuration_change_without_poll_retries(env, monkeypatch):
     from code_agent.codeintel import service as module
 
     intel, project, _ = env
@@ -174,10 +174,14 @@ def test_missing_provider_is_truthful_and_has_cooldown_between_status_polls(env,
         assert status["state"] == "waiting" and status["written"] == 0
         assert status["missing"] == 7 and status["coverage_known"]
         assert "没有可用的模型" in status["note"]
+        assert status["block_reason"] == "model_not_configured" and status["failed"] == 0
         for _ in range(100):
             assert not intel.maybe_autofill_briefs(project)["started"]
         assert len(factory_calls) == 1
         clock[0] += module.BRIEF_RETRY_COOLDOWN + 1
+        assert not intel.maybe_autofill_briefs(project)["started"]
+        intel.notify_brief_configuration_changed()
+        assert len(factory_calls) == 1, "saving settings does not make model calls"
         assert intel.maybe_autofill_briefs(project)["started"]
         await drain(intel, project)
         assert len(factory_calls) == 2
@@ -264,8 +268,8 @@ def test_late_result_is_discarded_after_source_changes(env):
         source.write_text(source.read_text(encoding="utf-8").replace("return base + count", "return count"), encoding="utf-8")
         release.set()
         status = await drain(intel, project)
-        assert status["failed"] > 0
-        assert "源码已变化" in status["error"]
+        assert status["failed"] == 0 and status["skipped"] > 0
+        assert not status["error"] and "源码已变化" in status["note"]
         rows = intel.index(project["id"]).all_symbols()
         for row in rows:
             if row["kind"] in {"class", "method", "parameter"}:
@@ -348,6 +352,16 @@ def test_successful_retry_does_not_leave_a_failure_status(env):
 def test_closed_project_or_tree_discards_late_provider_result(env, monkeypatch, tree):
     intel, project, _ = env
     entered, release, finished = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    after_close_reads = []
+    closed = [False]
+    original_signature = intel._brief_signature
+
+    def observed_signature(*args, **kwargs):
+        if closed[0]:
+            after_close_reads.append(True)
+        return original_signature(*args, **kwargs)
+
+    monkeypatch.setattr(intel, "_brief_signature", observed_signature)
 
     class StubbornProvider(Provider):
         async def chat(self, messages, tools):
@@ -380,10 +394,12 @@ def test_closed_project_or_tree_discards_late_provider_result(env, monkeypatch, 
             await asyncio.to_thread(intel.close, project["id"])
         else:
             await asyncio.to_thread(intel.close_tree, project["id"], tree)
+        closed[0] = True
         release.set()
         await asyncio.wait_for(finished.wait(), 3)
         assert store.stamp() == before and store.latest() == {}
         assert f"{project['id']}:{tree}" not in intel._indexes
+        assert not after_close_reads, "a late provider must not read/recreate a closed index"
 
     asyncio.run(scenario())
 

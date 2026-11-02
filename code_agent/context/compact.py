@@ -371,6 +371,20 @@ def compact_messages(
     preferred = [i for i, group in enumerate(groups) if i not in pinned and any(
         message.get("role") == "tool" and str(message.get("tool_call_id") or "") in preserved
         for message in group)]
+    # A small latest response (for example the actual test outcome) must not be
+    # starved by older source. This is still an atomic, fully accounted bundle;
+    # large history does not receive an unconditional reservation.
+    latest = next((i for i in reversed(range(len(groups))) if i not in pinned
+                   and groups[i][0].get("_context_source") != "auto"), None)
+    latest_calls = groups[latest][0].get("tool_calls", []) if latest is not None else []
+    source_queries = {"read_file", "grep", "glob", "list_dir", "read_image", "code_map", "code_search", "code_graph"}
+    latest_is_query = bool(latest_calls) and all(
+        call.get("function", {}).get("name") in source_queries for call in latest_calls)
+    if latest is not None and latest not in preferred and not latest_is_query:
+        latest_cost = messages_size_chars(groups[latest])
+        if latest_cost <= min(3000, budget // 4):
+            kept[latest] = groups[latest]
+            budget -= latest_cost
     # Keep whole exchanges, including all parallel call results. Reserve summary
     # space afterwards: an excerpt of discarded history must not evict source
     # that fits in full. Oversized reads fall through to normal bounded clipping.
@@ -379,6 +393,15 @@ def compact_messages(
         if cost <= budget:
             kept[index] = groups[index]
             budget -= cost
+        else:
+            # A newer source group may leave enough room for a useful complete
+            # file in this older parallel group, even though all its siblings
+            # cannot fit. Do not wait for the ordinary recency scan: it stops
+            # once recent history has already filled its share.
+            partial = _fit_latest_group(groups[index], budget)
+            if partial:
+                kept[index] = partial
+                budget -= messages_size_chars(partial)
     reserve = min(600, max(0, budget // 5))
     remaining = budget - reserve
     recent_kept = False
@@ -464,12 +487,40 @@ def _fit_latest_group(group: list[dict[str, Any]], budget: int) -> list[dict[str
 
     fixed = sum(_content_len({**message, "content": ""}) for message in group)
     available = budget - fixed
-    if available < 32 * len(group):
+    contents = [str(message.get("content") or "") for message in group]
+    minimums = []
+    for message, content in zip(group, contents):
+        minimum = 32
+        if message.get("role") == "tool":
+            locator = next((line for line in content.splitlines()
+                            if line.startswith(("全文已存盘: ", "full_roster_path: ")) and len(line) <= 512), "")
+            minimum += len(_TOOL_SLICE_END) + len(_TOOL_SLICE_MARKER)
+            if locator:
+                minimum += len(_TOOL_LOCATOR_MARKER) + len(locator)
+        elif message.get("role") == "user" and content.startswith(_DATA_START):
+            minimum += len(content.partition("\n")[0]) + len(_DATA_END) + 2
+        minimums.append(min(len(content), minimum))
+    if available < sum(minimums):
         return []
-    per_message = available // len(group)
+    # Metadata (including private provider protocol) is already paid above.
+    # An empty assistant body must not reserve a fourth of a three-result
+    # bundle's source budget. Keep smaller complete bodies first, reserving
+    # honest bounded excerpts for the remaining results and their locators.
+    allowances = list(minimums)
+    remaining = available - sum(allowances)
+    for index in sorted(range(len(group)), key=lambda i: len(contents[i]) - allowances[i]):
+        extra = len(contents[index]) - allowances[index]
+        if extra > remaining:
+            break
+        allowances[index] += extra
+        remaining -= extra
+    partial = [i for i, content in enumerate(contents) if allowances[i] < len(content)]
+    for position, index in enumerate(partial):
+        extra = min(len(contents[index]) - allowances[index], remaining // (len(partial) - position))
+        allowances[index] += extra
+        remaining -= extra
     fitted = []
-    for message in group:
-        content = str(message.get("content") or "")
+    for message, content, per_message in zip(group, contents, allowances):
         if message.get("role") == "user" and content.startswith(_DATA_START) and len(content) > per_message:
             header, separator, body = content.partition("\n")
             if not separator or not body.endswith(_DATA_END):

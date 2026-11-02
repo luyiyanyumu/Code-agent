@@ -3,6 +3,7 @@ import test from 'node:test'
 import { readFile } from 'node:fs/promises'
 import * as Vue from 'vue'
 import { compileScript, parse } from '@vue/compiler-sfc'
+import { IDE_LAYOUT_KEY } from '../src/lib/ideLayout.js'
 
 const settle = async () => { await Vue.nextTick(); await new Promise(setImmediate); await Vue.nextTick() }
 const hasClass = (node, name) => node?.props?.some(prop => prop.type === 6 && prop.name === 'class' && prop.value?.content.split(/\s+/).includes(name))
@@ -16,21 +17,24 @@ const domClass = (node, name) => typeof node.props.class === 'string' && node.pr
 const byClass = (root, name) => all(root).find(node => domClass(node, name))
 const byLabel = (root, name) => all(root).find(node => node.props['aria-label'] === name)
 const button = (root, name) => all(root).find(node => node.type === 'button' && text(node) === name)
+const command = (root, id) => all(root).find(node => node.props['data-command'] === id)
 const click = node => { assert.ok(node, 'the control is rendered'); assert.notEqual(node.props.disabled, true, 'the control is enabled'); node.props.onClick({ preventDefault() {}, stopPropagation() {} }) }
 
 // Compile actual handlers and the actual toolbar/status/bottom-panel subtrees.
 // Deferred startup is omitted; all API access remains a failing offline stub.
 async function setup(t) {
   const url = new URL('../src/views/CodeView.vue', import.meta.url)
-  const exposed = 'project,file,centerView,manualReadonly,rightTab,problemsVisible,bottomTab,runtimeActivated,debugActivated,notice,indexRefresh,indexStatusError,onWorkbenchKey,showBottom,debugRef,editorRef,quickOpen,quickMode'
+  const exposed = 'project,file,centerView,manualReadonly,rightTab,problemsVisible,bottomTab,runtimeActivated,debugActivated,notice,indexRefresh,indexStatusError,onWorkbenchKey,showBottom,debugRef,editorRef,quickOpen,quickMode,ideMenus,onIdeCommand,leftVisible,rightVisible,bottomHeight,focusMode,commandPaletteOpen'
   const source = (await readFile(url, 'utf8')).replace('</script>', `\ndefineExpose({ toolbarTestState: () => ({${exposed}}) })\n</script>`)
   const { descriptor, errors } = parse(source)
   assert.deepEqual(errors, [])
   const path = name => astPath(descriptor.template.ast, node => hasClass(node, name))
-  const top = path('workbench-bar')?.at(-1), editor = path('editor-workbench-tools'), status = path('workspace-notice-bar')?.at(-1), bottom = path('bottom-panel')?.at(-1)
-  assert.ok(top && editor && status && bottom, 'all production toolbar regions exist')
+  const titlebar = path('ide-titlebar')?.at(-1), top = path('workbench-bar')?.at(-1), activity = path('activity-bar')?.at(-1), strip = path('tool-window-strip'), status = path('workspace-notice-bar')?.at(-1), bottom = path('bottom-panel')?.at(-1)
+  assert.ok(titlebar && top && activity && strip && status && bottom, 'all production IDE control regions exist')
+  assert.ok(astPath(titlebar, node => node.tag === 'IdeMenuBar'), 'global menus belong to the IDE title bar')
   assert.ok(astPath(top, node => hasClass(node, 'workspace-view-switcher')), 'mode switching belongs to the global top bar')
-  assert.ok(editor.slice(0, -1).some(node => node.tag === 'main' && hasClass(node, 'center')), 'editor tools belong inside the editor center')
+  assert.ok(strip.slice(0, -1).some(node => node.tag === 'main' && hasClass(node, 'center')), 'bottom tools remain within the editor center')
+  assert.equal(path('editor-workbench-tools'), undefined, 'the duplicate editor toolbar is replaced by global actions and tool windows')
   assert.equal(path('workspace-view-bar'), undefined, 'no extra unconditional mode row remains')
   assert.ok(status.props.some(prop => prop.type === 7 && prop.name === 'if'), 'empty status never occupies its own row')
   const consumers = ['EditorPane', 'FrontendDesign', 'ChangesPanel'].map(name => {
@@ -38,20 +42,23 @@ async function setup(t) {
     assert.ok(node?.props.some(prop => prop.type === 7 && prop.name === 'bind' && prop.arg?.content === 'readonly' && /\bmanualReadonly\b/.test(prop.exp?.content)), `${name} consumes the shared permission`)
     return node.loc.source
   }).join('')
-  const content = `<section>${top.loc.source}${status.loc.source}<main>${editor.at(-1).loc.source}${consumers}${bottom.loc.source}</main></section>`
+  const content = `<section>${titlebar.loc.source}${top.loc.source}${activity.loc.source}${status.loc.source}<main>${consumers}${bottom.loc.source}${strip.at(-1).loc.source}</main></section>`
   const fixtureDescriptor = { ...descriptor, template: { ...descriptor.template, content, ast: undefined } }
   const compiled = compileScript(fixtureDescriptor, { id: 'workbench-toolbar', inlineTemplate: true })
   const calls = [], warnings = [], storage = new Map(), mounts = new Map(), events = []
   const browserStorage = { getItem: key => storage.get(key) ?? null, setItem: (key, value) => storage.set(key, value), removeItem: key => storage.delete(key) }
   const fakeApi = { code: new Proxy({}, { get: (_, name) => async () => { calls.push(String(name)); throw new Error(`Unexpected toolbar API: ${String(name)}`) } }) }
-  const widget = name => Vue.defineComponent({ name, props: ['visible', 'readonly'], setup(props) {
+  const widget = name => Vue.defineComponent({ name, props: ['visible', 'readonly', 'menus'], emits: ['command'], setup(props, { emit }) {
     mounts.set(name, (mounts.get(name) || 0) + 1)
-    return () => Vue.h(name === 'UiIcon' ? 'svg' : 'div', { 'data-widget': name, 'data-visible': props.visible, 'data-readonly': props.readonly }, name === 'AgentLogo' ? 'Code-agent' : '')
+    return () => Vue.h(name === 'UiIcon' ? 'svg' : 'div', { 'data-widget': name, 'data-visible': props.visible, 'data-readonly': props.readonly }, name === 'IdeMenuBar'
+      ? props.menus.flatMap(menu => menu.items.filter(item => item.id && !item.separator).map(item => Vue.h('button', { 'data-command': item.id, disabled: item.disabled, 'aria-checked': item.checked, onClick: () => emit('command', item.id) }, item.label)))
+      : name === 'AgentLogo' ? 'Code-agent' : '')
   } })
   let timerId = 0
   const bindings = { window: { innerWidth: 1280, addEventListener() {}, removeEventListener() {} }, document: { visibilityState: 'visible', activeElement: null, querySelector: () => null }, localStorage: browserStorage,
     setTimeout: () => ++timerId, clearTimeout() {}, setInterval: () => ++timerId, clearInterval() {},
   }
+  bindings.globalThis = { localStorage: browserStorage }
   const imports = []
   let script = compiled.content.replace(/^import\s+([\s\S]*?)\s+from\s+['"]([^'"]+)['"]\s*;?\r?$/gm, (_, clause, specifier) => { imports.push({ clause: clause.trim(), specifier }); return '' })
   for (const { clause, specifier } of imports) {
@@ -87,41 +94,42 @@ async function setup(t) {
   t.after(() => { app.unmount(); assert.deepEqual(calls, [], 'toolbar tests never call a real backend'); assert.deepEqual(warnings, []) })
   state.project.value = { id: 'toolbar-project', name: '工作区', root_path: '/fixture/project', available: true }
   await settle()
-  return { root, state, mounts, events }
+  return { root, state, mounts, events, storage }
 }
 
-test('global toolbar owns the unique mode selector while editor actions stay in the editor toolbar', async t => {
+test('IDE title menus, main actions, activity rail and bottom tools each own their controls', async t => {
   const { root, state, events } = await setup(t)
-  const top = byClass(root, 'workbench-bar'), modes = byLabel(top, '工作区视图'), tools = byLabel(root, '编辑器工具')
+  const titlebar = byClass(root, 'ide-titlebar'), top = byClass(root, 'workbench-bar'), modes = byLabel(top, '工作区视图'), strip = byLabel(root, '底部工具窗口'), activity = byLabel(root, '工具窗口')
   assert.equal(all(root).filter(node => node.props['aria-label'] === '工作区视图').length, 1)
-  assert.ok(all(top).some(node => node.props['data-widget'] === 'AgentLogo'))
-  for (const label of ['导航后退', '导航前进']) { assert.equal(byLabel(top, label), undefined); assert.ok(byLabel(tools, label)) }
-  for (const label of ['终端', '运行', '调试']) { assert.equal(button(top, label), undefined); assert.ok(button(tools, label)) }
+  assert.ok(all(titlebar).some(node => node.props['data-widget'] === 'AgentLogo'))
+  assert.ok(all(titlebar).some(node => node.props['data-widget'] === 'IdeMenuBar'))
+  for (const label of ['导航后退', '导航前进', '运行当前文件', '调试当前文件']) assert.ok(byLabel(top, label))
+  for (const label of ['终端', '运行', '调试']) assert.ok(button(strip, label))
   assert.ok(byClass(top, 'editing-trigger'))
-  assert.equal(byLabel(tools, '允许编辑'), undefined)
+  assert.equal(all(root).filter(node => domClass(node, 'editing-trigger')).length, 1)
   for (const [name, mode] of [['思维导图', 'map'], ['前端设计', 'design'], ['编辑器', 'file']]) {
     click(button(modes, name)); await settle()
     assert.equal(state.centerView.value, mode)
     const selected = all(modes).filter(node => node.type === 'button' && node.props['aria-pressed'] === true)
     assert.equal(selected.length, 1)
     assert.equal(text(selected[0]), name)
-    assert.equal(tools.style.display, mode === 'file' ? '' : 'none')
+    assert.equal(Boolean(byLabel(root, '底部工具窗口')), mode === 'file')
   }
-  click(byLabel(top, '打开设置'))
+  click(byLabel(activity, '打开设置'))
   assert.deepEqual(events, ['settings'])
 })
 
 test('editor actions remain functional and the bottom runtime is hidden across modes without remounting', async t => {
   const { root, state, mounts } = await setup(t)
-  const tools = byLabel(root, '编辑器工具'), modes = byLabel(root, '工作区视图')
+  const strip = byLabel(root, '底部工具窗口'), modes = byLabel(root, '工作区视图')
   click(byLabel(byClass(root, 'workbench-bar'), '允许编辑')); await settle()
   assert.equal(state.manualReadonly.value, true)
   assert.equal(byLabel(byClass(root, 'workbench-bar'), '编辑只读').props['aria-pressed'], true)
-  click(all(tools).find(node => node.type === 'button' && text(node).startsWith('问题'))); await settle()
+  click(all(strip).find(node => node.type === 'button' && text(node).startsWith('问题'))); await settle()
   assert.equal(state.problemsVisible.value, true)
   assert.equal(state.bottomTab.value, 'problems')
   assert.equal(all(root).find(node => node.props['data-widget'] === 'ProblemsPanel').props['data-visible'], true)
-  click(button(tools, '终端')); await settle()
+  click(button(byClass(root, 'bottom-tabs'), '终端')); await settle()
   const panel = byClass(root, 'bottom-panel'), runtime = all(root).find(node => node.props['data-widget'] === 'RuntimePanel')
   assert.equal(state.bottomTab.value, 'terminal')
   assert.equal(runtime.props['data-visible'], true)
@@ -137,7 +145,7 @@ test('editor actions remain functional and the bottom runtime is hidden across m
   assert.equal(panel.style.display, '')
   assert.equal(all(root).find(node => node.props['data-widget'] === 'RuntimePanel'), runtime)
   assert.equal(runtime.props['data-visible'], true)
-  click(byLabel(root, '关闭问题面板')); await settle()
+  click(byLabel(root, '关闭底部面板')); await settle()
   assert.equal(runtime.props['data-visible'], false)
   assert.equal(mounts.get('RuntimePanel'), 1)
 })
@@ -163,7 +171,33 @@ test('one global permission toggle works from map and design and updates every s
   assert.equal(consumer('ChangesPanel').props['data-readonly'], false)
   click(byLabel(top, '允许编辑')); await settle()
   for (const name of ['EditorPane', 'FrontendDesign', 'ChangesPanel']) assert.equal(consumer(name).props['data-readonly'], true)
-  assert.equal(byClass(root, 'editor-workbench-tools').style.display, 'none')
+  assert.equal(consumer('EditorPane').style.display, 'none')
+  assert.equal(byClass(root, 'editor-workbench-tools'), undefined)
+  assert.equal(command(root, 'toggle-readonly').props['aria-checked'], true)
+})
+
+test('menu commands share the permission state and persist panel choices while focus mode preserves them', async t => {
+  const { root, state, storage } = await setup(t)
+  state.file.value = { path: 'main.py', text: '', missing: false, needsReload: false }; await settle()
+  click(button(byLabel(root, '工作区视图'), '前端设计')); await settle()
+  click(command(root, 'toggle-readonly')); await settle()
+  assert.equal(state.manualReadonly.value, true)
+  assert.equal(byLabel(byClass(root, 'workbench-bar'), '编辑只读').props['aria-pressed'], true)
+  for (const name of ['EditorPane', 'FrontendDesign'])
+    assert.equal(all(root).find(node => node.props['data-widget'] === name).props['data-readonly'], true)
+  click(command(root, 'toggle-readonly')); await settle()
+  assert.equal(state.manualReadonly.value, false)
+  click(button(byLabel(root, '工作区视图'), '编辑器')); await settle()
+  click(command(root, 'files')); click(command(root, 'assistant')); click(command(root, 'bottom:terminal')); await settle()
+  const saved = JSON.parse(storage.get(IDE_LAYOUT_KEY))
+  assert.deepEqual(saved, { left: false, right: false, bottom: true, bottomTab: 'terminal', bottomHeight: 260 })
+  click(command(root, 'focus')); await settle()
+  assert.equal(state.focusMode.value, true)
+  assert.equal(byClass(root, 'bottom-panel').style.display, 'none')
+  assert.deepEqual(JSON.parse(storage.get(IDE_LAYOUT_KEY)), saved, 'focus mode hides panels without overwriting their remembered choices')
+  click(command(root, 'reset-layout')); await settle()
+  assert.equal(state.focusMode.value, false)
+  assert.deepEqual(JSON.parse(storage.get(IDE_LAYOUT_KEY)), { left: true, right: true, bottom: false, bottomTab: 'problems', bottomHeight: 260 })
 })
 
 test('status notices render only when needed and disappear after completion or clearing', async t => {
@@ -205,6 +239,27 @@ test('unified search shortcuts switch modes and the modal blocks background edit
   state.onWorkbenchKey(key({ key: 'p', metaKey: true }))
   assert.equal(state.quickMode.value, 'files')
   assert.equal(prevented, 3)
+})
+
+test('command palette and focused menus block editor shortcuts while the palette shortcut opens the real state', async t => {
+  const { state } = await setup(t)
+  let prevented = 0, continued = 0, breakpoint = 0
+  const key = overrides => ({ key: '', ctrlKey: false, metaKey: false, altKey: false, shiftKey: false, defaultPrevented: false,
+    preventDefault: () => prevented++, ...overrides })
+  state.debugRef.value = { isPaused: () => true, continue: () => continued++ }
+  state.editorRef.value = { toggleBreakpoint: () => breakpoint++ }
+  state.onWorkbenchKey(key({ key: 'P', ctrlKey: true, shiftKey: true }))
+  assert.equal(state.commandPaletteOpen.value, true)
+  assert.equal(prevented, 1)
+  for (const event of [{ key: 'F5' }, { key: 'F5', ctrlKey: true }, { key: 'F9' }]) state.onWorkbenchKey(key(event))
+  assert.equal(continued, 0); assert.equal(breakpoint, 0); assert.equal(state.problemsVisible.value, false)
+  state.commandPaletteOpen.value = false
+  for (const event of [{ key: 'F5' }, { key: 'F9' }]) state.onWorkbenchKey(key({ ...event, target: { closest: () => ({ role: 'menu' }) } }))
+  assert.equal(continued, 0); assert.equal(breakpoint, 0)
+  assert.equal(prevented, 1)
+  state.onWorkbenchKey(key({ key: 'P', ctrlKey: true, shiftKey: true, target: { closest: () => ({ role: 'menubar' }) } }))
+  assert.equal(state.commandPaletteOpen.value, true, 'global command search remains available after Escape restores menu trigger focus')
+  assert.equal(prevented, 2)
 })
 
 test('editor shortcuts ignore other modes and showBottom explicitly returns to the editor', async t => {

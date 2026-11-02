@@ -1,14 +1,14 @@
 <script setup>
 import { computed, defineAsyncComponent, nextTick, onMounted, ref, watch } from 'vue'
-import { api, getToken } from '../api.js'
-import { useDialog } from '../composables/useDialog.js'
+import { api } from '../api.js'
 import ExecutionSettings from '../components/settings/ExecutionSettings.vue'
 import ToolsView from './ToolsView.vue'
 import { usePreferences } from '../lib/preferences.js'
-import { SETTINGS_SECTIONS, WORKSPACE_SHORTCUTS, searchSettings } from '../lib/settingsCatalog.js'
+import { SETTINGS_GROUPS, SETTINGS_SECTIONS, WORKSPACE_SHORTCUTS, searchSettings } from '../lib/settingsCatalog.js'
 import EmptyState from '../components/ui/EmptyState.vue'
 import UiIcon from '../components/ui/UiIcon.vue'
 
+const ModelProviders = defineAsyncComponent(() => import('../components/settings/ModelProviders.vue'))
 const MemoryView = defineAsyncComponent(() => import('./MemoryView.vue'))
 const KnowledgeView = defineAsyncComponent(() => import('./KnowledgeView.vue'))
 const UsageView = defineAsyncComponent(() => import('./UsageView.vue'))
@@ -22,13 +22,20 @@ const props = defineProps({
   visible: { type: Boolean, default: true },
   initialSection: { type: String, default: 'general' },
   initialToolTab: { type: String, default: 'builtin' },
+  desktopAvailable: { type: Boolean, default: false },
 })
 const isAdmin = computed(() => props.user?.role === 'admin')
-const emit = defineEmits(['close', 'section-change'])
+const emit = defineEmits(['close', 'section-change', 'open-desktop'])
 const { preferences, updatePreference, resetPreferences, storageError } = usePreferences()
 const sections = SETTINGS_SECTIONS
-const activeSection = ref(sections.some(item => item.id === props.initialSection) ? props.initialSection : 'general')
+const groups = SETTINGS_GROUPS
+const initialSection = sections.some(item => item.id === props.initialSection) ? props.initialSection : groups.find(group => group.id === props.initialSection)?.sections[0] || 'general'
+const activeSection = ref(initialSection)
+const groupSelections = ref(Object.fromEntries(groups.map(group => [group.id, group.sections.includes(initialSection) ? initialSection : group.sections[0]])))
 const extensionsVisited = ref(activeSection.value === 'extensions')
+const modelsVisited = ref(activeSection.value === 'models')
+const modelAnchor = ref('')
+const modelPanel = ref(null)
 // Load resource screens on first visit and keep their instances while settings are open or hidden.
 const visitedResources = ref(new Set(resourceSections.includes(activeSection.value) ? [activeSection.value] : []))
 const resourcePanels = {}
@@ -39,6 +46,27 @@ const contentPane = ref(null)
 const preferenceNotice = ref('')
 const searchResults = computed(() => searchSettings(searchQuery.value))
 const currentSection = computed(() => sections.find(item => item.id === activeSection.value) || sections[0])
+const currentGroup = computed(() => groups.find(group => group.sections.includes(activeSection.value)) || groups[0])
+const currentTabs = computed(() => currentGroup.value.sections.map(id => sections.find(section => section.id === id)))
+function sectionPath(id) {
+  const group = groups.find(group => group.sections.includes(id))
+  const section = sections.find(section => section.id === id)
+  return group?.sections.length > 1 ? `${group.label} / ${section.label}` : section?.label
+}
+async function selectGroup(id) {
+  const group = groups.find(group => group.id === id)
+  if (group) await selectSection(groupSelections.value[id] || group.sections[0])
+}
+async function navigateTabs(event) {
+  const keys = ['ArrowLeft', 'ArrowRight', 'Home', 'End']
+  if (!keys.includes(event.key)) return
+  event.preventDefault()
+  const tabs = currentTabs.value
+  const index = tabs.findIndex(tab => tab.id === activeSection.value)
+  const nextIndex = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1 : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length
+  await selectSection(tabs[nextIndex].id)
+  contentPane.value?.querySelector(`[id="settings-tab-${tabs[nextIndex].id}"]`)?.focus({ preventScroll: true })
+}
 const shortcuts = WORKSPACE_SHORTCUTS
 const themeOptions = [{ value: 'light', label: '浅色' }, { value: 'dark', label: '深色' }, { value: 'system', label: '跟随系统' }]
 const editorPreview = computed(() => `public class Workspace {\n${' '.repeat(preferences.editorTabSize)}// 按你的习惯阅读代码\n${' '.repeat(preferences.editorTabSize)}String message = "Hello, Code-agent";\n}`)
@@ -64,11 +92,14 @@ function refreshResource(panel) {
   })
 }
 async function selectSection(id, anchor = '') {
+  if (!sections.some(item => item.id === id)) id = groups.find(group => group.id === id)?.sections[0] || id
   if (!sections.some(item => item.id === id)) return
   // A new async screen owns its first load; refresh only an existing instance.
   const resourcePanel = resourcePanels[id]
   activeSection.value = id
+  groupSelections.value[groups.find(group => group.sections.includes(id)).id] = id
   if (id === 'extensions') extensionsVisited.value = true
+  if (id === 'models') { modelsVisited.value = true; modelAnchor.value = anchor }
   if (resourceSections.includes(id)) visitedResources.value.add(id)
   refreshResource(resourcePanel)
   emit('section-change', id)
@@ -82,6 +113,7 @@ async function selectSection(id, anchor = '') {
   }
   if (id === 'system' && !service.value && !serviceLoading.value) checkService()
   if (anchor) {
+    if (id === 'models') { await modelPanel.value?.focusField(anchor); return }
     const target = contentPane.value?.querySelector(`[id="${anchor}"]`)
     target?.scrollIntoView?.({ block: 'center' })
     if (target?.matches?.('input, select, button, [tabindex]')) target.focus({ preventScroll: true })
@@ -108,15 +140,6 @@ async function checkService() {
   finally { serviceLoading.value = false }
 }
 
-
-const cfg = ref(null)
-const error = ref('')
-const notice = ref('')
-const saving = ref(false)
-const loading = ref(false)
-const profileError = ref('')
-const formSection = ref(null)
-const dialog = useDialog()
 
 const teamConfig = ref(null)
 const teamForm = ref({ max_depth: 3, max_parallel: 4 })
@@ -205,306 +228,6 @@ async function saveAgentTeamBudgets() {
   finally { teamBudgetSaving.value = false }
 }
 
-const form = ref({
-  provider: 'deepseek',
-  base_url: '',
-  api_key: '',
-  model_default: '',
-  proxy_mode: 'system',
-  context_window: '',
-  max_output_tokens: '',
-})
-
-const PROVIDERS = [
-  { value: 'deepseek', label: 'DeepSeek', hint: '官方 API，默认 https://api.deepseek.com' },
-  { value: 'openai', label: 'OpenAI', hint: '官方 API，默认 https://api.openai.com/v1' },
-  { value: 'openai_compat', label: 'OpenAI 兼容', hint: '内网网关 / vLLM / Ollama（/v1）' },
-  { value: 'offline', label: '离线 Mock', hint: '无 key 演示 / 回归测试' },
-]
-
-const BASE_URL_HINT = {
-  deepseek: 'https://api.deepseek.com',
-  openai: 'https://api.openai.com/v1',
-  openai_compat: 'http://10.0.0.9:8000/v1',
-  offline: '',
-}
-
-async function load() {
-  loading.value = true
-  error.value = ''
-  try {
-    cfg.value = await api.modelSettings()
-    if (!showProfileForm.value) fillForm(cfg.value)
-  } catch (e) {
-    error.value = e.message
-  } finally { loading.value = false }
-}
-
-async function submit() {
-  if (saving.value || !isAdmin.value) return
-  saving.value = true
-  error.value = ''
-  notice.value = ''
-  try {
-    const payload = { ...form.value }
-    payload.context_window = parseCapacity(payload.context_window, '上下文窗口')
-    payload.max_output_tokens = parseCapacity(payload.max_output_tokens, '最大输出 Token')
-    if (payload.context_window && payload.max_output_tokens && payload.max_output_tokens >= payload.context_window) {
-      throw new Error('最大输出 Token 必须小于上下文窗口')
-    }
-    if (!payload.api_key) delete payload.api_key // 留空 = 不修改
-    for (const k of Object.keys(payload)) {
-      if (typeof payload[k] === 'string') payload[k] = payload[k].trim()
-    }
-    // 防止浏览器把用户名自动填进服务地址。
-    const url = payload.base_url || ''
-    if (url && !/^https?:\/\/\S+$/i.test(url)) {
-      error.value = '服务地址请填写 http:// 或 https:// 开头的地址'
-      return
-    }
-
-    // 档案模式：保存到 providers.json（编辑中的档案若正在生效则自动应用）
-    if (showProfileForm.value && (editingPid.value || adding.value)) {
-      if (adding.value !== 'preset' && !editingPid.value && !editingName.value.trim()) {
-        error.value = '档案名称不能为空'
-        return
-      }
-      const body = { ...payload, name: editingName.value.trim() }
-      if (editingPid.value) {
-        const view = await profileCall('PUT', `/api/v1/model-profiles/${editingPid.value}`, body)
-        notice.value = view.active ? '配置已保存并生效' : '配置已保存，启用后生效'
-      } else {
-        await profileCall('POST', '/api/v1/model-profiles', body)
-        notice.value = '配置已添加，启用后生效'
-      }
-      showProfileForm.value = false
-      editingPid.value = ''
-      adding.value = ''
-      await Promise.all([loadProfiles(), load()])
-      return
-    }
-
-    await api.saveModelSettings(payload)
-    notice.value = '配置已保存并生效'
-    await load()
-  } catch (e) {
-    error.value = e.message
-  } finally {
-    saving.value = false
-  }
-}
-
-// ---- 模型配置档案（M14）：多 provider 预设，一键切换 ----
-const profiles = ref([])
-const editingPid = ref('')      // 正在编辑的档案 id（'' = 编辑当前生效配置 / 新增）
-const adding = ref('')          // '' | 'preset' | 'custom'
-const editingName = ref('')
-const showProfileForm = ref(false)
-
-// ---- 本地 / 内网后端（Ollama、LM Studio、vLLM）：免密钥 + 可用模型探测 ----
-const probing = ref(false)
-const probed = ref([])
-const probeError = ref('')
-const formLocal = computed(() => isLocalUrl(form.value.base_url))
-let probeGeneration = 0
-
-function probeSignature() {
-  return JSON.stringify([editingPid.value, adding.value, form.value.provider, form.value.base_url.trim(), form.value.api_key.trim(), form.value.proxy_mode])
-}
-
-/** 与后端 is_local_base_url 同口径的轻量判定（只用于提示，不做安全决策）。 */
-function isLocalUrl(u) {
-  const m = /^https?:\/\/([^/:?#]+)/i.exec(u || '')
-  if (!m) return false
-  const h = m[1].toLowerCase()
-  if (['localhost', '0.0.0.0', '::1', '[::1]', 'host.docker.internal'].includes(h)) return true
-  if (h.startsWith('127.') || h.startsWith('10.') || h.startsWith('192.168.') || h.startsWith('169.254.')) return true
-  if (h.endsWith('.local') || h.endsWith('.localhost') || h.endsWith('.internal')) return true
-  if (h.startsWith('172.')) {
-    const seg = h.split('.')
-    return seg.length > 1 && Number(seg[1]) >= 16 && Number(seg[1]) <= 31
-  }
-  return false
-}
-
-/** 拉取 {base_url}/models —— 本地模型的模型名不该靠猜。 */
-async function probeModels() {
-  if (probing.value || saving.value) return
-  probeError.value = ''
-  probed.value = []
-  const base_url = form.value.base_url.trim() || BASE_URL_HINT[form.value.provider] || ''
-  if (!base_url) { probeError.value = '请先填写 Base URL'; return }
-  const useCurrent = !showProfileForm.value && form.value.provider === cfg.value?.provider
-  const storedKey = editingPid.value ? profiles.value.find(profile => profile.id === editingPid.value)?.api_key_set : useCurrent && cfg.value?.api_key_set
-  if (!form.value.api_key.trim() && !isLocalUrl(base_url) && !storedKey) {
-    probeError.value = '远程服务需要 API Key，请填写密钥或选择已有密钥的档案'
-    return
-  }
-  probing.value = true
-  const generation = ++probeGeneration
-  const signature = probeSignature()
-  try {
-    const r = await profileCall('POST', '/api/v1/model-profiles/probe', {
-      base_url,
-      api_key: form.value.api_key.trim(),
-      proxy_mode: form.value.proxy_mode,
-      ...(editingPid.value ? { profile_id: editingPid.value } : useCurrent ? { use_current: true } : {}),
-    })
-    if (generation !== probeGeneration || signature !== probeSignature()) return
-    probed.value = r.models || []
-    if (!probed.value.length) probeError.value = '服务有响应但没有模型，先在本地后端拉取/加载一个模型'
-  } catch (e) {
-    if (generation === probeGeneration && signature === probeSignature()) probeError.value = e.message
-  } finally {
-    if (generation === probeGeneration) probing.value = false
-  }
-}
-
-const profilesLoaded = ref(false)
-const formSource = computed(() => editingPid.value
-  ? profiles.value.find(profile => profile.id === editingPid.value)
-  : adding.value ? null : cfg.value)
-const storedKey = computed(() => !!formSource.value?.api_key_set)
-const modelOptions = computed(() => [...new Set([
-  form.value.model_default,
-  ...(formSource.value?.models || []).map(item => item.id),
-  ...probed.value,
-].filter(Boolean))])
-
-function parseCapacity(value, label) {
-  if (value == null || String(value).trim() === '') return null
-  const text = String(value).trim()
-  if (!/^\d+$/.test(text) || !Number.isSafeInteger(Number(text)) || Number(text) < 1 || Number(text) > 10000000) {
-    throw new Error(`${label}请输入 1–10,000,000 之间的整数`)
-  }
-  return Number(text)
-}
-
-function tokenCount(value) {
-  return value ? Number(value).toLocaleString('en-US') : '自动'
-}
-
-// api.js 带着他人未提交改动，这里用局部 fetch 保持隔离
-async function profileCall(method, path, body) {
-  const headers = { Authorization: `Bearer ${getToken()}` }
-  if (body !== undefined) headers['Content-Type'] = 'application/json'
-  const resp = await fetch(path, {
-    method, headers, body: body === undefined ? undefined : JSON.stringify(body),
-  })
-  if (!resp.ok) {
-    const detail = (await resp.json().catch(() => ({}))).detail
-    throw new Error(detail || `HTTP ${resp.status}`)
-  }
-  return resp.json()
-}
-
-async function loadProfiles() {
-  profileError.value = ''
-  try { profiles.value = await profileCall('GET', '/api/v1/model-profiles') }
-  catch (e) { profileError.value = e.message }
-  finally { profilesLoaded.value = true }
-}
-
-function fillForm(src) {
-  probeGeneration++
-  probing.value = false
-  form.value = {
-    provider: src.provider || 'deepseek',
-    base_url: src.base_url || '',
-    api_key: '', // 永远不回填 key，留空=不修改
-    model_default: src.model_default || '',
-    proxy_mode: src.proxy_mode || 'system',
-    context_window: src.context_window ?? '',
-    max_output_tokens: src.max_output_tokens ?? '',
-  }
-  probed.value = []
-  probeError.value = ''
-}
-
-function beginEditProfile(p) {
-  editingPid.value = p.id
-  adding.value = ''
-  editingName.value = p.name
-  showProfileForm.value = true
-  fillForm(p)
-  error.value = ''
-  notice.value = ''
-  setTimeout(() => formSection.value?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 0)
-}
-
-function beginAddPreset(name) {
-  const EMPTY = { model_default: '' }
-  const pr = {
-    DeepSeek: { provider: 'deepseek', base_url: '', model_default: 'deepseek-chat' },
-    Kimi: { provider: 'openai_compat', base_url: 'https://api.moonshot.cn/v1', model_default: 'kimi-k2-turbo-preview' },
-    '火山方舟': { provider: 'openai_compat', base_url: 'https://ark.cn-beijing.volces.com/api/v3', model_default: 'deepseek-v4-pro' },
-    OpenAI: { provider: 'openai', base_url: 'https://api.openai.com/v1', ...EMPTY },
-    // 本地 / 内网后端：无需密钥，模型名建议点「探测模型」从本机拉取后一键填入
-    '本地 Ollama': { provider: 'openai_compat', base_url: 'http://127.0.0.1:11434/v1', ...EMPTY },
-    '本地 LM Studio': { provider: 'openai_compat', base_url: 'http://127.0.0.1:1234/v1', ...EMPTY },
-    '本地 vLLM': { provider: 'openai_compat', base_url: 'http://127.0.0.1:8000/v1', ...EMPTY },
-  }[name]
-  if (!pr) return
-  editingPid.value = ''
-  adding.value = 'preset'
-  editingName.value = name
-  showProfileForm.value = true
-  fillForm(pr)
-  error.value = ''
-  notice.value = ''
-  setTimeout(() => formSection.value?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 0)
-}
-
-function beginAddCustom() {
-  editingPid.value = ''
-  adding.value = 'custom'
-  editingName.value = ''
-  showProfileForm.value = true
-  fillForm({ provider: 'openai_compat' })
-  error.value = ''
-  notice.value = ''
-  setTimeout(() => formSection.value?.scrollIntoView({ behavior: 'smooth', block: 'start' }), 0)
-}
-
-function cancelProfileEdit() {
-  showProfileForm.value = false
-  editingPid.value = ''
-  adding.value = ''
-  load()
-}
-
-async function activateProfile(p) {
-  error.value = ''
-  notice.value = ''
-  try {
-    await profileCall('POST', `/api/v1/model-profiles/${p.id}/activate`)
-    notice.value = `已切换到「${p.name}」，配置已生效`
-    await Promise.all([loadProfiles(), load()])
-  } catch (e) { error.value = e.message }
-}
-
-async function deleteProfile(p) {
-  const { id, name } = p
-  return dialog.open({
-    title: '删除配置档案',
-    description: '将移除此保存的模型连接档案。当前已经生效的连接配置仍会保留。',
-    details: name,
-    tone: 'danger',
-    icon: 'server',
-    confirmText: '删除档案',
-    pendingText: '正在删除…',
-    onConfirm: async () => {
-      error.value = ''
-      notice.value = ''
-      await profileCall('DELETE', `/api/v1/model-profiles/${id}`)
-      notice.value = `已删除配置档案「${name}」`
-      await loadProfiles()
-    },
-  })
-}
-
-onMounted(load)
-onMounted(loadProfiles)
 onMounted(loadAgentTeam)
 onMounted(loadAgentTeamBudgets)
 onMounted(() => { if (activeSection.value === 'system') checkService() })
@@ -516,21 +239,22 @@ onMounted(() => { if (activeSection.value === 'system') checkService() })
     <div class="settings-workspace">
       <aside class="settings-sidebar">
         <div class="settings-search"><UiIcon name="search" :size="16" /><input v-model="searchQuery" type="search" aria-label="搜索设置" placeholder="搜索设置…" @keydown.esc="searchQuery = ''" /></div>
-        <nav aria-label="设置分类"><button v-for="section in sections" :key="section.id" class="settings-nav-item" :class="{ selected: activeSection === section.id && !searchQuery.trim() }" :aria-current="activeSection === section.id && !searchQuery.trim() ? 'page' : undefined" @click="selectSection(section.id)"><UiIcon :name="section.icon" :size="17" /><span>{{ section.label }}</span></button></nav>
+        <nav aria-label="设置分类"><button v-for="group in groups" :key="group.id" class="settings-nav-item" :class="{ selected: currentGroup.id === group.id && !searchQuery.trim() }" :aria-current="currentGroup.id === group.id && !searchQuery.trim() ? 'page' : undefined" @click="selectGroup(group.id)"><UiIcon :name="group.icon" :size="17" /><span>{{ group.label }}</span></button></nav>
         <div class="settings-sidebar-note"><span>Code-agent</span><span>你的工作区，你的偏好</span></div>
       </aside>
       <section ref="contentPane" class="settings-content" aria-label="设置内容">
         <div class="settings-content-inner">
           <template v-if="searchQuery.trim()">
             <div class="category-heading"><div><h2>搜索设置</h2><p role="status">找到 {{ searchResults.length }} 项与「{{ searchQuery.trim() }}」相关的设置</p></div></div>
-            <div v-if="searchResults.length" class="search-results"><button v-for="item in searchResults" :key="item.section + item.label" class="search-result" @click="selectSection(item.section, item.anchor)"><div><span>{{ sections.find(s => s.id === item.section)?.label }}</span><strong>{{ item.label }}</strong></div><UiIcon name="chevron-right" :size="16" /></button></div>
+            <div v-if="searchResults.length" class="search-results"><button v-for="item in searchResults" :key="item.section + item.label" class="search-result" @click="selectSection(item.section, item.anchor)"><div><span>{{ sectionPath(item.section) }}</span><strong>{{ item.label }}</strong></div><UiIcon name="chevron-right" :size="16" /></button></div>
             <EmptyState v-else title="没有找到相关设置" description="试试“主题”“模型”“权限”或“字体”。" icon="search" />
           </template>
           <div v-show="!searchQuery.trim()">
-            <div class="category-heading"><div><h2>{{ currentSection.label }}</h2><p>{{ currentSection.description }}</p></div><span class="scope-label">{{ currentSection.scope }}</span></div>
+            <div class="category-heading" :class="{ 'has-subsections': currentTabs.length > 1 }"><div><h2>{{ currentGroup.label }}</h2><p>{{ currentSection.description }}</p></div><span class="scope-label">{{ currentSection.scope }}</span></div>
+            <div v-if="currentTabs.length > 1" class="settings-subsections" role="tablist" :aria-label="currentGroup.label + '分类'" @keydown="navigateTabs"><button v-for="tab in currentTabs" :id="'settings-tab-' + tab.id" :key="tab.id" type="button" role="tab" :aria-selected="activeSection === tab.id" aria-controls="settings-active-panel" :tabindex="activeSection === tab.id ? 0 : -1" @click="selectSection(tab.id)">{{ tab.label }}</button></div>
             <p v-if="storageError" class="feedback error" role="alert">{{ storageError }}</p>
             <p v-if="preferenceNotice" class="preference-notice" role="status"><UiIcon name="check" :size="14" />{{ preferenceNotice }}</p>
-
+            <div id="settings-active-panel" :role="currentTabs.length > 1 ? 'tabpanel' : undefined" :aria-labelledby="currentTabs.length > 1 ? 'settings-tab-' + activeSection : undefined">
             <section v-show="activeSection === 'general'" aria-label="通用设置">
               <div class="setting-group"><h3>启动与代码助手</h3>
                 <div id="default-view" class="setting-row"><div><span class="setting-label">起始页面</span><p>启动后直接进入代码工作区。资源与管理功能统一从设置打开。</p></div><span class="subtle-badge">代码工作区</span></div>
@@ -565,54 +289,7 @@ onMounted(() => { if (activeSection.value === 'system') checkService() })
             </section>
 
             <section v-show="activeSection === 'models'" aria-label="模型与连接设置">
-              <div v-if="error" class="feedback error" role="alert"><UiIcon name="alert" :size="16" /><span>{{ error }}</span><button v-if="!cfg" :disabled="loading" @click="load">重试</button></div>
-              <div v-if="notice" class="feedback success" role="status"><UiIcon name="check" :size="16" /><span>{{ notice }}</span></div>
-      <section class="panel active-panel" aria-label="当前生效模型">
-        <template v-if="cfg">
-          <div class="active-model"><span class="section-icon"><UiIcon name="server" :size="18" /></span><div><span class="eyebrow">当前模型</span><strong :title="cfg.active_model || cfg.model_default">{{ cfg.active_model || cfg.model_default || '未设置' }}</strong></div><span class="status-chip">生效中</span></div>
-          <div class="active-capacity"><div><span>上下文窗口</span><strong>{{ tokenCount(cfg.effective_context_window ?? cfg.context_window) }}</strong></div><div><span>最大输出 Token</span><strong>{{ tokenCount(cfg.effective_max_output_tokens ?? cfg.max_output_tokens) }}</strong></div></div>
-        </template>
-        <div v-else class="loading-state" role="status">{{ loading ? '正在加载配置…' : '当前配置暂时不可用' }}</div>
-      </section>
-      <div class="settings-layout">
-        <section id="saved-profiles" class="panel profiles-panel">
-          <div class="section-head"><h3>已保存配置 <span class="count">{{ profiles.length }}</span></h3><button v-if="isAdmin" class="mini" :disabled="saving" @click="beginAddCustom"><UiIcon name="plus" :size="14" />添加</button></div>
-          <div v-if="profileError" class="profile-error" role="alert"><span>{{ profileError }}</span><button @click="loadProfiles">重试</button></div>
-          <div v-if="!profilesLoaded" class="loading-state" role="status">正在加载配置…</div>
-          <div v-else-if="profiles.length" class="profile-list">
-            <article v-for="p in profiles" :key="p.id" class="profile-card" :class="{ active: p.active, editing: editingPid === p.id }">
-              <div class="profile-heading"><span class="provider-icon"><UiIcon name="server" :size="16" /></span><div class="p-main"><div class="p-title"><span class="p-name">{{ p.name }}</span><span v-if="p.active" class="p-badge">生效中</span><span v-if="p.local" class="p-badge local">本地</span></div><span class="p-model" :title="p.model_default || p.provider">{{ p.model_default || p.provider }}</span></div></div>
-              <div class="profile-meta"><span><span class="p-dot" :class="(p.api_key_set || p.local) ? 'ok' : 'warn'"></span>{{ p.local ? '本地服务' : p.api_key_set ? '密钥已配置' : '未配置密钥' }}</span><span>{{ p.proxy_mode === 'direct' ? '直接连接' : '系统代理' }}</span></div>
-              <div v-if="isAdmin" class="p-actions"><button class="mini" :disabled="saving" @click="beginEditProfile(p)">编辑</button><button v-if="!p.active" class="mini go" :disabled="saving" @click="activateProfile(p)">启用</button><button class="mini del" :disabled="saving" @click="deleteProfile(p)">删除</button></div>
-            </article>
-          </div>
-          <EmptyState v-else-if="!profileError" title="暂无保存的配置" icon="server" />
-          <div v-if="isAdmin" class="preset-section"><h4>快速添加</h4><div class="add-row"><button v-for="name in ['DeepSeek', 'Kimi', '火山方舟', 'OpenAI']" :key="name" class="add-btn" :disabled="saving" @click="beginAddPreset(name)">{{ name }}</button></div><div class="add-row"><button v-for="name in ['本地 Ollama', '本地 LM Studio', '本地 vLLM']" :key="name" class="add-btn" :disabled="saving" @click="beginAddPreset(name)">{{ name.replace('本地 ', '') }}</button></div></div>
-        </section>
-        <section ref="formSection" class="panel connection-panel">
-          <div class="section-head"><h3>{{ showProfileForm ? (editingPid ? '编辑配置' : '添加配置') : '当前配置' }}</h3><span class="section-note">{{ isAdmin ? '一个配置 · 一个模型' : '只读 · 仅管理员可修改' }}</span></div>
-          <form class="form" novalidate @submit.prevent="submit">
-            <fieldset :disabled="saving || !isAdmin" class="form-fields">
-              <div v-if="showProfileForm" class="field"><label for="profile-name">配置名称</label><input id="profile-name" v-model="editingName" name="code-agent-profile-name" autocomplete="off" :disabled="adding === 'preset'" placeholder="例如：本地开发" /></div>
-              <div class="autofill-decoy" aria-hidden="true"><input type="text" name="decoy-username" autocomplete="username" tabindex="-1" /><input type="password" name="decoy-password" autocomplete="current-password" tabindex="-1" /></div>
-              <div class="field"><label for="model-provider">服务提供方</label><select id="model-provider" v-model="form.provider"><option v-for="p in PROVIDERS" :key="p.value" :value="p.value">{{ p.label }}</option></select></div>
-              <div class="field"><label for="provider-base-url">服务地址 <span>Base URL</span></label><input id="provider-base-url" v-model="form.base_url" name="code-agent-base-url" autocomplete="off" autocapitalize="off" spellcheck="false" :placeholder="BASE_URL_HINT[form.provider] || '默认地址'" /></div>
-              <div class="field"><label for="provider-api-key">API Key <span v-if="storedKey" class="key-status">已配置</span></label><input id="provider-api-key" v-model="form.api_key" type="password" name="code-agent-api-key" autocomplete="new-password" :placeholder="formLocal ? '本地服务可留空' : storedKey ? '留空保留已有密钥' : '输入服务密钥'" /></div>
-              <div class="model-section">
-                <div class="field"><label for="default-model">模型 <span>Model ID</span></label><div class="model-row"><input id="default-model" v-model="form.model_default" list="available-models" name="code-agent-model-default" autocomplete="off" spellcheck="false" placeholder="输入或选择一个模型" /><button class="mini" type="button" :disabled="probing || form.provider === 'offline'" @click="probeModels"><UiIcon name="refresh" :size="14" />{{ probing ? '获取中…' : '获取模型' }}</button></div><datalist id="available-models"><option v-for="m in modelOptions" :key="m" :value="m" /></datalist><p v-if="probeError" class="err" role="alert">{{ probeError }}</p><p v-else-if="probed.length" class="hint" role="status">已获取 {{ probed.length }} 个模型，可在输入框中选择</p></div>
-                <div class="capacity-grid">
-                  <div class="field"><label for="context-window">上下文窗口 <span>Token</span></label><input id="context-window" v-model="form.context_window" name="context_window" type="text" inputmode="numeric" autocomplete="off" placeholder="自动" aria-describedby="capacity-hint" /></div>
-                  <div class="field"><label for="max-output-tokens">最大输出 Token</label><input id="max-output-tokens" v-model="form.max_output_tokens" name="max_output_tokens" type="text" inputmode="numeric" autocomplete="off" placeholder="自动" aria-describedby="capacity-hint" /></div>
-                </div>
-                <p id="capacity-hint" class="hint">留空自动设置，输出上限需小于上下文窗口。</p>
-              </div>
-              <div class="field network-field"><label for="provider-proxy-mode">网络代理</label><select id="provider-proxy-mode" v-model="form.proxy_mode" aria-label="网络代理"><option value="system">跟随系统</option><option value="direct">直接连接</option></select></div>
-            </fieldset>
-            <div v-if="isAdmin" class="actions"><button v-if="showProfileForm" class="ghost" type="button" :disabled="saving" @click="cancelProfileEdit">取消</button><button class="primary" type="submit" :disabled="saving || probing || (!cfg && !showProfileForm)">{{ saving ? '保存中…' : (showProfileForm ? '保存配置' : '保存并生效') }}</button></div>
-          </form>
-        </section>
-      </div>
-
+              <ModelProviders v-if="modelsVisited" ref="modelPanel" :readonly="!isAdmin" :focus-anchor="modelAnchor" :visible="visible !== false && activeSection === 'models' && !searchQuery.trim()" />
             </section>
             <section v-show="activeSection === 'agents'" aria-label="智能体协作设置">
       <section class="panel team-panel" aria-labelledby="agent-team-title">
@@ -663,10 +340,16 @@ onMounted(() => { if (activeSection.value === 'system') checkService() })
               <p class="section-footnote">以上为 Windows 快捷键。编辑器中的常见 Ctrl 组合键在 macOS 上使用 ⌘；运行和调试需要当前文件与运行环境支持。</p>
             </section>
             <section v-show="activeSection === 'system'" aria-label="关于与诊断设置">
+              <div v-if="desktopAvailable" class="setting-group desktop-app-settings">
+                <h3>桌面应用</h3>
+                <p class="hint">工作台和运行环境由应用统一管理，可在这里查看状态、重启服务、读取日志和检查更新。</p>
+                <button type="button" @click="emit('open-desktop')"><UiIcon name="server" :size="15" />应用状态与日志</button>
+              </div>
               <div id="service-status" class="setting-group"><h3>服务连接</h3><div class="setting-row"><div><span class="setting-label">后端服务</span><p v-if="serviceError" class="err" role="alert">{{ serviceError }}</p><p v-else>{{ service?.ok ? '服务已连接 · v' + service.version : '尚未检查' }}<span v-if="serviceCheckedAt"> · 最近检查 {{ serviceCheckedAt }}</span></p></div><button :disabled="serviceLoading" @click="checkService"><UiIcon name="refresh" :size="14" />{{ serviceLoading ? '检查中…' : '检查连接' }}</button></div></div>
               <div id="settings-storage" class="setting-group"><h3>设置与数据</h3><div class="setting-row"><div><span class="setting-label">此浏览器的偏好</span><p>主题、输入方式与编辑器显示自动保存。清除浏览器站点数据后，这些偏好会恢复默认。</p></div><span class="subtle-badge">本地存储</span></div><div class="setting-row"><div><span class="setting-label">模型与服务配置</span><p>模型档案、密钥、权限和团队参数由后端保存。页面不会回填已保存的 API 密钥。</p></div><span class="subtle-badge">服务端</span></div></div>
               <div class="diagnostic-links"><button @click="selectSection('usage', 'usage-settings')"><UiIcon name="usage" :size="16" />查看模型用量</button><button v-if="isAdmin" @click="selectSection('audit', 'audit-settings')"><UiIcon name="audit" :size="16" />查看执行审计</button></div>
             </section>
+            </div>
           </div>
         </div>
       </section>
@@ -734,6 +417,13 @@ button { display: inline-flex; align-items: center; justify-content: center; gap
 .category-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 29px; }
 .category-heading h2 { margin: 0; font-size: 21px; font-weight: 600; letter-spacing: -.3px; }
 .category-heading p { margin: 7px 0 0; color: var(--muted); font-size: 12px; line-height: 1.7; }
+.category-heading.has-subsections { margin-bottom: 18px; }
+.settings-subsections { display: flex; gap: 4px; margin-bottom: 24px; border-bottom: 1px solid var(--border); overflow-x: auto; }
+.settings-subsections button { flex: none; min-height: 38px; padding: 0 14px 10px; border: 0; border-bottom: 2px solid transparent; border-radius: 0; background: transparent; color: var(--muted); font-size: 12px; }
+.settings-subsections button[aria-selected=true] { border-bottom-color: var(--accent); color: var(--accent); font-weight: 600; }
+.settings-subsections button:hover { color: var(--accent); background: var(--accent-soft); }
+.settings-subsections button:focus-visible { outline: 2px solid var(--accent); outline-offset: -3px; }
+#settings-active-panel { min-width: 0; }
 .scope-label { margin-top: 5px; padding: 3px 8px; border: 1px solid var(--border); border-radius: 5px; font-size: 10px; color: var(--muted); white-space: nowrap; }
 .setting-group { border: 1px solid var(--border); border-radius: 10px; overflow: hidden; margin-bottom: 22px; background: var(--panel); }
 .setting-group > h3 { margin: 0; padding: 13px 20px; background: var(--panel-soft); border-bottom: 1px solid var(--border); color: var(--text-2); font-size: 12px; font-weight: 600; }

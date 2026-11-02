@@ -1,0 +1,21 @@
+{
+  "name": "code-agent-bundled-language-servers",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Pinned, redistributable language servers for the offline desktop payload.",
+  "license": "MIT",
+  "overrides": {
+    "@emmetio/css-parser": "0.4.1"
+  },
+  "dependencies": {
+    "@vue/language-server": "2.2.12",
+    "bash-language-server": "5.8.1",
+    "dockerfile-language-server-nodejs": "0.15.0",
+    "eslint": "9.39.5",
+    "pyright": "1.1.414",
+    "typescript": "5.9.3",
+    "typescript-language-server": "4.3.4",
+    "vscode-langservers-extracted": "4.10.0",
+    "yaml-language-server": "1.24.0"
+  }
+}

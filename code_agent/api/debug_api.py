@@ -99,3 +99,11 @@ def mount_debug_api(app: FastAPI, *, service: ProjectService, runtime: DebugRunt
             return await session(user, project_id, session_id).variables(reference, pause_seq)
         except Exception as exc:
             raise _error(exc) from exc
+
+    @app.post(prefix + "/sessions/{session_id}/evaluate")
+    async def evaluate(project_id: str, session_id: str, body: dict, user: CurrentUser = Depends(get_current_user)):
+        try:
+            current = session(user, project_id, session_id)
+            return await current.evaluate(body.get("expression"), body.get("frame_id"), body.get("pause_seq"), body.get("context", "repl"))
+        except Exception as exc:
+            raise _error(exc) from exc

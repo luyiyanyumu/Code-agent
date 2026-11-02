@@ -2,8 +2,8 @@
 
 三条设计原则：
 
-1. **内置目录不等于内置二进制**。这里只声明"哪种语言该用哪个 server、怎么启动、
-   靠什么文件判断适用"，二进制本身由用户按需安装（内网环境不该被我们偷偷下载）。
+1. **目录声明与工具安装分开**。这里只声明"哪种语言该用哪个 server、怎么启动、
+   靠什么文件判断适用"；桌面安装包通过内置清单提供语言工具及其运行环境。
    没装就如实显示"未安装 + 安装提示"，而不是静默失效。
 2. **自动探测**：只给"项目里真的有这种语言"的 server 提建议（按扩展名与根标记文件），
    避免一个 Python 项目被推荐装 20 个语言服务器。
@@ -52,7 +52,7 @@ _CATALOG: tuple[LspPreset, ...] = (
     ),
     LspPreset(
         "typescript", "TypeScript", "typescript-language-server", ("--stdio",),
-        ("typescript", "javascript", "json"),
+        ("typescript", "javascript"),
         ("tsconfig.json", "jsconfig.json", "package.json"),
         "npm i -g typescript-language-server typescript",
     ),
@@ -107,7 +107,7 @@ _CATALOG: tuple[LspPreset, ...] = (
     ),
     LspPreset(
         "jdtls", "Eclipse JDT (Java)", "jdtls", (), ("java",), ("pom.xml", "build.gradle", "*.java"),
-        "解压 eclipse.jdt.ls 的里程碑包（需要 Java 21+），或 brew install jdtls",
+        "桌面版内置 Java 21 与 Eclipse JDT；可更新或修复安装。源码运行时请安装 Java 21+，并配置 JDT LS 的启动路径。",
     ),
     LspPreset(
         "csharp", "C#", "csharp-ls", (), ("csharp",), ("*.csproj", "*.sln"),
@@ -259,7 +259,10 @@ def merged_servers(config: dict[str, dict[str, Any]] | None = None) -> list[dict
     用户配置以 id 为键：既能覆盖内置（换命令/加参数/关掉），也能新增自定义 server
     （`command` 必填）。
     """
+    from code_agent.codeintel.bundled_lsp import launches, merge_options
+
     config = config or {}
+    packaged = launches()
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in _CATALOG:
@@ -277,7 +280,30 @@ def merged_servers(config: dict[str, dict[str, Any]] | None = None) -> list[dict
             "enabled": bool(override.get("enabled", True)),
             "builtin": True,
         }
+        bundle = packaged.get(item.id) if item.id != "jdtls" and not override.get("command") else None
+        if bundle is not None:
+            entry.update({
+                "command": bundle["command"],
+                "args": list(override["args"]) if "args" in override else list(bundle["args"]),
+                "env": {**bundle["env"], **(override.get("env") or {})},
+                "initialization_options": merge_options(bundle["initialization_options"],
+                                                         override.get("initializationOptions") or item.initialization_options),
+                "source": "bundled",
+                "version": bundle["version"],
+                "install_hint": "桌面版已内置此语言分析服务和运行环境；文件缺失时可更新或修复安装。",
+            })
+            if bundle.get("name") and not override.get("name"):
+                entry["name"] = bundle["name"]
         if item.id == "jdtls":
+            from code_agent.codeintel.bundled_java import default_launch, has_explicit_java
+
+            # A configured launcher belongs to the user. Only replace our
+            # default; detection and actual process startup consume this entry.
+            tools = default_launch() if not override.get("command") else None
+            if tools is not None:
+                entry["command"] = tools["command"]
+                if not has_explicit_java(entry["args"], entry["env"]):
+                    entry["args"] += ["--java-executable", tools["java"]]
             # Paths remain user-owned; launch preparation never rewrites lsp.json.
             entry.update({
                 "lombok_jar": override.get("lombokJar"),
@@ -353,6 +379,7 @@ def detect(
                     else "installed" if resolved
                     else "missing"
                 ),
+                **({"source": "bundled", "version": entry["version"]} if entry.get("source") == "bundled" else {}),
             }
         )
     return out

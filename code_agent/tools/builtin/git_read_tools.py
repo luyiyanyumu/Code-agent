@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import re
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -90,6 +91,7 @@ async def _run_git(
         executable, *_CONFIG, *args, cwd=str(root), env=env,
         stdin=asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
     )
     output = bytearray()
     truncated = False

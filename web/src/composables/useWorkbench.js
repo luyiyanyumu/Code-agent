@@ -64,7 +64,7 @@ export function useWorkbench(options = {}) {
     return reactive({
       key: documentKey(pid, treeId, path), projectId: pid, tree: treeId, path,
       file: { ...file, path }, text, savedText: text, sha1: file.sha1 || '',
-      dirty: false, viewState: null, selection: null, conflict: null, needsReload: false,
+      dirty: false, viewState: null, selection: null, conflict: null, needsReload: false, readError: '', saveError: '',
     })
   }
 
@@ -77,6 +77,7 @@ export function useWorkbench(options = {}) {
     document.dirty = false
     document.conflict = null
     document.needsReload = false
+    document.readError = document.saveError = ''
   }
 
   function activateProject(pid, treeId = 'main') {
@@ -148,6 +149,7 @@ export function useWorkbench(options = {}) {
     document.dirty = document.text !== submitted
     document.conflict = null
     document.needsReload = false
+    document.readError = document.saveError = ''
     schedule()
     return document
   }
@@ -167,7 +169,12 @@ export function useWorkbench(options = {}) {
       document.dirty = document.text !== diskText
       document.conflict = null
       document.needsReload = false
+      document.readError = ''
     } else {
+      // A successful reread proves existence even when its disk contents now
+      // conflict with the draft. Keep the draft and its original save baseline.
+      document.file = { ...file, path: document.path }
+      document.readError = ''
       document.conflict = {
         kind: 'external', expectedSha1: document.sha1,
         actualSha1: file.sha1 || '', file: { ...file, path: document.path },
@@ -175,6 +182,23 @@ export function useWorkbench(options = {}) {
       document.needsReload = false
     }
     schedule()
+    return document
+  }
+
+  function markReadError(key, message, { missing = false } = {}) {
+    const document = registry.get(key)
+    if (!document) return null
+    document.file = { ...document.file, missing: !!missing }
+    document.readError = String(message || '文件读取失败，请重新读取。')
+    document.needsReload = true
+    schedule()
+    return document
+  }
+
+  function markSaveError(key, message = '文件保存失败，草稿已保留。') {
+    const document = registry.get(key)
+    if (!document) return null
+    document.saveError = String(message ?? '')
     return document
   }
 
@@ -277,5 +301,5 @@ export function useWorkbench(options = {}) {
 
   restore()
   return { documents, activeKey, activeDocument, allDirty, hasUnsaved, storageError,
-    activateProject, openFile, activate, update, markSaved, updateExternal, close, flush, dispose }
+    activateProject, openFile, activate, update, markSaved, updateExternal, markReadError, markSaveError, close, flush, dispose }
 }

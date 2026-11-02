@@ -207,7 +207,7 @@ def _existing_agent(args: list[str], env: dict[str, Any]) -> bool:
             if "lombok" in path.lower() or _lombok_jar(Path(path)) or _lombok_jar(Path(path.split("=", 1)[0])):
                 return True
     # Environment values are inspected only for agent presence, never returned/logged.
-    for key in ("JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS"):
+    for key in ("JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS"):
         value = str(env.get(key) or "")
         for match in re.finditer(r'''(?:^|\s)-javaagent:(?:"([^"]+)"|'([^']+)'|([^\s]+))''', value):
             path = next(part for part in match.groups() if part is not None)
@@ -270,16 +270,45 @@ def _workspace_args(args: list[str], project: dict, tree: str, entry: dict, data
     return result, {"isolated": True, "source": "configured-root" if explicit else "default", "path": str(workspace)}
 
 
+def _configuration_args(args: list[str], workspace: dict, project: dict, tree: str,
+                        entry: dict, command: str, data_root: Path, tools: dict | None) -> tuple[list[str], dict | None]:
+    """Keep writable OSGi state outside the app while preserving user choices."""
+    if not tools or Path(command).resolve() != Path(tools["command"]).resolve():
+        return args, None
+    explicit = any(arg == "-configuration" or arg.startswith("-configuration=")
+                   or arg.removeprefix("--jvm-arg=").startswith("-Dosgi.configuration.area=") for arg in args)
+    environment = entry.get("env") or {}
+    explicit |= any(re.search(r'''(?:^|\s)["']?-Dosgi\.configuration\.area=''',
+                              str(environment.get(key, os.environ.get(key)) or ""))
+                    for key in ("JAVA_TOOL_OPTIONS", "JDK_JAVA_OPTIONS", "_JAVA_OPTIONS"))
+    if explicit:
+        return args, {"isolated": False, "source": "configured", "reason": "保留用户指定的 OSGi 配置目录或 JVM 配置参数"}
+    # Even an explicit shared -data opt-out must not force OSGi to write into
+    # runtimes/jdtls/configuration. Give it a separate stable per-project home.
+    base = workspace.get("path") or _workspace_args([], project, tree, {}, data_root)[1]["path"]
+    configuration = Path(base) / "configuration"
+    return [*args, "-configuration", str(configuration)], {
+        "isolated": True, "source": "default", "path": str(configuration),
+        "reason": "OSGi 缓存按项目与工作树单独保存，不使用安装包中的默认缓存目录",
+    }
+
+
 def prepare_jdtls_launch(project: dict, tree: str, entry: dict, command: str, *,
                          repository: Path | None = None, data_root: Path | None = None) -> tuple[list[str], dict]:
     """Return argv + safe, explainable environment metadata; never create files."""
     from code_agent.config import agent_home
+    from code_agent.codeintel.bundled_java import bundled_tools
 
     root = Path(project["root_path"]).resolve()
+    data_root = data_root or agent_home() / "lsp-workspaces"
     args, workspace = _workspace_args(list(entry.get("args") or []), project, tree, entry,
-                                       data_root or agent_home() / "lsp-workspaces")
+                                       data_root)
+    tools = bundled_tools()
+    args, configuration = _configuration_args(args, workspace, project, tree, entry, command, data_root, tools)
     state: dict[str, Any] = {"enabled": False, "status": "not-required", "source": "none", "reason": "项目未声明 Lombok"}
     metadata = {"workspace_data": workspace, "lombok": state}
+    if configuration is not None:
+        metadata["configuration_data"] = configuration
     if _existing_agent(args, entry.get("env") or {}) or _existing_agent([], os.environ):
         state.update(enabled=True, status="configured", source="jvm-argument", reason="保留已有 Lombok JVM agent，不重复注入")
         return args, metadata
@@ -308,10 +337,18 @@ def prepare_jdtls_launch(project: dict, tree: str, entry: dict, command: str, *,
             if cache.rejected:
                 state.update(status="unresolved", reason="部分 Maven 配置不可安全读取；可通过 lombokJar 指定本地 jar")
             return args, metadata
-        if len(versions) > 1:
+        # An IDE agent targets the JDT/JDK running analysis, not the project's
+        # compile-time Lombok version. Old projects can keep their POM unchanged.
+        bundled = Path(tools["lombok"]) if tools and tools.get("lombok") else None
+        if bundled is not None and _lombok_jar(bundled):
+            jar = bundled
+            state.update(source="bundled-ide-agent", version=tools.get("lombok_version", ""),
+                         project_versions=sorted(versions), status="ready",
+                         reason="使用适配内置 JDT/Java 的 IDE agent；项目 Lombok 依赖版本保持不变")
+        elif len(versions) > 1:
             state.update(status="unresolved", reason="项目模块声明不同 Lombok 版本；请通过 lombokJar 明确分析使用的版本")
             return args, metadata
-        if versions:
+        elif versions:
             version = next(iter(versions))
             candidate = _coordinate_path(repo, *LOMBOK, version, "jar")
             if candidate and _lombok_jar(candidate):
@@ -332,5 +369,6 @@ def prepare_jdtls_launch(project: dict, tree: str, entry: dict, command: str, *,
     else:
         state.update(status="unsupported-launcher", reason="自定义 launcher 未声明 JVM 参数接口；请自行配置 Lombok JVM agent")
         return args, metadata
-    state.update(enabled=True, status="enabled", path=str(jar), reason="已为 JDTLS 启用本地 Lombok JVM agent")
+    reason = state["reason"] if state["source"] == "bundled-ide-agent" else "已为 JDTLS 启用本地 Lombok JVM agent"
+    state.update(enabled=True, status="enabled", path=str(jar), reason=reason)
     return args, metadata

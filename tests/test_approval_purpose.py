@@ -306,13 +306,22 @@ def test_explanation_cannot_override_hard_policy_denial(workspace):
     assert result.startswith("[permission denied]") and requests == [] and tool.calls == []
 
 
-def test_changing_explanation_does_not_evade_repeated_failure_detection(workspace):
-    loop, _, _ = make_loop(workspace, [], None)
-    loop.breaker.limit = 2
-    loop._note_outcome(action(purpose="第一次目的"), "[permission denied] fixture")
-    loop._note_outcome(action(purpose="第二次目的"), "[permission denied] fixture")
-    assert loop.breaker.tripped
-    assert len(loop.breaker.streaks) == 1
+def test_changing_public_purpose_never_changes_executable_or_policy_arguments(workspace):
+    approvals, audits = [], []
+    async def approve(request):
+        approvals.append(request)
+        return True
+    first, second = action(purpose="第一次目的"), action(purpose="第二次目的")
+    loop, tool, policy = make_loop(workspace, [ModelTurn(tool_calls=[first]), ModelTurn(tool_calls=[second]),
+                                              OfflineProvider.text_turn("done")], approve)
+    loop.on_tool_executed = lambda name, arguments, outcome: audits.append((name, json.loads(arguments), outcome))
+    result = asyncio.run(loop.run("执行两次相同的限定操作"))
+    assert result.stop_reason == "end_turn" and result.turns == 3
+    assert [request.purpose for request in approvals] == ["第一次目的", "第二次目的"]
+    assert all(json.loads(request.command) == {"path": "fixture.txt"} for request in approvals)
+    assert tool.calls == [{"path": "fixture.txt"}, {"path": "fixture.txt"}]
+    assert policy.calls and all(arguments == {"path": "fixture.txt"} for arguments in policy.calls)
+    assert audits == [(tool.name, {"path": "fixture.txt"}, "ok"), (tool.name, {"path": "fixture.txt"}, "ok")]
 
 
 def test_approval_repo_persists_and_recovers_explanation_after_reopen(tmp_path):

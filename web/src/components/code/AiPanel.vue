@@ -2,6 +2,7 @@
 import UiIcon from '../ui/UiIcon.vue'
 import BackgroundAgentTasks from './BackgroundAgentTasks.vue'
 import ConversationTabs from './ConversationTabs.vue'
+import ModelSelector from './ModelSelector.vue'
 import ApprovalRequest from '../ApprovalRequest.vue'
 import QuestionRequest from '../QuestionRequest.vue'
 import ToolExplanation from '../ToolExplanation.vue'
@@ -45,10 +46,13 @@ const props = defineProps({
   conversationLoading: { type: Boolean, default: false },
   conversationError: { type: String, default: '' },
 })
-const emit = defineEmits(['clear-context', 'consume-prompt', 'open-review', 'review-refresh', 'team-refresh', 'agent-stop', 'sent', 'assistant-complete', 'conversation-select', 'conversation-create', 'conversation-delete', 'conversation-refresh'])
+const emit = defineEmits(['clear-context', 'consume-prompt', 'open-review', 'review-refresh', 'team-refresh', 'agent-stop', 'sent', 'assistant-complete', 'conversation-select', 'conversation-create', 'conversation-delete', 'conversation-refresh', 'open-settings'])
 
 const s = useAgentSession()
 const input = ref('')
+const modelSelector = ref(null)
+const modelChangeNotice = ref('')
+watch(() => props.sessionId, () => { modelChangeNotice.value = '' })
 const listEl = ref(null)
 const toolOpen = ref({})
 const includeContext = ref(true)
@@ -297,9 +301,14 @@ function scrollDown(force = false) {
 }
 watch(() => [messages.value.length, s.streaming.value], () => scrollDown())
 
-const canSend = computed(() => !!props.sessionId && !!input.value.trim() && !s.busy.value && !pendingQuestions.value.length && !s.historyLoading.value && !s.historyError.value)
+const canSend = computed(() => !!props.sessionId && !!input.value.trim() && !s.busy.value && !s.webPending?.value && !pendingQuestions.value.length && !s.historyLoading.value && !s.historyError.value)
 
 async function send() {
+  if (input.value.trim() === '/model' && props.sessionId) {
+    input.value = ''
+    await modelSelector.value?.open()
+    return
+  }
   if (!canSend.value) return
   scrollDown(true)
   const text = input.value
@@ -319,15 +328,26 @@ async function send() {
   }
 }
 
-/** 联网开关：后端说不可用（没配检索 key）时点不开，并把原因写在 title 上。 */
+/** 不可用时保留检测入口，原因直接显示在输入区。 */
+const webFeedback = ref(false)
 const webAvailable = computed(() => s.webInfo.value?.available !== false)
 const webTitle = computed(
   () => s.webHint.value + (webAvailable.value ? '' : `（${s.webInfo.value?.how_to || ''}）`)
 )
+const webFeedbackText = computed(() => s.webPending.value ? '正在更新联网设置…' : s.webLoading.value ? '正在重新检测联网能力…'
+  : s.webError.value || (!webAvailable.value ? s.webHint.value : '联网能力已就绪，可开启联网。'))
 async function toggleWeb() {
-  if (!webAvailable.value) return
-  await s.setWeb(!s.web.value)
+  if (s.webPending.value) return
+  webFeedback.value = true
+  if (await s.setWeb(!s.web.value)) webFeedback.value = false
 }
+async function recheckWeb() { if (!s.webPending?.value) await s.refreshWebInfo() }
+function modelSelected() {
+  modelChangeNotice.value = '模型与推理强度已保存，下一次请求生效。'
+  void s.refreshWebInfo()
+}
+watch(() => props.sessionId, () => { webFeedback.value = false })
+watch(() => props.visible, (visible, previous) => { if (visible && previous === false && props.sessionId) void s.refreshWebInfo() })
 
 function toggleTool(id) {
   toolOpen.value = { ...toolOpen.value, [id]: !toolOpen.value[id] }
@@ -341,7 +361,6 @@ const STATE_LABEL = { running: '执行中', ok: '完成', denied: '被拒绝', e
     <div class="ai-meta">
     <div class="head">
       <span class="assistant-icon"><UiIcon name="sparkles" :size="15" /></span><span class="title">{{ projectChat ? '项目对话' : '代码助手' }}</span>
-      <span v-if="s.modelName.value" class="chip">{{ s.modelName.value }}</span>
       <span class="spacer" />
       <span class="dot" :class="s.streamState.value" :title="`WS: ${s.streamState.value}`" />
       <button v-if="s.busy.value" class="ghost danger-text" @click="s.stop()">停止</button>
@@ -457,25 +476,38 @@ const STATE_LABEL = { running: '执行中', ok: '完成', denied: '被拒绝', e
           rows="3"
           aria-label="向代码助手发送消息"
           placeholder="提问或描述想要的修改…"
+          :title="sendHint"
           @keydown="onComposerKeydown"
           @compositionstart="composing = true"
           @compositionend="composing = false"
         />
         <small v-if="draftStorageError" role="status" class="muted">{{ draftStorageError }}</small>
+        <small v-if="modelChangeNotice" role="status" class="muted">{{ modelChangeNotice }}</small>
+        <div v-if="webFeedback || s.webError.value" class="web-feedback" role="status" aria-live="polite">
+          <span>{{ webFeedbackText }}</span>
+          <div class="web-feedback-actions">
+            <button type="button" class="ghost" :disabled="s.webLoading.value || s.webPending.value" @click="recheckWeb">{{ s.webLoading.value ? '检测中…' : '重新检测' }}</button>
+            <button v-if="!webAvailable" type="button" class="ghost" @click="emit('open-settings', 'models')">模型设置</button>
+            <button type="button" class="ghost" aria-label="收起联网提示" @click="webFeedback = false; s.webError.value = ''">收起</button>
+          </div>
+        </div>
         <div class="send-row">
           <!-- 联网开关（M19）：和"发送"同一行，发消息时随这一轮一起带过去。
-               不可用时（没配检索 key）置灰，title 里写清怎么配。 -->
+               开启前重新检测，只有保存期间禁用；缺配置可就地处理。 -->
           <button
             class="web-toggle"
             :class="{ on: s.web.value, off: !webAvailable }"
-            :disabled="!webAvailable"
+            :disabled="s.webPending.value"
+            role="switch"
+            :aria-checked="s.web.value"
+            :aria-busy="s.webPending.value"
             :title="webTitle"
             @click="toggleWeb"
           >
             <span class="web-dot" />
-            联网{{ s.web.value ? '已开' : '关闭' }}
+            {{ s.webPending.value ? '检测中…' : s.web.value ? '联网已开' : '联网关闭' }}
           </button>
-          <span class="muted tiny">{{ sendHint }}</span>
+          <ModelSelector ref="modelSelector" :session-id="sessionId" :observed-model="s.modelName.value" :visible="visible && !s.approval.value && !pendingQuestions.length" @open-settings="emit('open-settings', $event)" @selected="modelSelected" />
           <span class="spacer" />
           <button class="primary" :disabled="!canSend" @click="send">发送</button>
         </div>
@@ -549,9 +581,11 @@ const STATE_LABEL = { running: '执行中', ok: '完成', denied: '被拒绝', e
 .ctx-label { display: flex; align-items: center; gap: 6px; min-width: 0; }.ctx-label span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.ctx-label input { flex: none; }.ctx-sym { font-size: var(--fs-2xs); max-width: 90px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.ctx .ghost { font-size: var(--fs-2xs); flex: none; }
 .composer textarea { width: 100%; min-height: 92px; max-height: 35vh; resize: vertical; padding: 11px 12px; border: 1px solid var(--border-strong); border-radius: 8px; font-size: var(--fs-sm); line-height: 1.7; background: var(--panel); }
 .send-row { display: flex; align-items: center; gap: 7px; margin-top: 9px; }.send-row .spacer { flex: 1; }.send-row .primary { min-height: 30px; padding: 5px 13px; font-size: var(--fs-xs); }
-.web-toggle { display: inline-flex; align-items: center; flex: none; gap: 5px; min-height: 27px; font-size: var(--fs-2xs); padding: 3px 7px; border-radius: 5px; border: 1px solid transparent; background: transparent; color: var(--muted); cursor: pointer; }.web-toggle .web-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--border-strong); flex: none; }.web-toggle.on { color: var(--accent); background: var(--accent-soft); }.web-toggle.on .web-dot { background: var(--accent); }.web-toggle.off { cursor: not-allowed; opacity: .6; }.tiny { font-size: var(--fs-2xs); }
+.web-toggle { display: inline-flex; align-items: center; flex: none; gap: 5px; min-height: 27px; font-size: var(--fs-2xs); padding: 3px 7px; border-radius: 5px; border: 1px solid transparent; background: transparent; color: var(--muted); cursor: pointer; }.web-toggle .web-dot { width: 5px; height: 5px; border-radius: 50%; background: var(--border-strong); flex: none; }.web-toggle.on { color: var(--accent); background: var(--accent-soft); }.web-toggle.on .web-dot { background: var(--accent); }.web-toggle.off { cursor: pointer; }.web-toggle:disabled { cursor: wait; opacity: .6; }.web-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }.tiny { font-size: var(--fs-2xs); }
 @media (max-width: 1400px) and (min-width: 1101px) { .send-row .tiny { display: none; }.connection-status { gap: 7px; } }
 @media (max-width: 440px) { .send-row .tiny { display: none; }.list { padding: 14px; }.composer { padding: 10px; }.head { padding: 7px 12px; }.connection-status { padding-left: 12px; padding-right: 12px; gap: 8px; }.ctx-sym { display: none; } }
 @media (max-height: 600px) { .has-approval .list { display: none; }.has-approval .conversation-body { padding: 6px; } }
+.web-feedback { display: grid; gap: 5px; min-width: 0; border: 1px solid var(--border); border-radius: 6px; background: var(--panel-soft); padding: 8px 10px; color: var(--muted); font-size: var(--fs-2xs); line-height: 1.6; overflow-wrap: anywhere; }
+.web-feedback-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; }.web-feedback-actions button { min-height: 28px; padding: 3px 6px; color: var(--accent); }.web-feedback-actions button:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 @media (prefers-reduced-motion: reduce) { .caret { transition: none; } }
 </style>

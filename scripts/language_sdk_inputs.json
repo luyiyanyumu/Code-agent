@@ -1,0 +1,96 @@
+{
+  "schemaVersion": 1,
+  "versions": {
+    "go": "1.27.0",
+    "gopls": "0.23.0",
+    "rust": "1.98.1",
+    "dotnet": "10.0.401",
+    "csharp-ls": "0.28.0"
+  },
+  "sources": {
+    "go": "https://go.dev/dl/",
+    "dotnet": "https://builds.dotnet.microsoft.com/dotnet/release-metadata/10.0/releases.json",
+    "rust": "https://static.rust-lang.org/dist/channel-rust-1.98.1.toml",
+    "rustManifestSha256": "a7c8774a5fd8441c997d94c029776cbc5eb111e9d72ab5d256fa69866644347e",
+    "csharp-ls": "https://api.nuget.org/v3-flatcontainer/csharp-ls/0.28.0/csharp-ls.0.28.0.nupkg"
+  },
+  "inputs": [
+    {
+      "id": "go",
+      "file": "go1.27.0.windows-amd64.zip",
+      "url": "https://go.dev/dl/go1.27.0.windows-amd64.zip",
+      "sha256": "f0c0a0d33ba94f4d2c5dbc887334ce678b21813504ddb3aafcb06e60a5a667c4",
+      "mirrors": [
+        "https://mirrors.nju.edu.cn/golang/go1.27.0.windows-amd64.zip"
+      ]
+    },
+    {
+      "id": "dotnet",
+      "file": "dotnet-sdk-10.0.401-win-x64.zip",
+      "url": "https://builds.dotnet.microsoft.com/dotnet/Sdk/10.0.401/dotnet-sdk-10.0.401-win-x64.zip",
+      "sha512": "24b670ad3d923bfcf47df6c3b034152398b42f6dbc388e10d783aee1cfb5e5817d399fc0ae2a12cfa822a55e61d34830ccb15c50ef6efee437ab874bb7c79430"
+    },
+    {
+      "id": "csharp",
+      "file": "csharp-ls.0.28.0.nupkg",
+      "url": "https://api.nuget.org/v3-flatcontainer/csharp-ls/0.28.0/csharp-ls.0.28.0.nupkg",
+      "sha256": "8f815e4f22674106a8244beba07e4b4b062e31528e404aa8489312effb8c0e0c"
+    },
+    {
+      "id": "rustc",
+      "component": "rustc",
+      "file": "rustc-1.98.1-x86_64-pc-windows-msvc.tar.xz",
+      "url": "https://static.rust-lang.org/dist/2026-09-03/rustc-1.98.1-x86_64-pc-windows-msvc.tar.xz",
+      "sha256": "cb5370843a9d15ce6e6cf6461b4c997722220d268d0d813c2b2b86f3ed59ac24",
+      "mirrors": [
+        "https://rsproxy.cn/dist/2026-09-03/rustc-1.98.1-x86_64-pc-windows-msvc.tar.xz"
+      ]
+    },
+    {
+      "id": "cargo",
+      "component": "cargo",
+      "file": "cargo-1.98.1-x86_64-pc-windows-msvc.tar.xz",
+      "url": "https://static.rust-lang.org/dist/2026-09-03/cargo-1.98.1-x86_64-pc-windows-msvc.tar.xz",
+      "sha256": "d6e8c738a0503b16b04db3838a38769620d553e436f632d2ebf667f793b2d44d",
+      "mirrors": [
+        "https://rsproxy.cn/dist/2026-09-03/cargo-1.98.1-x86_64-pc-windows-msvc.tar.xz"
+      ]
+    },
+    {
+      "id": "rust-std",
+      "component": "rust-std-x86_64-pc-windows-msvc",
+      "file": "rust-std-1.98.1-x86_64-pc-windows-msvc.tar.xz",
+      "url": "https://static.rust-lang.org/dist/2026-09-03/rust-std-1.98.1-x86_64-pc-windows-msvc.tar.xz",
+      "sha256": "42727764a01a54db7423e43db08a9c818405679af6a9a677068e8cd4b8361242",
+      "mirrors": [
+        "https://rsproxy.cn/dist/2026-09-03/rust-std-1.98.1-x86_64-pc-windows-msvc.tar.xz"
+      ]
+    },
+    {
+      "id": "rust-analyzer",
+      "component": "rust-analyzer-preview",
+      "file": "rust-analyzer-1.98.1-x86_64-pc-windows-msvc.tar.xz",
+      "url": "https://static.rust-lang.org/dist/2026-09-03/rust-analyzer-1.98.1-x86_64-pc-windows-msvc.tar.xz",
+      "sha256": "ed342d98a7dc30f5bd931f435d22e32f7fab8e73c0648ac71fb2bcb0d3f2039c",
+      "mirrors": [
+        "https://rsproxy.cn/dist/2026-09-03/rust-analyzer-1.98.1-x86_64-pc-windows-msvc.tar.xz"
+      ]
+    },
+    {
+      "id": "rust-src",
+      "component": "rust-src",
+      "file": "rust-src-1.98.1.tar.xz",
+      "url": "https://static.rust-lang.org/dist/2026-09-03/rust-src-1.98.1.tar.xz",
+      "sha256": "5c846ebcebcc7e2e0777a4cdaa12051691593f16a7e94edbae5e6241cc62d98c",
+      "mirrors": [
+        "https://rsproxy.cn/dist/2026-09-03/rust-src-1.98.1.tar.xz"
+      ]
+    }
+  ],
+  "goplsBuild": {
+    "module": "golang.org/x/tools/gopls",
+    "version": "v0.23.0",
+    "moduleSum": "h1:Dn6mf9WXu9iLnTftDDMb9wV0c6Se7PjzEMqP0LEe08Y=",
+    "source": "https://proxy.golang.org/golang.org/x/tools/gopls/@v/v0.23.0.zip"
+  }
+}

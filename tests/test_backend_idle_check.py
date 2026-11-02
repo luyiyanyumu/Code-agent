@@ -6,6 +6,7 @@ import importlib.util
 import json
 from pathlib import Path
 import sqlite3
+import ssl
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -259,6 +260,8 @@ def test_http_client_get_only_json_status_and_no_redirect_or_proxy(monkeypatch):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     monkeypatch.setenv("http_proxy", "http://127.0.0.1:1")
+    monkeypatch.setenv("no_proxy", "")
+    monkeypatch.setenv("NO_PROXY", "")
     try:
         get = guard.InspectionClient(f"http://127.0.0.1:{server.server_port}")
         assert get("/ok") == {"busy": False}
@@ -268,6 +271,69 @@ def test_http_client_get_only_json_status_and_no_redirect_or_proxy(monkeypatch):
             assert error.value.http_status == status
             assert "private" not in str(error.value)
         assert seen == [("GET", "/ok"), ("GET", "/redirect"), ("GET", "/quota")]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+
+
+def test_http_opener_never_initializes_tls_and_reuses_only_within_each_thread(monkeypatch):
+    def forbidden_tls():
+        pytest.fail("Local HTTP inspection must not load the Windows TLS trust store")
+    monkeypatch.setattr(guard, "HTTPSHandler", forbidden_tls)
+    get = guard.InspectionClient("http://127.0.0.1:8765")
+    main_opener = get._opener()
+    assert get._opener() is main_opener
+    barrier = threading.Barrier(2)
+    def worker(_):
+        first = get._opener()
+        barrier.wait(timeout=5)
+        return first, get._opener()
+    with guard.ThreadPoolExecutor(max_workers=2) as pool:
+        pairs = list(pool.map(worker, range(2)))
+    assert all(first is second for first, second in pairs)
+    assert pairs[0][0] is not pairs[1][0]
+    assert all(first is not main_opener for first, _ in pairs)
+
+
+def test_https_opener_keeps_default_certificate_and_hostname_validation(monkeypatch):
+    original = guard.HTTPSHandler
+    contexts = []
+    def validated_handler():
+        handler = original()
+        contexts.append(handler._context)
+        return handler
+    monkeypatch.setattr(guard, "HTTPSHandler", validated_handler)
+    get = guard.InspectionClient("https://127.0.0.1:8765")
+    assert get._opener() is get._opener()
+    assert len(contexts) == 1
+    assert contexts[0].verify_mode == ssl.CERT_REQUIRED
+    assert contexts[0].check_hostname is True
+
+
+def test_http_inspection_preserves_body_limit_invalid_json_and_no_tls(monkeypatch):
+    seen = []
+    def forbidden_tls():
+        pytest.fail("HTTP must not initialize HTTPSHandler")
+    monkeypatch.setattr(guard, "HTTPSHandler", forbidden_tls)
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_):
+            pass
+        def do_GET(self):
+            seen.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b" " * (8 * 1024 * 1024 + 1) if self.path == "/large" else b"not-json")
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        get = guard.InspectionClient(f"http://127.0.0.1:{server.server_port}")
+        for path, code in (("/bad", "inspection_invalid_json"), ("/large", "inspection_response_too_large"), ("/bad-again", "inspection_invalid_json")):
+            with pytest.raises(guard.CannotConfirm) as error:
+                get(path)
+            assert error.value.code == code
+        assert seen == ["/bad", "/large", "/bad-again"]
     finally:
         server.shutdown()
         server.server_close()

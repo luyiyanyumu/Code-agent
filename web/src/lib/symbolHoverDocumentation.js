@@ -5,23 +5,100 @@ import { hoverMarkdownStrings, normalizeHoverDocumentation } from './hoverDocume
 
 const parser = new Marked({ gfm: true, async: false })
 const languages = { python: 'Python', javascript: 'JavaScript', typescript: 'TypeScript', go: 'Go', rust: 'Rust', c: 'C', cpp: 'C++', csharp: 'C#', java: 'Java', vue: 'Vue', ruby: 'Ruby', php: 'PHP', kotlin: 'Kotlin', swift: 'Swift' }
-const categories = { namespace: '命名空间', type: '类型', class: '类', enum: '枚举', interface: '接口', struct: '结构体', typeParameter: '类型参数', parameter: '参数', variable: '变量', property: '属性', enumMember: '枚举成员', event: '事件', function: '函数', method: '方法', macro: '宏', decorator: '装饰器', keyword: '关键字', comment: '注释', string: '字符串', number: '数值', operator: '运算符' }
+const categories = { namespace: '命名空间', type: '类型', class: '类', enum: '枚举', interface: '接口', struct: '结构体', typeParameter: '类型参数', parameter: '参数', variable: '变量', field: '成员变量', property: '属性', enumMember: '枚举常量', event: '事件', function: '函数', method: '方法', macro: '宏', decorator: '装饰器', keyword: '关键字', comment: '注释', string: '字符串', number: '数值', operator: '运算符' }
 const modifiers = { declaration: '声明位置', definition: '定义位置', readonly: '只读', static: '静态', deprecated: '已弃用', abstract: '抽象', async: '异步', modification: '修改位置', documentation: '文档', defaultLibrary: '标准库' }
 const literal = value => String(value).replace(/&/g, '&amp;').replace(/[\\`*_{}\[\]()#+\-.!<>|~=:]/g, character => `&#${character.codePointAt(0)};`)
+
+function semanticCategoryOf(token) {
+  const category = categories[token?.type]
+  if (!['variable', 'field', 'property'].includes(token?.type)) return category
+  // These modifiers do not establish a language's const semantics or whether a
+  // variable is local. Keep the service's distinction between fields/properties.
+  const flags = Array.isArray(token.modifiers) ? token.modifiers : []
+  const base = flags.includes('static') ? token.type === 'property' ? '静态属性' : '静态变量' : category
+  return flags.includes('readonly') ? `只读${base}` : base
+}
 
 export function documentationTranslationState(value) {
   if (!value || typeof value !== 'object') return null
   if (value.status === 'pending') return 'pending'
   if (value.status === 'failed') return 'failed'
+  if (value.status === 'untranslated') return 'untranslated'
   return value.language === 'zh-CN' && value.source === 'configured-model' && (!value.status || value.status === 'ready') ? 'ready' : null
 }
 
-export function documentationTranslationNote(value) {
+const translationErrors = {
+  provider_unavailable: '请在模型设置中配置可用模型后重试。',
+  queue_full: '翻译队列繁忙，请稍后重试。',
+  timeout: '翻译超时，请重试。',
+  invalid_response: '翻译结果未通过校验，请重试。',
+  provider_error: '翻译请求未成功，请重试。',
+  input_too_large: '说明内容过长，暂时无法翻译。',
+  request_failed: '连接中断，请重试。',
+}
+export function documentationTranslationPresentation(document, { missing = false } = {}) {
+  const metadata = document?.documentation_translation
+  const supplied = documentationTranslationState(metadata)
+  let status = metadata?.required === false ? null
+    : supplied === 'ready' && missing ? 'untranslated' : supplied || (missing ? 'untranslated' : null)
+  const detached = document?.detached && ['pending', 'failed', 'untranslated'].includes(status)
+  if (detached) status = 'untranslated'
+  const label = ({ untranslated: '未翻译', pending: '翻译中', failed: '翻译失败', ready: '已翻译' })[status] || ''
+  const message = detached ? '文件已切换或修改，请重新打开该符号的说明以更新翻译。'
+    : status === 'pending' ? '正在翻译中文说明，完成后自动更新。'
+    : status === 'failed' ? translationErrors[metadata?.error_code] || '中文说明翻译失败，可重试或查看原文。'
+      : status === 'untranslated' ? '这段说明尚未翻译。' : ''
+  return { status, label, message,
+    canRetry: !detached && ['untranslated', 'failed'].includes(status) && metadata?.retryable !== false,
+    action: status === 'failed' ? '重试翻译' : '翻译为中文' }
+}
+
+export function documentationTranslationNote(value, { untranslated = false } = {}) {
   const state = documentationTranslationState(value)
-  const text = state === 'ready' ? '**文档中文翻译：** 模型翻译，签名、类型与代码保持原文。'
-    : state === 'pending' ? '**文档中文翻译：** 正在准备中文说明，完成后更新。'
-      : state === 'failed' ? '**文档中文翻译：** 暂未完成，当前保留语言服务原文。' : ''
+  const presentation = documentationTranslationPresentation({ documentation_translation: value }, { missing: untranslated })
+  const text = state === 'ready' && !untranslated ? '**文档中文翻译：** 模型翻译，签名、类型与代码保持原文。'
+    : presentation.message ? `**中文说明：** ${presentation.message}` : ''
   return text ? [{ kind: 'markdown', value: text }] : []
+}
+
+const hasChinese = value => /\p{Script=Han}/u.test(value)
+
+// Chinese is the default reading view, not a claim that unavailable prose has
+// been translated. Keep original server receipts separately for an opt-in view.
+// Code examples/signatures are always retained, including English identifiers.
+export function chineseDocumentationProjection(serverResult, language = '') {
+  const original = normalizeHoverDocumentation(serverResult?.contents)
+  let untranslated = false
+  const sections = original.flatMap(section => {
+    if (section.kind === 'code') return [section]
+    if (section.kind === 'plaintext') {
+      if (hasChinese(section.value) || !/[a-z]/i.test(section.value)) return [section]
+      untranslated = true
+      return []
+    }
+    const signature = signatureFacts([section], language)
+    const blocks = parser.lexer(section.value)
+    let omitted = false
+    const kept = blocks.map(block => {
+      const raw = block.raw || ''
+      if (block.type === 'space' || block.type === 'code' || hasChinese(raw) || !/[a-z]/i.test(raw)) return raw
+      if (signature.text && block.type === 'paragraph' && textOf(block.tokens).trim() === signature.text) return raw
+      // These are provenance labels, not prose translations. Preserve literal
+      // package/file names while presenting the established labels in Chinese.
+      const source = /^(\s*)(Source|Defined in|Since|Author|Version)\s*:\s*/i.exec(raw)
+      if (source) {
+        const label = { source: '来源', 'defined in': '定义位置', since: '起始版本', author: '作者', version: '版本' }[source[2].toLowerCase()]
+        return raw.replace(source[0], `${source[1]}${label}：`)
+      }
+      omitted = untranslated = true
+      return ''
+    }).join('').trim()
+    if (!omitted && kept === section.value.trim()) return [section]
+    return kept ? [{ ...section, value: kept }] : []
+  })
+  const restored = normalizeHoverDocumentation(serverResult?._code_agent_original?.contents)
+  const originalSections = restored.length ? restored : JSON.stringify(sections) !== JSON.stringify(original) ? original : []
+  return { sections, originalSections, untranslated }
 }
 
 function textOf(tokens) {
@@ -125,7 +202,8 @@ export function describeSymbolHover({ model, position, serverResult, semanticTok
   if (!original.length) return null
   const language = model.getLanguageId?.() || 'plaintext', word = wordAt(model, position)
   const signature = signatureFacts(original, language)
-  const purpose = prose(original, signature), semanticCategory = categories[semanticToken?.type]
+  const projection = chineseDocumentationProjection(serverResult, language)
+  const purpose = prose(projection.sections, signature), semanticCategory = semanticCategoryOf(semanticToken)
   const category = semanticCategory || categories[signature.category]
   const attributes = [...new Set((semanticToken?.modifiers || []).map(name => modifiers[name]).filter(Boolean))]
   const lines = [word ? `**名称：** ${literal(word.word)}` : '', `**语言：** ${literal(languages[language] || language)}`]
@@ -134,12 +212,13 @@ export function describeSymbolHover({ model, position, serverResult, semanticTok
   if (signature.returnType) lines.push(`**返回类型：** ${literal(signature.returnType)}`)
   if (purpose) lines.push(`**作用：** ${literal(purpose)}`, '作用依据：语言服务器文档。')
   const detail = { kind: 'markdown', value: lines.filter(Boolean).join('\n\n') }
-  const sections = [detail, ...documentationTranslationNote(serverResult.documentation_translation), ...original]
+  const sections = [detail, ...documentationTranslationNote(serverResult.documentation_translation, projection),
+    ...(projection.originalSections.length ? [{ kind: 'markdown', value: 'Ctrl+Q 查看完整说明或原文。' }] : []), ...projection.sections]
   const range = serverResult.range?.start && serverResult.range?.end ? {
     startLineNumber: serverResult.range.start.line + 1, startColumn: serverResult.range.start.character + 1,
     endLineNumber: serverResult.range.end.line + 1, endColumn: serverResult.range.end.character + 1,
   } : word ? { startLineNumber: position.lineNumber, startColumn: word.startColumn, endLineNumber: position.lineNumber, endColumn: word.endColumn } : null
-  return { sections, contents: hoverMarkdownStrings(sections), source: '语言服务', ...(range ? { range } : {}),
+  return { sections, symbolSection: detail, untranslated: projection.untranslated, originalSections: projection.originalSections, contents: hoverMarkdownStrings(sections), source: '语言服务', ...(range ? { range } : {}),
     symbol: { ...(word ? { name: word.word } : {}), language, ...(category ? { category } : {}), ...(semanticCategory ? { semanticType: semanticToken.type } : {}), ...(signature.returnType ? { returnType: signature.returnType } : {}), ...(attributes.length ? { attributes } : {}), ...(purpose ? { purpose } : {}) },
     ...(serverResult.documentation_translation && typeof serverResult.documentation_translation === 'object'
       ? { documentation_translation: { ...serverResult.documentation_translation } } : {}),

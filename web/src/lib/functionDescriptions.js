@@ -27,6 +27,11 @@ export function functionDescriptionPresentation(job, { loading = false, error = 
     job.error, job.note].filter(Boolean).join('；')
   if (job.state === 'queued') return { label: '功能描述自动检查中…', title: details, tone: 'running' }
   if (job.running || job.state === 'running') return { label: `自动补功能描述：本轮 ${done}/${total}`, title: details, tone: 'running' }
+  const configurationBlocked = job.action === 'configure_model' || ['model_not_configured', 'model_authentication_failed'].includes(job.block_reason)
+    || /(?:[A-Z_]*API_KEY|api_key)\s*未配置/.test(job.error || '')
+  if (configurationBlocked) return { label: `功能描述等待模型配置${job.coverage_known ? ` · 待补 ${missing}` : ''}`,
+    title: details, tone: 'missing', action: 'configure_model',
+    summary: job.block_reason === 'model_authentication_failed' ? '模型连接验证未通过，请检查模型与连接设置。' : '配置可用模型后继续，结构图仍可正常浏览。' }
   if (job.state === 'error' || failed || job.error) return { label: `功能描述${failed ? `失败 ${failed} 条` : '补全失败'}${job.coverage_known ? ` · 待补 ${missing}` : ''}`, title: details, tone: 'error' }
   if (job.state === 'waiting') return { label: `功能描述等待补全${job.coverage_known ? ` · 待补 ${missing}` : ''}`, title: details, tone: 'missing' }
   if (!job.coverage_known) return { label: '功能描述待检查', title: details || '索引准备完成后自动检查功能描述。', tone: 'unknown' }

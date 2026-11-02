@@ -36,6 +36,13 @@ from code_agent.codeintel.vcs import RepoInfo, git_available, probe_repo
 from code_agent.config import projects_root
 from code_agent.storage.db import ProjectRepo
 
+
+class ProjectFileNotFoundError(P.ProjectPathError):
+    """An explicitly requested project file does not exist on disk."""
+
+    code = "PROJECT_FILE_NOT_FOUND"
+
+
 #: 单文件读取上限（不带行区间时）。超过就要求带 start/end，避免把 5MB 日志糊给前端
 MAX_FILE_BYTES = 512 * 1024
 #: 编辑器可用上限：超过这个体积在浏览器里编辑会明显掉帧，改为只读 + 提示
@@ -736,10 +743,14 @@ class ProjectService:
         if not rel_norm:
             raise P.ProjectPathError("缺少 path 参数")
         target = P.safe_child(root, rel_norm)
-        if not target.is_file():
-            raise P.ProjectPathError(f"文件不存在：{rel_norm}")
+        try:
+            info = target.stat()
+        except FileNotFoundError:
+            raise ProjectFileNotFoundError(f"文件不存在：{rel_norm}") from None
+        if not stat.S_ISREG(info.st_mode):
+            raise P.ProjectPathError(f"不是普通文件：{rel_norm}")
 
-        size = target.stat().st_size
+        size = info.st_size
         with target.open("rb") as stream:
             head = stream.read(8192)
         if P.is_probably_binary(head):

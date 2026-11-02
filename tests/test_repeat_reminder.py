@@ -1,7 +1,6 @@
 """重复调用提醒（M47，对齐 DSH 的 `dsh-repeat-tool-reminder`）。
 
-它与熔断器**互补**，所以这个文件里有两条断言是专门用来钉住"两者不会互相吃掉"的：
-提醒管"成功但没用的重复"，熔断器管"失败重复并终止"。
+前九项保留旧提醒工具的独立纯函数契约；官方核心集成项验证它不会被隐式安装。
 最关键的语义是 **成功不清零**——照抄熔断器的"成功即清零"会让提醒永远不触发。
 """
 
@@ -135,7 +134,7 @@ def _loop(workspace, home, script):
     )
 
 
-def test_loop_appends_the_reminder_to_the_third_identical_call(tmp_path) -> None:
+def test_official_loop_does_not_implicitly_append_legacy_reminders(tmp_path) -> None:
     workspace = tmp_path / "ws"
     workspace.mkdir()
     (workspace / "a.txt").write_text("hello\n", encoding="utf-8")
@@ -158,14 +157,13 @@ def test_loop_appends_the_reminder_to_the_third_identical_call(tmp_path) -> None
     assert len(results) == 3
     assert "[提示]" not in results[0].payload["result"]
     assert "[提示]" not in results[1].payload["result"]
-    assert "[提示]" in results[2].payload["result"], "第三次必须带上提醒"
+    assert "[提示]" not in results[2].payload["result"]
 
     notes = [
         e for e in loop.transcript.replay(loop.session_id)
         if e.type.value == "error" and e.payload.get("code") == "repeat_tool_reminder"
     ]
-    assert len(notes) == 1, "提醒要单独落一条事件（工具结果会被截到 2000 字）"
-    assert notes[0].payload["quiet"] is True
+    assert notes == []
 
 
 class _BoomTool(Tool):
@@ -177,8 +175,8 @@ class _BoomTool(Tool):
         raise ToolError("总是失败")
 
 
-def test_reminder_does_not_break_the_failure_breaker(tmp_path) -> None:
-    """两个机制共存：提醒追加在结果**之后**，所以熔断器的失败前缀判定不受影响。"""
+def test_official_loop_uses_explicit_segment_limit_instead_of_legacy_breaker(tmp_path) -> None:
+    """Finite native failures preserve their receipts and stop only at the explicit boundary."""
     workspace = tmp_path / "ws"
     workspace.mkdir()
     reg = ToolRegistry()
@@ -197,15 +195,18 @@ def test_reminder_does_not_break_the_failure_breaker(tmp_path) -> None:
         permissions=pm,
         transcript=TranscriptStore(tmp_path / "transcripts"),
         workspace=workspace,
-        breaker=FailureBreaker(limit=5),
+        breaker=FailureBreaker(limit=2),  # Compatibility input must not install the retired policy.
+        max_turns=6,
     )
     result = asyncio.run(loop.run("一直失败"))
 
-    assert result.stop_reason == "repeated_failure", "熔断器必须照旧工作"
+    assert result.stop_reason == "max_turns" and result.segment_boundary
+    assert result.turns == 6 and not hasattr(loop, "breaker")
     results = [
         e for e in loop.transcript.replay(loop.session_id) if e.type.value == "tool_result"
     ]
-    assert "[提示]" in results[2].payload["result"], "第 3 次应该已经有提醒"
+    assert len(results) == 6
+    assert all("[提示]" not in event.payload["result"] for event in results)
     assert results[2].payload["result"].startswith("[tool error]"), (
-        "提醒追加在末尾，绝不能改变开头的前缀（熔断器按前缀判失败）"
+        "Actual tool failures must retain their error status"
     )

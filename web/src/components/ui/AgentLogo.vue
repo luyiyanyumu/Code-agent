@@ -7,7 +7,7 @@ defineProps({
 
 <template>
   <span class="agent-logo" role="img" aria-label="Code-agent 编码智能体" title="Code-agent · 编码智能体">
-    <img class="agent-logo__mark" src="/brand/code-agent-mark.png" alt="" :width="size" :height="size" draggable="false" />
+    <img class="agent-logo__mark" src="/brand/code-agent-mark.svg" alt="" :width="size" :height="size" draggable="false" />
     <span v-if="wordmark" class="agent-logo__wordmark" aria-hidden="true">Code-agent</span>
   </span>
 </template>

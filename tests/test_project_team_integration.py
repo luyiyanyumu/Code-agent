@@ -23,6 +23,10 @@ from code_agent.tools.base import Tool, ToolContext, ToolError
 @pytest.fixture
 def integration(agent_home, tmp_path, monkeypatch):
     monkeypatch.setenv("CODE_AGENT_CODE_WATCH", "0")
+    # Conversation-copy tests deliberately retain a usable web toggle. Keep
+    # that capability explicit and isolated without invoking any live search.
+    monkeypatch.setenv("CODE_AGENT_SEARCH_API_KEY", "fixture-search-key")
+    monkeypatch.setenv("CODE_AGENT_SEARCH_BASE_URL", "https://api.deepseek.com/anthropic/v1")
     monkeypatch.setattr("code_agent.sessions.manager.MAX_CONSECUTIVE_WAKES", 0)
     async def no_embedding_probe():
         return {"found": False}

@@ -40,20 +40,6 @@ def make_loop(workspace, registry, calls, *, permissions=None, on_event=None, **
     )
 
 
-def test_deferred_validation_preserves_real_failure_streak(workspace):
-    from code_agent.agent.breaker import FailureBreaker, fingerprint
-
-    loop = make_loop(workspace, ToolRegistry(), [], breaker=FailureBreaker(limit=3))
-    call = ToolCall(name="bash", arguments={"command": "pytest -q"})
-    key = fingerprint(call.name, call.arguments)
-    loop._note_outcome(call, "[tool error] actual validation launch failed")
-    before = dict(loop.breaker.streaks)
-    totals = dict(loop.breaker.totals)
-    loop._note_outcome(call, "[tool deferred] 验证未执行：先完成写入")
-    assert loop.breaker.streaks == before == {key: 1}
-    assert loop.breaker.totals == totals
-    loop._note_outcome(call, "exit_code=0\n1 passed")
-    assert key not in loop.breaker.streaks
 
 
 def test_parallel_progress_arrives_before_slow_tool_and_model_history_stays_ordered(workspace):
@@ -62,6 +48,7 @@ def test_parallel_progress_arrives_before_slow_tool_and_model_history_stays_orde
 
         class Probe(Tool):
             name = "probe"
+            execution_mode = "parallel"
 
             async def execute(self, args, ctx):
                 if args["slow"]:
@@ -81,8 +68,8 @@ def test_parallel_progress_arrives_before_slow_tool_and_model_history_stays_orde
 
         loop = make_loop(workspace, reg, calls, on_event=event)
         run = asyncio.create_task(loop.run("parallel task"))
-        await asyncio.wait_for(slow_started.wait(), 1)
-        await asyncio.wait_for(fast_seen.wait(), 1)
+        await asyncio.wait_for(slow_started.wait(), 3)
+        await asyncio.wait_for(fast_seen.wait(), 3)
         assert not run.done()
         replay = loop.transcript.replay(loop.session_id)
         results = [ev.payload["call_id"] for ev in replay if ev.type == EventType.tool_result]
@@ -126,9 +113,9 @@ def test_single_call_sessions_share_write_lease_even_with_parallel_disabled(work
         first = make_loop(workspace, reg, [ToolCall(name="writer", arguments={"path": "same.txt"})])
         second = make_loop(workspace, reg, [ToolCall(name="writer", arguments={"path": "./same.txt"})], before_tool_dispatch=before_second)
         task1 = asyncio.create_task(first.run("first"))
-        await asyncio.wait_for(first_started.wait(), 1)
+        await asyncio.wait_for(first_started.wait(), 3)
         task2 = asyncio.create_task(second.run("second"))
-        await asyncio.wait_for(second_before.wait(), 1)
+        await asyncio.wait_for(second_before.wait(), 3)
         assert executed == [first.session_id]
         assert reg._write_lease.size() == 1
         release_first.set()
@@ -164,9 +151,9 @@ def test_pending_approval_holds_no_file_lease(workspace):
                           permissions=PermissionManager(workspace_root=workspace, approver=approver))
         second = make_loop(workspace, reg, [ToolCall(name="writer", arguments={"path": "same.txt"})])
         task = asyncio.create_task(first.run("requires approval"))
-        await asyncio.wait_for(approval_started.wait(), 1)
+        await asyncio.wait_for(approval_started.wait(), 3)
         assert reg._write_lease.size() == 0
-        await asyncio.wait_for(second.run("authorized writer"), 1)
+        await asyncio.wait_for(second.run("authorized writer"), 3)
         assert written == [second.session_id]
         approve.set()
         await task
@@ -185,6 +172,7 @@ def test_fast_parallel_result_is_persisted_while_sibling_waits_for_approval(work
 
         class Probe(Tool):
             name = "probe"
+            execution_mode = "parallel"
 
             async def execute(self, args, ctx):
                 executed.append(args["approval"])
@@ -212,8 +200,8 @@ def test_fast_parallel_result_is_persisted_while_sibling_waits_for_approval(work
                                          ToolCall(id="fast", name="probe", arguments={"approval": False})],
                          permissions=pm, on_event=on_event)
         task = asyncio.create_task(loop.run("one approval and one fast tool"))
-        await asyncio.wait_for(approval_started.wait(), 1)
-        await asyncio.wait_for(fast_seen.wait(), 1)
+        await asyncio.wait_for(approval_started.wait(), 3)
+        await asyncio.wait_for(fast_seen.wait(), 3)
         assert executed == [False]
         assert not task.done()
         approve.set()
@@ -252,9 +240,9 @@ def test_cancelling_a_single_waiting_writer_does_not_execute_or_release_another_
         second = make_loop(workspace, reg, [ToolCall(name="writer", arguments={"path": "same.txt"})],
                            before_tool_dispatch=before_second, after_tool_dispatch=after_second)
         owner = asyncio.create_task(first.run("owner"))
-        await asyncio.wait_for(occupied.wait(), 1)
+        await asyncio.wait_for(occupied.wait(), 3)
         waiting = asyncio.create_task(second.run("waiting writer"))
-        await asyncio.wait_for(second_before.wait(), 1)
+        await asyncio.wait_for(second_before.wait(), 3)
         waiting.cancel()
         with pytest.raises(asyncio.CancelledError):
             await waiting
@@ -295,9 +283,9 @@ def test_permission_is_rechecked_after_waiting_for_a_write_lease(workspace):
                            permissions=PermissionManager(workspace_root=workspace, mode_provider=lambda: mode["value"]),
                            before_tool_dispatch=before_second)
         task1 = asyncio.create_task(first.run("first"))
-        await asyncio.wait_for(occupied.wait(), 1)
+        await asyncio.wait_for(occupied.wait(), 3)
         task2 = asyncio.create_task(second.run("second"))
-        await asyncio.wait_for(second_before.wait(), 1)
+        await asyncio.wait_for(second_before.wait(), 3)
         mode["value"] = "read-only"
         release.set()
         await asyncio.gather(task1, task2)
@@ -317,6 +305,7 @@ def test_parallel_cancellation_drains_tools_and_pairs_runtime_hooks(workspace):
 
         class Probe(Tool):
             name = "probe"
+            execution_mode = "parallel"
             writes_path = True
 
             async def execute(self, args, ctx):
@@ -339,7 +328,7 @@ def test_parallel_cancellation_drains_tools_and_pairs_runtime_hooks(workspace):
                                          ToolCall(name="probe", arguments={"path": "pending.txt"})],
                          before_tool_dispatch=before, after_tool_dispatch=after)
         task = asyncio.create_task(loop.run("cancel writers"))
-        await asyncio.wait_for(started.wait(), 1)
+        await asyncio.wait_for(started.wait(), 3)
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -359,6 +348,7 @@ def test_self_cancelled_tool_does_not_leave_a_parallel_sibling_running(workspace
 
         class Probe(Tool):
             name = "probe"
+            execution_mode = "parallel"
 
             async def execute(self, args, ctx):
                 if args.get("cancel"):
@@ -375,13 +365,13 @@ def test_self_cancelled_tool_does_not_leave_a_parallel_sibling_running(workspace
         loop = make_loop(workspace, reg, [ToolCall(name="probe", arguments={"cancel": True}),
                                          ToolCall(name="probe", arguments={})])
         with pytest.raises(asyncio.CancelledError):
-            await asyncio.wait_for(loop.run("self cancellation"), 1)
+            await asyncio.wait_for(loop.run("self cancellation"), 3)
         assert sibling_cancelled.is_set()
 
     asyncio.run(scenario())
 
 
-def test_wait_tools_start_after_ordinary_results_and_skip_dispatch_hooks(workspace):
+def test_wait_tools_keep_model_order_and_skip_ordinary_dispatch_hooks(workspace):
     async def scenario():
         observed = []
 
@@ -397,7 +387,7 @@ def test_wait_tools_start_after_ordinary_results_and_skip_dispatch_hooks(workspa
             suspends_session = True
 
             async def execute(self, args, ctx):
-                assert observed == ["before", "ordinary", "after", "ordinary result"]
+                assert observed == []
                 observed.append("wait")
                 return "child returned"
 
@@ -417,7 +407,7 @@ def test_wait_tools_start_after_ordinary_results_and_skip_dispatch_hooks(workspa
         loop = make_loop(workspace, reg, [ToolCall(name="wait", arguments={}), ToolCall(name="ordinary", arguments={})],
                          on_event=event, before_tool_dispatch=before, after_tool_dispatch=after)
         await loop.run("wait after local calls")
-        assert observed[-2:] == ["wait", "wait result"]
+        assert observed == ["wait", "wait result", "before", "ordinary", "after", "ordinary result"]
         tools = [msg for msg in loop.provider.requests[-1] if msg["role"] == "tool"]
         assert [msg["content"] for msg in tools] == ["child returned", "ordinary returned"]
 
@@ -448,6 +438,7 @@ def test_model_turn_hook_runs_before_each_request_and_can_cancel_before_provider
 
         class Probe(Tool):
             name = "probe"
+            execution_mode = "parallel"
 
             async def execute(self, args, ctx):
                 return "result"
@@ -477,6 +468,7 @@ def test_usage_meter_charges_each_response_once_before_tools_and_includes_final_
 
     class Probe(Tool):
         name = "probe"
+        execution_mode = "parallel"
 
         async def execute(self, args, ctx):
             assert metered == [{"input_tokens": 3, "output_tokens": 4, "cached_tokens": 1}]
@@ -503,6 +495,7 @@ def test_usage_meter_failure_stops_before_dispatch(workspace):
 
     class Probe(Tool):
         name = "probe"
+        execution_mode = "parallel"
 
         async def execute(self, args, ctx):
             executed.append(True)

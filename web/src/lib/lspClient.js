@@ -11,8 +11,10 @@
 
 import * as monaco from './monacoRuntime.js'
 import { getToken } from '../api.js'
+import { completionLabel, completionPresentation } from './completionPresentation.js'
 import { hoverMarkdownStrings, normalizeHoverDocumentation } from './hoverDocumentation.js'
 import { getTokenHover, registerTokenHoverSource, rememberSemanticTokens, clearSemanticTokens, notifyHoverDocumentationUpdated } from './tokenHover.js'
+import { compactSymbolHover } from './compactSymbolHover.js'
 
 const LANG_ID = {
   python: 'python',
@@ -465,7 +467,8 @@ export class LspClient {
 
   symbols(uri, token) { return this._documentRequest(uri, 'textDocument/documentSymbol', {}, token) }
   definition(uri, position, token) { return this._documentRequest(uri, 'textDocument/definition', { position: fromPosition(position) }, token) }
-  async hover(uri, position, token) {
+  async hover(uri, position, token, { retryTranslation = false } = {}) {
+    const params = { position: fromPosition(position), ...(retryTranslation === true ? { codeAgentRetryTranslation: true } : {}) }
     const entry = this.documents.get(uri), model = entry?.model
     if (model?.getLanguageId?.() === 'java') {
       if (this.disposed || model.isDisposed?.() || token?.isCancellationRequested) throw cancelledError()
@@ -477,18 +480,19 @@ export class LspClient {
         && this.documents.get(uri) === entry && entry.model === model && entry.version === version
         && model.getVersionId?.() === modelVersion && model.getValue?.() === text && this.featureGeneration === generation
       try {
-        const result = await this._documentRequest(uri, 'textDocument/hover', { position: fromPosition(position) }, token)
+        const result = await this._documentRequest(uri, 'textDocument/hover', params, token)
         if (!current()) throw cancelledError('文档已变化，请重试')
         return getTokenHover(model, position, result)
       } catch (error) {
         if (error?.name === 'CancellationError' || error?.code === -32800 || !current()) throw cancelledError('文档已变化或请求已取消')
+        if (retryTranslation) throw error
         // Server failures can still leave useful lexical help for this exact
         // draft. Never revive an obsolete hover after typing or navigation.
         return getTokenHover(model, position)
       }
     }
     if (!this.capabilities.hoverProvider) return null
-    const result = await this._documentRequest(uri, 'textDocument/hover', { position: fromPosition(position) }, token)
+    const result = await this._documentRequest(uri, 'textDocument/hover', params, token)
     if (!result) return null
     // Background cache growth does not change this document's source. Let the
     // current hover finish; an open details view coalesces a later refresh.
@@ -722,7 +726,7 @@ export class LspClient {
           return suggestion
         }) }
       },
-      ...(caps.completionProvider.resolveProvider ? { resolveCompletionItem: async (item, token) => {
+      resolveCompletionItem: async (item, token) => {
         const info = this.completionMetadata.get(item)
         if (!info) return item
         try {
@@ -731,7 +735,7 @@ export class LspClient {
           this.completionMetadata.set(converted, { ...info, raw: { ...info.raw, ...resolved } })
           return converted
         } catch { return item }
-      } } : {}),
+      },
     })
 
     if (langId === 'java') this.disposables.push(registerTokenHoverSource({
@@ -745,7 +749,7 @@ export class LspClient {
       provideHover: async (model, position, token) => {
         const uri = this._uriOf(model)
         if (!uri) return null
-        try { return await this.hover(uri, position, token) }
+        try { return compactSymbolHover(await this.hover(uri, position, token)) }
         catch { return null }
       },
     })
@@ -1024,8 +1028,12 @@ function wordRange(model, position) {
 }
 function documentation(value) {
   if (!value) return undefined
+  // Completion and parameter popups must follow the same rendering contract
+  // as hover: no trusted commands, HTML or automatic remote-image loads.
+  // Their display prose has already passed the shared backend translation/cache.
   if (typeof value === 'string') return value
-  return value.kind === 'plaintext' ? value.value || '' : { value: value.value || '', isTrusted: false }
+  if (value.kind === 'plaintext') return value.value || ''
+  return hoverMarkdownStrings(value)[0]
 }
 const completionKinds = ['Text', 'Method', 'Function', 'Constructor', 'Field', 'Variable', 'Class', 'Interface', 'Module', 'Property', 'Unit', 'Value', 'Enum', 'Keyword', 'Snippet', 'Color', 'File', 'Reference', 'Folder', 'EnumMember', 'Constant', 'Struct', 'Event', 'Operator', 'TypeParameter']
 function completionItem(item, defaults = {}, model, position) {
@@ -1034,9 +1042,9 @@ function completionItem(item, defaults = {}, model, position) {
   const edit = item.textEdit || (defaults.editRange ? { ...((defaults.editRange.insert && defaults.editRange.replace) ? defaults.editRange : { range: defaults.editRange }), newText: item.textEditText ?? item.insertText ?? item.label ?? '' } : null)
   const range = edit?.insert && edit?.replace ? { insert: toRange(edit.insert), replace: toRange(edit.replace) } : edit?.range ? toRange(edit.range) : wordRange(model, position)
   return {
-    label: item.labelDetails ? { label: item.label || '', detail: item.labelDetails.detail, description: item.labelDetails.description } : item.label || item.insertText || '',
+    label: completionLabel(item),
     kind: monaco.languages.CompletionItemKind[completionKinds[(item.kind || 1) - 1]] ?? monaco.languages.CompletionItemKind.Text,
-    detail: item.detail || '', documentation: documentation(item.documentation),
+    ...completionPresentation(item, model.getLanguageId?.() || 'plaintext'),
     insertText: edit?.newText ?? item.insertText ?? item.label ?? '', range,
     insertTextRules: (raw.insertTextFormat === 2 ? monaco.languages.CompletionItemInsertTextRule?.InsertAsSnippet ?? 4 : 0) | (raw.insertTextMode === 1 ? monaco.languages.CompletionItemInsertTextRule?.KeepWhitespace ?? 1 : 0),
     sortText: item.sortText, filterText: item.filterText, preselect: item.preselect, commitCharacters: raw.commitCharacters,

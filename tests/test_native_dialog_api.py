@@ -3,11 +3,11 @@ from types import SimpleNamespace
 
 import httpx
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 
 from code_agent.api.code_api import mount_code_api
 from code_agent.api.deps import CurrentUser, get_current_user
-from code_agent.api.native_dialog_api import mount_native_dialog_api
+from code_agent.api.native_dialog_api import mount_native_dialog_api, _pick_until_disconnect
 from code_agent.codeintel import native_dialog
 
 
@@ -83,3 +83,57 @@ def test_dialog_failures_have_useful_http_errors(app, monkeypatch, exception, st
     monkeypatch.setattr(native_dialog, 'pick_folder', fail)
     response = request(app, 'POST', body={})
     assert response.status_code == status and response.json()['detail'] == '系统选择器状态'
+
+
+def test_disconnected_request_cancels_only_its_own_picker_and_waits_for_cleanup(monkeypatch):
+    async def check():
+        disconnected = asyncio.Event()
+        started = asyncio.Event()
+        cleaned = []
+        async def choose(start):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await asyncio.sleep(0)
+                cleaned.append(start)
+        async def is_disconnected():
+            return disconnected.is_set()
+        monkeypatch.setattr(native_dialog, 'pick_folder', choose)
+        def forbidden_global_cancel():
+            pytest.fail('an old request must never cancel the globally active selector')
+        monkeypatch.setattr(native_dialog, 'cancel_active', forbidden_global_cancel)
+        pending = asyncio.create_task(_pick_until_disconnect(SimpleNamespace(is_disconnected=is_disconnected), 'first'))
+        await started.wait()
+        disconnected.set()
+        with pytest.raises(HTTPException) as error:
+            await pending
+        assert error.value.status_code == 499
+        assert cleaned == ['first']
+        async def next_choose(start):
+            return {'path': start, 'cancelled': False}
+        monkeypatch.setattr(native_dialog, 'pick_folder', next_choose)
+        # Even a late disconnect from the old client must not touch the next picker.
+        assert await _pick_until_disconnect(SimpleNamespace(is_disconnected=is_disconnected), 'second') == {'path': 'second', 'cancelled': False}
+    asyncio.run(check())
+
+
+def test_cancelled_route_task_cleans_up_its_picker(monkeypatch):
+    async def check():
+        started, cleaned = asyncio.Event(), asyncio.Event()
+        async def choose(start):
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaned.set()
+        async def connected():
+            return False
+        monkeypatch.setattr(native_dialog, 'pick_folder', choose)
+        pending = asyncio.create_task(_pick_until_disconnect(SimpleNamespace(is_disconnected=connected), 'first'))
+        await started.wait()
+        pending.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending
+        assert cleaned.is_set()
+    asyncio.run(check())

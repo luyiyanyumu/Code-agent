@@ -6,6 +6,8 @@ import test from 'node:test'
 import vm from 'node:vm'
 import { computed, effectScope, nextTick, reactive, ref, watch } from 'vue'
 import { documentKey, useWorkbench } from '../src/composables/useWorkbench.js'
+import { isMissingProjectFile } from '../src/lib/fileErrors.js'
+import { createHoverDocumentationRefresh } from '../src/lib/hoverDocumentationRefresh.js'
 import { useNavigation } from '../src/composables/useNavigation.js'
 import { useProjectAccess } from '../src/composables/useProjectAccess.js'
 import { useIndexRefresh } from '../src/composables/useIndexRefresh.js'
@@ -18,6 +20,10 @@ import { useProjectConversations } from '../src/composables/useProjectConversati
 import { clearSemanticTokens, getJavaTokenTarget, registerTokenBusinessSource, subscribeHoverDocumentationUpdates, withTokenBusiness } from '../src/lib/tokenHover.js'
 import { createBusinessMeaningSource, subscribeBusinessMeaning } from '../src/lib/businessMeaning.js'
 import { usePreferences, editorPreferenceOptions, shouldSendMessage } from '../src/lib/preferences.js'
+import { ideActions, ideActionState, ideCapability, ideKeybinding } from '../src/lib/ideActions.js'
+import { desktopRuntime, createWorkbenchLeaveGuard } from '../src/lib/desktopRuntime.js'
+import { readIdeLayout, persistIdeLayout } from '../src/lib/ideLayout.js'
+import { flattenIdeCommands } from '../src/lib/ideCommands.js'
 
 const deferred = () => {
   let resolve, reject
@@ -43,14 +49,14 @@ async function component(path, props, api, exports, extra = {}) {
   const storage = new Map()
   const browserStorage = { getItem: (key) => storage.get(key), setItem: (key, value) => storage.set(key, value), removeItem: (key) => storage.delete(key) }
   const loaded = await loadScript(path, {
-    computed, usePreferences, editorPreferenceOptions, shouldSendMessage, defineAsyncComponent: loader => ({ loader }), nextTick, ref, watch, defineProps: () => props, defineEmits: () => () => {},
+    computed, usePreferences, editorPreferenceOptions, shouldSendMessage, ideActions, ideActionState, ideCapability, ideKeybinding, defineAsyncComponent: loader => ({ loader }), nextTick, ref, watch, defineProps: () => props, defineEmits: () => () => {},
     defineExpose: () => {}, onMounted: () => {}, onBeforeUnmount: (fn) => unmount.push(fn),
-    api, localStorage: browserStorage, documentKey, useNavigation, WorkspaceLanguageService, prepareWorkspaceEdit, assertPlanCurrent, findPlanDocument, useProjectAccess: (options) => useProjectAccess({ ...options, storage: browserStorage }), useWorkbench: (options) => useWorkbench({ ...options, storage: browserStorage }),
-    getJavaTokenTarget, registerTokenBusinessSource, subscribeHoverDocumentationUpdates, withTokenBusiness, createBusinessMeaningSource, subscribeBusinessMeaning,
+    api, localStorage: browserStorage, documentKey, isMissingProjectFile, useNavigation, WorkspaceLanguageService, prepareWorkspaceEdit, assertPlanCurrent, findPlanDocument, useProjectAccess: (options) => useProjectAccess({ ...options, storage: browserStorage }), useWorkbench: (options) => useWorkbench({ ...options, storage: browserStorage }),
+    getJavaTokenTarget, registerTokenBusinessSource, subscribeHoverDocumentationUpdates, withTokenBusiness, createBusinessMeaningSource, subscribeBusinessMeaning, createHoverDocumentationRefresh,
     useIndexRefresh, useFunctionDescriptions, useDialog: () => ({ open: async () => null }), document: { visibilityState: 'visible' },
     useProjectAgentTeam: options => { const scope = effectScope(); unmount.push(() => scope.stop()); return scope.run(() => useProjectAgentTeam(options)) },
     useProjectConversations: options => { const scope = effectScope(); unmount.push(() => scope.stop()); return scope.run(() => useProjectConversations(options)) },
-    window: { confirm: () => false, addEventListener() {}, removeEventListener() {} },
+    window: { confirm: () => false, addEventListener() {}, removeEventListener() {} }, desktopRuntime, createWorkbenchLeaveGuard, readIdeLayout, persistIdeLayout, flattenIdeCommands,
     ...extra,
   }, exports)
   return { ...loaded, dispose: async () => { unmount.forEach((fn) => fn()); await nextTick() } }
@@ -66,6 +72,99 @@ const apiFor = (overrides = {}) => ({ code: {
   ...overrides,
 } })
 const viewExports = 'project, session, file, fileBusy, lspServers, diagnostics, activeTree, selectProject, openFile, refreshDiagnostics, saveFile, promptOpenProject, projectAccess, pickerOpen, openProjectFolder, pickProjectLocation, projectLocationSelection, dismissProjectForm, workbench, documents, editorRef, captureEditor, onEditorChange, closeDocument, closingDocument, finishClose, conflictDialog, resolveConflict, navigation, navigateHistory, onEditorSelection, runCurrent, runDebug, runtimeRef, debugRef, banner, onPatchesChanged, onLanguageEdit, applyLanguageEdit, undoLanguageEdit, languageEditPreview, languageEditUndo'
+
+test('a failed old path cannot remain above a healthy cached tab', async () => {
+  const view = await component('../src/views/CodeView.vue', { user: { id: 1 } }, fileApi({
+    file: async (_, path) => { if (path === 'SkyApplications.java') throw Object.assign(new Error(`文件不存在：${path}`), { status: 422 }); return { path, text: 'class SkyApplication {}', sha1: 'one', editable: true } },
+  }), viewExports + ', activeFileError, activateDocument')
+  try {
+    const s = view.subject
+    await s.selectProject(project('p')); await s.openFile({ path: 'SkyApplication.java' })
+    const key = s.file.value.key
+    assert.equal(await s.openFile({ path: 'SkyApplications.java' }), false)
+    assert.match(s.banner.value, /SkyApplications/)
+    assert.equal(s.file.value.path, 'SkyApplication.java'); assert.notEqual(s.file.value.missing, true)
+    await s.openFile({ path: 'SkyApplication.java' })
+    assert.equal(s.banner.value, ''); assert.equal(s.activeFileError.value, ''); assert.equal(s.file.value.key, key)
+    s.banner.value = 'an old file error'; s.activateDocument(key)
+    assert.equal(s.banner.value, '')
+  } finally { await view.dispose() }
+})
+
+test('a late failed save belongs to its own dirty tab, not the active replacement', async () => {
+  const gate = deferred()
+  const view = await component('../src/views/CodeView.vue', { user: { id: 1 } }, fileApi({ saveFile: () => gate.promise }), viewExports + ', activeFileError, activateDocument')
+  try {
+    const s = view.subject
+    await s.selectProject(project('p')); await s.openFile({ path: 'a.txt' })
+    const key = s.file.value.key
+    s.onEditorChange({ key, text: 'preserved unsaved draft' })
+    const saving = s.saveFile({ key, path: 'a.txt', text: 'preserved unsaved draft', sha1: 'sha-a.txt' })
+    await s.openFile({ path: 'b.txt' })
+    gate.reject(Object.assign(new Error('保存暂时失败'), { status: 500 }))
+    assert.equal(await saving, false)
+    assert.equal(s.banner.value, ''); assert.equal(s.activeFileError.value, ''); assert.equal(s.file.value.path, 'b.txt')
+    s.activateDocument(key)
+    assert.match(s.activeFileError.value, /a.txt.*保存暂时失败/)
+    assert.equal(s.file.value.text, 'preserved unsaved draft'); assert.equal(s.file.value.dirty, true)
+  } finally { await view.dispose() }
+})
+
+test('temporary recovery errors stay retryable without claiming absence or replacing the draft', async () => {
+  let calls = 0
+  const view = await component('../src/views/CodeView.vue', { user: { id: 1 } }, fileApi({ file: async (_, path) => {
+    if (++calls === 1) throw Object.assign(new Error('temporary read failure'), { status: 500 })
+    return { path, text: 'original', sha1: 'baseline', editable: true }
+  } }), viewExports + ', activeFileError, reloadActiveDocument')
+  try {
+    const s = view.subject
+    const doc = s.workbench.openFile({ path: 'a.txt', text: 'original', sha1: 'baseline' }, { projectId: 'p' })
+    s.workbench.update(doc.key, { text: 'local draft' }); doc.needsReload = true
+    await s.selectProject(project('p')); await new Promise(setImmediate)
+    assert.equal(doc.needsReload, true); assert.equal(doc.file.missing, false); assert.match(s.activeFileError.value, /temporary/)
+    assert.equal(await s.reloadActiveDocument(), true)
+    assert.equal(calls, 2); assert.equal(doc.needsReload, false); assert.equal(doc.readError, '')
+    assert.equal(doc.text, 'local draft'); assert.equal(doc.dirty, true); assert.equal(doc.conflict, null)
+  } finally { await view.dispose() }
+})
+
+test('reopening a missing cached document rereads disk and preserves a conflicting draft when it reappears', async () => {
+  let exists = false
+  const view = await component('../src/views/CodeView.vue', { user: { id: 1 } }, fileApi({ file: async (_, path) => {
+    if (!exists) throw Object.assign(new Error(`文件不存在：${path}`), { status: 404, code: 'PROJECT_FILE_NOT_FOUND' })
+    return { path, text: 'changed disk', sha1: 'changed', editable: true }
+  } }), viewExports + ', activeFileError')
+  try {
+    const s = view.subject
+    const doc = s.workbench.openFile({ path: 'a.txt', text: 'original', sha1: 'baseline' }, { projectId: 'p' })
+    s.workbench.update(doc.key, { text: 'local draft' }); doc.needsReload = true
+    await s.selectProject(project('p')); await new Promise(setImmediate)
+    assert.equal(doc.file.missing, true); assert.match(s.activeFileError.value, /文件不存在/)
+    exists = true; assert.equal(await s.openFile({ path: 'a.txt' }), true)
+    assert.equal(s.activeFileError.value, ''); assert.equal(s.file.value.needsReload, false); assert.notEqual(s.file.value.missing, true)
+    assert.equal(doc.text, 'local draft'); assert.equal(doc.sha1, 'baseline'); assert.equal(doc.savedText, 'original'); assert.ok(doc.conflict)
+  } finally { await view.dispose() }
+})
+
+test('a delayed old patch read cannot relock a file successfully reloaded in the meantime', async () => {
+  let reads = 0
+  const old = deferred()
+  const view = await component('../src/views/CodeView.vue', { user: { id: 1 } }, fileApi({ file: async (_, path) => {
+    if (++reads === 2) return old.promise
+    return { path, text: reads > 2 ? 'new disk' : 'old disk', sha1: reads > 2 ? 'new' : 'old', editable: true }
+  } }), viewExports)
+  try {
+    const s = view.subject
+    await s.selectProject(project('p')); await s.openFile({ path: 'a.txt' })
+    const pending = s.onPatchesChanged({ paths: ['a.txt'] })
+    const doc = s.workbench.activeDocument.value
+    doc.needsReload = true
+    await s.openFile({ path: 'a.txt' })
+    old.reject(Object.assign(new Error('文件不存在：a.txt'), { status: 404, code: 'PROJECT_FILE_NOT_FOUND' }))
+    await pending
+    assert.equal(doc.text, 'new disk'); assert.equal(doc.sha1, 'new'); assert.equal(doc.needsReload, false); assert.notEqual(doc.file.missing, true)
+  } finally { await view.dispose() }
+})
 
 test('opening an editor project checks automatic functionality progress without opening a map', async () => {
   const reads = [], blocked = deferred()

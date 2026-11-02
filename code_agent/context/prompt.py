@@ -59,6 +59,7 @@ def dynamic_history_budget(
     tools_chars: int = 0,
     fraction: float = 0.5,
     max_output_tokens: int | None = None,
+    budget_cap: int | None = None,
 ) -> int:
     """按模型上下文窗口动态计算历史字符预算（字符级，与 compact_messages 的 max_chars 同单位）。
 
@@ -76,7 +77,11 @@ def dynamic_history_budget(
     # Capacity is a hard ceiling, not a target for ordinary working memory.
     # A large model window must not expand every loop into hundreds of thousands
     # of history characters. The explicit history setting remains the soft cap.
-    return min(available, max(0, history_budget()), max(4_000, int(usable * 2.2)))
+    configured = history_budget()
+    cap = configured if budget_cap is None else budget_cap
+    if "CODE_AGENT_HISTORY_BUDGET" in os.environ:
+        cap = min(cap, configured)
+    return min(available, max(0, cap), max(4_000, int(usable * 2.2)))
 
 
 # ---------------------------------------------------------------------------
@@ -254,11 +259,11 @@ def assemble(
     history: list[dict[str, Any]],
     prompt: str,
     max_chars: int | None = None,
-    *, automatic: bool = False,
+    *, automatic: bool = False, preserve_tool_ids=(),
 ) -> list[dict[str, Any]]:
     """产出最终发给 provider 的 messages。"""
     budget = max_chars if max_chars is not None else history_budget()
-    compacted = compact_messages(history, max_chars=budget)
+    compacted = compact_messages(history, max_chars=budget, preserve_tool_ids=preserve_tool_ids)
     current = user_message(prompt)
     if automatic:
         current["_context_source"] = "auto"
@@ -272,6 +277,6 @@ def provider_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     A JSON-restored empty placeholder is not a genuine reasoning receipt.
     """
     return [{key: value for key, value in message.items()
-             if key not in ("_context_source", "_execution_progress")
-             and (key != "_provider_payload" or isinstance(value, ProviderPayload))}
+             if not key.startswith("_")
+             or key == "_provider_payload" and isinstance(value, ProviderPayload)}
             for message in messages]

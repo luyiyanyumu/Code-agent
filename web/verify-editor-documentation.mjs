@@ -14,7 +14,7 @@ const source = `package demo;\n\npublic class SessionService {\n    public Strin
 const otherSource = 'package demo;\nclass OtherService {\n    void otherSymbol() {}\n}\n'
 const markdown = '# 为什么要有这一层\n\n原来后端是**完全无状态**的：对话历史由前端带回，超出的直接丢弃。\n\n## 事件 ≠ 上下文\n\n落库的事件是**全量**的，而发给模型的上下文是投影。\n\n' +
   Array.from({ length: 28 }, (_, i) => `### ${i + 1}. 执行步骤\n\n- 读取项目事件日志并校验版本。\n- 上下文保留用户意图与最终结果，审计记录保留工具输出。\n\n`).join('') +
-  '\n<h1 id="raw-html-probe">HTML 不执行</h1>\n<img src="https://fixture.invalid/remote.png" onerror="window.__documentationAttack=1">\n\n[执行命令](command:fixture.attack)\n\n![远程架构图片](https://fixture.invalid/diagram.png)\n\n## 完整说明末尾标记\n\nDOCUMENTATION_TAIL_9e52\n'
+  '\n<h1 id="raw-html-probe">HTML 不执行</h1>\n<img src="https://fixture.invalid/remote.png" onerror="window.__documentationAttack=1">\n\n[执行命令](command:fixture.attack)\n\n![远程架构图片](https://fixture.invalid/diagram.png)\n\n## 完整说明末尾标记\n\n中文末尾标记：DOCUMENTATION_TAIL_9e52\n'
 const signature = 'public java.util.Map<String, java.util.List<ProjectAgent>> projectLead(String input, java.util.function.Consumer<AuditEvent> auditor)'
 const docs = [{ language: 'java', value: signature }, { kind: 'markdown', value: markdown }, { kind: 'plaintext', value: '纯文本原样：**不是粗体**\n@param input 输入\nPLAIN_TEXT_TAIL_28d7' }]
 const fixture = { source, otherSource, docs }
@@ -37,7 +37,7 @@ class FixtureSocket extends EventTarget{ static CONNECTING=0;static OPEN=1;stati
  emit(type,event){this.dispatchEvent(event);this['on'+type]?.(event)}
  message(frame){if(this.readyState===1)this.emit('message',new MessageEvent('message',{data:JSON.stringify(frame)}))}
  send(raw){if(!this.isLsp)return;const frame=JSON.parse(raw);state.frames.push(frame);const uri=frame.params?.textDocument?.uri;if(frame.method==='textDocument/didOpen')this.docs.set(uri,frame.params.textDocument);if(frame.method==='textDocument/didChange'){const doc=this.docs.get(uri);if(doc){doc.text=frame.params.contentChanges[0].text;doc.version=frame.params.textDocument.version}}if(frame.method==='textDocument/didClose')this.docs.delete(uri);if(frame.id===undefined)return;
- const result=frame.method==='textDocument/hover'?{contents:uri?.endsWith('/OtherService.java')?[{language:'java',value:'void otherSymbol()'},{kind:'markdown',value:'OTHER_SYMBOL_ONLY'}]:fixture.docs,range:{start:{line:3,character:18},end:{line:3,character:29}}}:null;
+ const result=frame.method==='textDocument/hover'?{contents:uri?.endsWith('/OtherService.java')?[{language:'java',value:'void otherSymbol()'},{kind:'markdown',value:'另一个符号的中文说明：OTHER_SYMBOL_ONLY'}]:fixture.docs,range:{start:{line:3,character:18},end:{line:3,character:29}}}:null;
  if(state.hold&&frame.method==='textDocument/hover')state.pending.push(()=>this.message({id:frame.id,result}));else queueMicrotask(()=>this.message({id:frame.id,result}))}
  close(){this.readyState=3;this.emit('close',new CloseEvent('close'))}
 }
@@ -55,6 +55,12 @@ try {
   const context = await browser.newContext({ viewport: { width: 1440, height: 930 }, serviceWorkers: 'block' })
   await context.route('**/*', route => {
     const url = new URL(route.request().url())
+    if (url.origin === origin && url.pathname === '/api/v1/code/projects/documentation-fixture/symbol/business/resolve' && route.request().method() === 'POST') {
+      return route.fulfill({ contentType: 'application/json', body: JSON.stringify({
+        entity: { id: 'fixture-project-lead' },
+        business: { status: 'current', source: 'human', business_meaning: '维护项目负责人对应的会话上下文。' },
+      }) })
+    }
     if (url.origin !== origin || url.pathname.startsWith('/api/')) { unexpected.push(url.href); return route.abort() }
     if (url.pathname === '/__editor-documentation-fixture') return route.fulfill({ contentType: 'text/html', body: html })
     return route.continue()
@@ -62,9 +68,9 @@ try {
   page = await context.newPage()
   page.on('pageerror', error => errors.push(error.message))
   await page.goto(`${origin}/__editor-documentation-fixture`, { waitUntil: 'networkidle' })
-  const tool = () => page.locator('.language-tool').filter({ hasText: /^说明$/ })
+  const tool = () => ({ async click() { await page.evaluate(() => window.__documentationFixture.editor.focus()); await page.keyboard.press('Control+q') } })
   const drawer = () => page.getByRole('complementary', { name: '代码完整说明' })
-  await tool().waitFor(); await page.waitForFunction(() => ![...document.querySelectorAll('.language-tool')].find(el=>el.textContent==='说明')?.disabled)
+  await page.waitForFunction(() => !!window.__documentationFixture?.editor?.getAction('code-agent.symbol-documentation'))
   const setCursor = async () => {await page.waitForFunction(()=>!!window.__documentationFixture.editor);await page.evaluate(() => {const editor=window.__documentationFixture.editor;editor.setPosition({lineNumber:4,column:23});editor.revealLineInCenter(4);editor.focus()})}
   const shot = async name => {const filename=path.join(output,name);await page.screenshot({path:filename,fullPage:true});screenshots.push(filename)}
   const snapshot = () => page.evaluate(() => {const editor=window.__documentationFixture.editor;return {text:editor.getValue(),selection:editor.getSelection(),top:editor.getScrollTop(),left:editor.getScrollLeft(),uri:editor.getModel().uri.toString()}})
@@ -72,6 +78,8 @@ try {
   await page.evaluate(() => window.__documentationFixture.editor.getAction('editor.action.showHover').run())
   const native = page.locator('.monaco-resizable-hover').filter({visible:true})
   await native.waitFor()
+  assert.match(await native.innerText(), /维护项目负责人对应的会话上下文/)
+  checks.push('Native Chinese hover retains the existing confirmed project business explanation')
   await page.waitForTimeout(250)
   measurements.hover = await native.evaluate(el => {const hover=el.querySelector('.monaco-hover'),content=el.querySelector('.monaco-hover-content');const rect=element=>{const b=element.getBoundingClientRect();return {x:b.x,y:b.y,width:b.width,height:b.height}};return {outer:rect(el),hover:rect(hover),content:rect(content),scrollables:[...el.querySelectorAll('.monaco-scrollable-element')].map(item=>({rect:rect(item),height:item.style.height,overflow:getComputedStyle(item).overflow,scroll:item.scrollHeight,client:item.clientHeight})),font:getComputedStyle(content).fontSize,headers:[...content.querySelectorAll('h1,h2,h3,h4,h5,h6')].map(el=>getComputedStyle(el).fontSize),scroll:content.scrollHeight,client:content.clientHeight}})
   const geo=measurements.hover
@@ -101,15 +109,15 @@ try {
   await page.keyboard.press('Escape'); await tool().click(); await drawer().waitFor()
   await page.waitForFunction(() => document.querySelector('.documentation-body')?.getAttribute('aria-busy')==='false')
   assert.match(await drawer().innerText(),/语言服务[\s\S]*SessionService\.java:4/);checks.push('Full documentation names the language-service source and query file/line')
-  assert.deepEqual(await drawer().locator('.documentation-section').evaluateAll(els=>els.map(el=>el.dataset.sectionKind)),['markdown','code','markdown','plaintext']);checks.push('Full documentation adds Java classification and keeps signature, Markdown and literal text in server order')
+  assert.deepEqual(await drawer().locator('.documentation-section').evaluateAll(els=>els.map(el=>el.dataset.sectionKind).slice(-3)),['code','markdown','plaintext']);checks.push('Full documentation keeps signature, Chinese Markdown and literal text in server order after classification and translation status')
   assert.equal(await drawer().locator('.documentation-section[data-section-kind=code] code').innerText(),signature+'\n')
   assert.match(await drawer().innerText(),/DOCUMENTATION_TAIL_9e52[\s\S]*PLAIN_TEXT_TAIL_28d7/);checks.push('Full documentation retains complete long content and every tail marker')
   assert.match(await drawer().locator('.documentation-plaintext').innerText(),/\*\*不是粗体\*\*/);checks.push('Plaintext Javadoc markers stay literal')
-  assert.equal(await drawer().locator('img,script,iframe,svg,#raw-html-probe').count(),0)
+  assert.equal(await drawer().locator('.documentation-body img,.documentation-body script,.documentation-body iframe,.documentation-body svg,#raw-html-probe').count(),0)
   assert.equal(await drawer().locator('a[href^="command:"]').count(),0)
   assert.equal(await page.evaluate(()=>window.__documentationAttack||0),0);checks.push('Full documentation escapes raw HTML and command links and never renders remote images')
   measurements.drawer=await drawer().evaluate(el=>{const b=el.getBoundingClientRect();return {width:b.width,height:b.height,headers:[...el.querySelectorAll('h1,h2,h3,h4,h5,h6')].map(el=>getComputedStyle(el).fontSize)}})
-  assert.ok(measurements.drawer.width<=542);assert.ok(measurements.drawer.headers.every(value=>parseFloat(value)<=14));checks.push('Full drawer has restrained width and 14px maximum headings')
+  assert.ok(measurements.drawer.width<=602);assert.ok(measurements.drawer.headers.every(value=>parseFloat(value)<=14));checks.push('Full drawer has bounded 600px width and compact body headings')
   await drawer().locator('.documentation-body').evaluate(el=>el.scrollTop=el.scrollHeight)
   await drawer().locator('.documentation-plaintext').waitFor();await shot('editor-documentation-tail.png')
   await drawer().locator('.documentation-body').evaluate(el=>el.scrollTop=0);await shot('editor-documentation-full.png')

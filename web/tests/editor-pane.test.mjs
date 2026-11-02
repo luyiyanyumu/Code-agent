@@ -6,8 +6,10 @@ import vm from 'node:vm'
 import { computed, effectScope, markRaw, nextTick, reactive, ref, watch } from 'vue'
 import { WorkspaceLanguageService } from '../src/lib/workspaceLanguageService.js'
 import { getTokenHover, getJavaTokenTarget, registerTokenBusinessSource, withTokenBusiness, clearSemanticTokens, subscribeHoverDocumentationUpdates, notifyHoverDocumentationUpdated } from '../src/lib/tokenHover.js'
+import { createHoverDocumentationRefresh } from '../src/lib/hoverDocumentationRefresh.js'
 import { createBusinessMeaningSource, subscribeBusinessMeaning, notifyBusinessMeaningChanged } from '../src/lib/businessMeaning.js'
 import { PREFERENCE_DEFAULTS, editorPreferenceOptions } from '../src/lib/preferences.js'
+import { ideActions, ideActionState, ideCapability, ideKeybinding } from '../src/lib/ideActions.js'
 
 const clone = value => JSON.parse(JSON.stringify(value))
 const settle = async () => { await nextTick(); await new Promise(setImmediate); await nextTick() }
@@ -131,9 +133,9 @@ async function setup(t, overrides = {}, options = {}) {
     async formatDocument(uri, formatOptions) { this.calls.push(['format', uri, formatOptions]); return typeof options.format === 'function' ? options.format() : options.format || [] }
     async symbols(uri) { this.calls.push(['symbols', uri]); return options.symbols || [] }
     async workspaceSymbols(query) { this.calls.push(['workspace-symbols', query]); return options.workspaceSymbols || [] }
-    async hover(uri, position, token) {
-      this.calls.push(['hover', uri, position, token])
-      return typeof options.hover === 'function' ? options.hover(token) : options.hover || null
+    async hover(uri, position, token, queryOptions) {
+      this.calls.push(['hover', uri, position, token, queryOptions])
+      return typeof options.hover === 'function' ? options.hover(token, queryOptions) : options.hover || null
     }
   }
   if (options.existingText != null) fake.module.getModel(props.file.path, options.existingText, props.file.lang, props.file.uri, `${props.projectId}/${props.tree}`)
@@ -141,8 +143,9 @@ async function setup(t, overrides = {}, options = {}) {
   const preferences = reactive({ ...PREFERENCE_DEFAULTS, ...options.preferences })
   const subject = await scope.run(() => loadScript('../src/components/code/EditorPane.vue', {
     computed, markRaw, ref, watch: (...args) => scope.run(() => watch(...args)), nextTick, WorkspaceLanguageService, getTokenHover,
-    getJavaTokenTarget, registerTokenBusinessSource, withTokenBusiness, createBusinessMeaningSource, subscribeBusinessMeaning, subscribeHoverDocumentationUpdates,
+    getJavaTokenTarget, registerTokenBusinessSource, withTokenBusiness, createBusinessMeaningSource, subscribeBusinessMeaning, subscribeHoverDocumentationUpdates, createHoverDocumentationRefresh,
     usePreferences: () => ({ preferences }), editorPreferenceOptions,
+    ideActions, ideActionState, ideCapability, ideKeybinding,
     defineProps: () => props, defineEmits: () => (name, payload) => events.push([name, clone(payload)]),
     defineExpose: methods => { exposed = methods }, onMounted() {}, onBeforeUnmount: fn => { unmount = fn },
     requestAnimationFrame: fn => fn(),
@@ -150,7 +153,7 @@ async function setup(t, overrides = {}, options = {}) {
     clearTimeout: function (id) { assert.equal(this, undefined, 'native browser timer cancellation needs its original receiver'); return timers.delete(id) },
     api: options.api || { code: new Proxy({}, { get: () => () => { throw new Error('API not allowed in editor regression') } }) },
     __modules: { '../../lib/monacoSetup.js': fake.module, '../../lib/lspClient.js': { LspClient: FakeLspClient } },
-  }, 'mount, hostEl, dirty, error, lspState, plainFile, snapshot, releaseDocument, save, markSaved, relativeTargetPath, connectLsp, toggleBreakpoint, notifySaved, notifyResourceChanges, formatDocument, languageEditorAction, languageCapabilities, languageServerIds, symbolPanel, symbolMode, symbolQuery, symbolItems, toggleSymbolPanel, setSymbolMode, openLanguageSymbol, toggleLspPanel, showDocumentation, closeDocumentation, symbolDocumentation, showHierarchy, hierarchy, navigateHierarchy, showLensReferences, lensReferences'))
+  }, 'mount, hostEl, dirty, error, lspState, plainFile, snapshot, releaseDocument, save, markSaved, relativeTargetPath, connectLsp, toggleBreakpoint, notifySaved, notifyResourceChanges, formatDocument, languageEditorAction, languageCapabilities, languageServerIds, symbolPanel, symbolMode, symbolQuery, symbolItems, toggleSymbolPanel, setSymbolMode, openLanguageSymbol, toggleLspPanel, showDocumentation, retryDocumentationTranslation, closeDocumentation, symbolDocumentation, showHierarchy, hierarchy, navigateHierarchy, showLensReferences, lensReferences, runIdeCommand, toggleDocumentationPin'))
   subject.hostEl.value = { rendered: true }
   await subject.mount()
   await settle()
@@ -198,6 +201,37 @@ test('editor mounts the document draft, preserves its dirty baseline, and expose
   assert.equal(fake.editors[0].options.bracketPairColorization.enabled, true)
   assert.equal(fake.editors[0].options.guides.bracketPairs, 'active')
   assert.equal(typeof exposed.snapshot, 'function')
+})
+
+test('global edit menu routes read actions and blocks writes for readonly or stale documents', async t => {
+  const { props, fake, exposed } = await setup(t, { readonly: true })
+  const editor = fake.editors[0]
+  assert.equal(exposed.canEdit.value, false)
+  for (const id of ['undo', 'redo', 'replace']) assert.equal(exposed.runEditorCommand(id), false)
+  assert.equal(editor.calls.length, 0)
+  assert.equal(exposed.runEditorCommand('find'), true)
+  assert.deepEqual(editor.calls.at(-1), ['action', 'actions.find'])
+  props.readonly = false
+  await settle()
+  assert.equal(exposed.canEdit.value, true)
+  assert.equal(exposed.runEditorCommand('undo'), true)
+  assert.deepEqual(editor.calls.at(-1), ['action', 'undo'])
+  props.file = initialFile({ path: 'src/b.py', uri: 'file:///E:/project/src/b.py' })
+  props.documentKey = 'p/main/src/b.py'
+  const before = editor.calls.length
+  assert.equal(exposed.runEditorCommand('replace'), false)
+  assert.equal(editor.calls.length, before, 'pending document switches cannot edit the previous model')
+})
+
+test('encoding previews keep edit-menu writes disabled after manual editing is allowed', async t => {
+  const { props, exposed, fake } = await setup(t, { readonly: false, file: initialFile({ editable: false, readonly_reason: 'encoding' }) })
+  assert.equal(exposed.canEdit.value, false)
+  assert.equal(exposed.runEditorCommand('redo'), false)
+  assert.equal(exposed.runEditorCommand('selectAll'), true)
+  assert.deepEqual(fake.editors[0].calls.at(-1), ['action', 'editor.action.selectAll'])
+  props.file = { ...props.file, editable: true, readonly_reason: '' }
+  await settle()
+  assert.equal(exposed.canEdit.value, true)
 })
 
 test('glyph margin and F9 toggle Python breakpoints without editing or dirtying the document', async t => {
@@ -728,7 +762,8 @@ test('full documentation reads the current unsaved document in readonly mode wit
   assert.equal(typeof exposed.showDocumentation, 'function')
   assert.equal(await s.showDocumentation(), true)
   assert.deepEqual(clone(s.symbolDocumentation.value), {
-    title: 'a.py', path: 'src/a.py', line: 12, sections, loading: false, error: '',
+    title: 'a.py', path: 'src/a.py', line: 12, projectId: 'p', tree: 'main', pinned: false,
+    sections, originalSections: [], loading: false, error: '',
   })
   const call = clients[0].calls.find(([name]) => name === 'hover')
   assert.equal(call[1], 'file:///E:/project/src/a.py')
@@ -740,6 +775,39 @@ test('full documentation reads the current unsaved document in readonly mode wit
   assert.equal(s.symbolDocumentation.value, null)
   assert.equal(editor.focusCount, 1)
   assert.deepEqual(clone(s.snapshot()), before)
+})
+
+test('full reader receives structured symbol and business facts and clears missing metadata after a language refresh', async t => {
+  const tokenSection = { kind: 'markdown', value: '`read` · **方法**\n\n**作用：** 读取资料。' }
+  const symbolSection = { kind: 'markdown', value: '**类别：** 方法' }
+  const businessSection = { kind: 'markdown', value: '**功能描述：** 读取当前项目的资料。' }
+  let result = {
+    sections: [tokenSection, businessSection], originalSections: [{ kind: 'plaintext', value: 'Read project records.' }], source: '语言服务',
+    symbol: { name: 'read', language: 'python', category: '方法', returnType: 'str', purpose: '读取资料。' },
+    tokenSection, symbolSection, businessBaseSections: [tokenSection], businessSection,
+    business: { entity: { id: 'read', name: 'read' }, business: { status: 'current', source: 'human', business_meaning: '读取当前项目的资料。' } },
+    businessReadError: '', untranslated: true,
+    documentationTranslation: { language: 'zh-CN', source: 'configured-model' },
+    documentation_translation: { language: 'zh-CN', source: 'configured-model', status: 'pending' },
+    _code_agent_original: { contents: 'Read project records.' },
+  }
+  const { subject: s } = await setup(t, { lspServer: { available: true } }, {
+    capabilities: { hoverProvider: true }, hover: () => result,
+  })
+  assert.equal(await s.showDocumentation(), true)
+  for (const [key, value] of Object.entries(result)) assert.deepEqual(clone(s.symbolDocumentation.value[key]), value, key)
+  const optionalKeys = ['symbol', 'tokenSection', 'symbolSection', 'businessBaseSections', 'businessSection', 'business',
+    'businessReadError', 'untranslated', 'documentationTranslation', 'documentation_translation', '_code_agent_original']
+  result = { sections: [{ kind: 'plaintext', value: '新语言说明没有旧的结构化事实。' }], source: '新语言服务' }
+  notifyHoverDocumentationUpdated({ projectId: 'p', tree: 'main', uri: 'file:///E:/project/src/a.py', version: 1 })
+  await settle()
+  assert.equal(s.symbolDocumentation.value.source, '新语言服务')
+  assert.equal(s.symbolDocumentation.value.sections[0].value, result.sections[0].value)
+  assert.deepEqual(clone(s.symbolDocumentation.value.originalSections), [])
+  for (const key of optionalKeys) {
+    assert.equal(Object.hasOwn(s.symbolDocumentation.value, key), true, key)
+    assert.equal(s.symbolDocumentation.value[key], undefined, key)
+  }
 })
 
 test('background LSP documentation updates refresh the pinned full view without stealing focus or opening native hover', async t => {
@@ -778,6 +846,56 @@ test('background LSP documentation updates refresh the pinned full view without 
   notifyHoverDocumentationUpdated(change)
   await settle()
   assert.equal(clients[0].calls.filter(([name]) => name === 'hover').length, 2)
+})
+
+test('retry retains the original and pin, deduplicates clicks, and receives background completion at the queried word', async t => {
+  let retryDone
+  const original = [{ kind: 'plaintext', value: 'Enable Spring transaction management.' }]
+  let result = { sections: [], originalSections: original, documentation_translation: { status: 'failed', error_code: 'timeout' } }
+  const { subject: s, clients, fake } = await setup(t, { lspServer: { available: true } }, {
+    capabilities: { hoverProvider: true }, hover: (token, query) => query?.retryTranslation ? new Promise(resolve => { retryDone = resolve }) : result,
+  })
+  const editor = fake.editors[0]
+  editor.setSelection(new fake.monaco.Range(1, 2, 1, 2))
+  await s.showDocumentation(); s.toggleDocumentationPin()
+  const before = clone(s.snapshot()), focused = editor.focusCount
+  const pending = s.retryDocumentationTranslation()
+  assert.equal(s.symbolDocumentation.value.documentation_translation.status, 'pending')
+  assert.deepEqual(clone(s.symbolDocumentation.value.originalSections), original)
+  assert.equal(s.symbolDocumentation.value.loading, false)
+  assert.equal(s.symbolDocumentation.value.pinned, true)
+  assert.equal(await s.retryDocumentationTranslation(), false)
+  assert.equal(clients[0].calls.filter(x => x[0] === 'hover').length, 2)
+  assert.deepEqual(clone(clients[0].calls.at(-1)[4]), { retryTranslation: true })
+  retryDone({ ...result, documentation_translation: { status: 'pending' } }); await pending
+  result = { sections: [{ kind: 'plaintext', value: '启用 Spring 声明式事务管理。' }], originalSections: original, documentation_translation: { status: 'ready' } }
+  notifyHoverDocumentationUpdated({ projectId: 'p', tree: 'main', uri: 'file:///E:/project/src/a.py', version: 1, position: { line: 0, character: 1 }, status: 'ready' })
+  await settle()
+  assert.equal(s.symbolDocumentation.value.documentation_translation.status, 'ready')
+  assert.deepEqual(clone(s.symbolDocumentation.value.originalSections), original)
+  assert.equal(editor.focusCount, focused)
+  assert.deepEqual(clone(s.snapshot()), before)
+})
+
+test('failed retry keeps its original readable and closed panels reject late translation results', async t => {
+  let rejectRetry, resolveRetry
+  const originalSections = [{ kind: 'plaintext', value: 'Original documentation.' }]
+  const { subject: s } = await setup(t, { lspServer: { available: true } }, {
+    capabilities: { hoverProvider: true }, hover: (_, query) => query?.retryTranslation
+      ? new Promise((resolve, reject) => { resolveRetry = resolve; rejectRetry = reject })
+      : { sections: [], originalSections, documentation_translation: { status: 'failed' } },
+  })
+  await s.showDocumentation()
+  const pending = s.retryDocumentationTranslation(); rejectRetry(new Error('private provider credentials'))
+  assert.equal(await pending, false)
+  assert.equal(s.symbolDocumentation.value.documentation_translation.error_code, 'request_failed')
+  assert.equal(s.symbolDocumentation.value.error, '')
+  assert.deepEqual(clone(s.symbolDocumentation.value.originalSections), originalSections)
+  const later = s.retryDocumentationTranslation(); s.closeDocumentation(false)
+  resolveRetry({ sections: [{ kind: 'plaintext', value: '迟到的中文。' }], documentation_translation: { status: 'ready' } })
+  await later
+  assert.equal(s.symbolDocumentation.value, null)
+  assert.equal(await s.retryDocumentationTranslation(), false)
 })
 
 test('frequent background updates during a full-documentation read keep it running and coalesce one later refresh', async t => {
@@ -887,17 +1005,23 @@ test('a pinned explanation shows failed function refreshes and recovers while re
   const column = text.indexOf('categoryId') + 1
   fake.editors[0].setSelection(new fake.monaco.Range(1, column, 1, column))
   await s.showDocumentation()
+  assert.equal(s.symbolDocumentation.value.business.business.business_meaning, '当前分类功能')
+  assert.equal(s.symbolDocumentation.value.businessReadError, '')
   failed = true
   notifyBusinessMeaningChanged({ projectId: 'p', tree: 'main', automatic: true })
   await settle()
   assert.match(s.symbolDocumentation.value.sections[0].value, /功能描述.*接口不可用.*重启后端/)
   assert.doesNotMatch(s.symbolDocumentation.value.sections[0].value, /当前分类功能/)
   assert.equal(s.symbolDocumentation.value.sections.at(-1).value, '原始语言服务说明')
+  assert.equal(s.symbolDocumentation.value.business, null, 'a failed refresh clears the previous business record')
+  assert.match(s.symbolDocumentation.value.businessReadError, /接口不可用/)
   failed = false
   notifyBusinessMeaningChanged({ projectId: 'p', tree: 'main', automatic: true })
   await settle()
   assert.match(s.symbolDocumentation.value.sections[0].value, /功能描述.*当前分类功能/)
   assert.doesNotMatch(s.symbolDocumentation.value.sections[0].value, /接口不可用/)
+  assert.equal(s.symbolDocumentation.value.business.business.business_meaning, '当前分类功能')
+  assert.equal(s.symbolDocumentation.value.businessReadError, '', 'successful recovery clears the old failure')
 })
 
 test('open Java explanations ignore automatic changes from another project/tree or entity', async t => {
@@ -935,9 +1059,15 @@ test('an optional automatic refresh failure replaces the function with an honest
   notifyBusinessMeaningChanged({ projectId: 'p', tree: 'main', automatic: true }); await settle()
   assert.equal(reads, 2)
   const updated = clone(s.symbolDocumentation.value)
-  assert.deepEqual({ ...updated, sections: [] }, { ...before, sections: [] })
+  const stableLanguageFields = document => {
+    const { sections, business, businessSection, businessReadError, ...stable } = document
+    return stable
+  }
+  assert.deepEqual(stableLanguageFields(updated), stableLanguageFields(before))
+  assert.equal(updated.business, null)
+  assert.match(updated.businessReadError, /暂时无法读取/)
   assert.match(updated.sections[0].value, /功能描述.*暂时无法读取.*重试/)
-  assert.match(updated.sections[0].value, /作用.*保存类或实例的状态/)
+  assert.match(updated.sections[0].value, /作用.*保存每个实例各自的状态/)
   assert.doesNotMatch(updated.sections[0].value, /已确认的功能描述/)
 })
 
@@ -1106,4 +1236,25 @@ test('resource notifications encode project paths and invert created/deleted sta
   s.notifyResourceChanges(batch, true, 'E:\\项目 空间')
   changes = clients[0].calls.at(-1)[2].changes
   assert.deepEqual(clone(changes.map(row => row.type)), [3, 1, 2])
+})
+
+test('pinned Chinese documentation retains original receipts across files but never across projects', async t => {
+  const sections = [{ kind: 'markdown', value: '**作用：** 保留当前中文业务说明。' }]
+  const originalSections = [{ kind: 'markdown', value: 'Original provider documentation.' }]
+  const { subject: s, props } = await setup(t, { lspServer: { available: true } }, {
+    capabilities: { hoverProvider: true }, hover: { sections, originalSections },
+  })
+  assert.equal(await s.runIdeCommand('documentation'), true)
+  assert.deepEqual(clone(s.symbolDocumentation.value.originalSections), originalSections)
+  s.runIdeCommand('documentation')
+  assert.equal(s.symbolDocumentation.value.pinned, true)
+  props.file = initialFile({ path: 'src/b.py', uri: 'file:///E:/project/src/b.py', text: 'another file' })
+  props.documentKey = 'p/main/src/b.py'
+  await settle()
+  assert.equal(s.symbolDocumentation.value.path, 'src/a.py')
+  assert.equal(s.symbolDocumentation.value.detached, true)
+  assert.deepEqual(clone(s.symbolDocumentation.value.sections), sections)
+  props.projectId = 'another-project'
+  await settle()
+  assert.equal(s.symbolDocumentation.value, null)
 })

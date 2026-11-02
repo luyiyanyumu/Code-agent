@@ -11,12 +11,14 @@ export const latestPackage = '@luyiyanyumu/code-agent@latest'
 const providers = new Set(['offline', 'deepseek', 'openai', 'openai_compat'])
 const help = `Code-agent：本地 AI 编码工作台
 
-用法：code-agent [start|install|update] [选项]
+用法：code-agent [start|install|update|launcher] [选项]
   启动：npx @luyiyanyumu/code-agent@latest
   更新：npx @luyiyanyumu/code-agent@latest update
   start              启动工作台（默认）；首次自动安装 Python 后端
   install            只准备当前版本的运行环境
   update             下载最新发布包并准备环境，不中断已有服务
+  launcher           打开独立启动器，管理前后端、日志和更新
+  --launcher-port <端口> 启动器端口，默认 19387
   --host <地址>      监听地址，默认 127.0.0.1
   --port <端口>      监听端口，默认 8765
   --provider <名称>  offline / deepseek / openai / openai_compat
@@ -26,7 +28,7 @@ const help = `Code-agent：本地 AI 编码工作台
   -h, --help         查看帮助
   -v, --version      查看版本
 
-需要 Node.js 20.11+、Python 3.11+。可启动后在设置中配置模型，或使用环境变量 / 数据目录 .env。
+需要 Node.js 22.14+、Python 3.11+。可启动后在设置中配置模型，或使用环境变量 / 数据目录 .env。
 `
 
 export function parseArgs(args) {
@@ -37,13 +39,13 @@ export function parseArgs(args) {
     if (['-h', '--help'].includes(arg)) { options.help = true; continue }
     if (['-v', '--version'].includes(arg)) { options.version = true; continue }
     if (arg === '--no-open') { options.open = false; continue }
-    if (['start', 'install', 'update'].includes(arg) && !commandSeen) {
+    if (['start', 'install', 'update', 'launcher'].includes(arg) && !commandSeen) {
       options.command = arg
       commandSeen = true
       continue
     }
     const [flag, ...inlineValue] = arg.split('=')
-    if (!['--host', '--port', '--provider', '--home', '--python'].includes(flag)) {
+    if (!['--host', '--port', '--provider', '--home', '--python', '--launcher-port'].includes(flag)) {
       throw new Error(`未知参数：${arg}。使用 --help 查看用法。`)
     }
     const value = inlineValue.length ? inlineValue.join('=') : args[++index]
@@ -54,6 +56,11 @@ export function parseArgs(args) {
     throw new Error('--port 必须为 1 到 65535 的整数。')
   }
   options.port = Number(options.port)
+  if (options['launcher-port'] !== undefined) {
+    if (!/^\d+$/.test(options['launcher-port']) || Number(options['launcher-port']) < 1 || Number(options['launcher-port']) > 65535) throw new Error('--launcher-port 必须为 1 到 65535 的整数。')
+    options.launcherPort = Number(options['launcher-port'])
+    delete options['launcher-port']
+  }
   if (!/^[a-zA-Z0-9.:[\]_-]+$/.test(options.host)) throw new Error('--host 必须是有效的主机名或 IP 地址。')
   options.host = options.host.replace(/^\[([^\]]+)\]$/, '$1')
   if (options.provider && !providers.has(options.provider)) throw new Error(`不支持的模型供应商：${options.provider}`)
@@ -174,6 +181,7 @@ export async function ensureRuntime({ root = packageRoot, home, release, python,
     await checkedRun(run, selected.command, [...selected.prefix, '-m', 'venv', paths.directory], { cwd: root, env }, '创建 Python 环境')
     await checkedRun(run, paths.python, ['-I', '-X', 'utf8', '-m', 'pip', '--disable-pip-version-check', 'install', '--no-input', '--upgrade', '--progress-bar', 'off', root], { cwd: root, env }, '安装后端依赖')
     await checkedRun(run, paths.python, ['-I', '-X', 'utf8', '-c', 'import code_agent.server'], { cwd: root, env }, '后端导入验证')
+    await checkedRun(run, paths.python, ['-I', '-X', 'utf8', '-m', 'code_agent.harness', '--prepare'], { cwd: root, env }, '准备 DeepSeek Harness 内核')
     if (!existsSync(paths.python)) throw new Error('Python 环境未生成可执行文件，请检查 Python venv 组件是否安装。')
     const temporary = `${paths.ready}.${process.pid}.tmp`
     await writeFile(temporary, JSON.stringify(release) + '\n', 'utf8')
@@ -276,7 +284,7 @@ export async function main(args = process.argv.slice(2), dependencies = {}) {
   const platform = dependencies.platform || process.platform
   try {
     const nodeVersion = (dependencies.nodeVersion || process.versions.node).split('.').map(Number)
-    if (nodeVersion[0] < 20 || (nodeVersion[0] === 20 && nodeVersion[1] < 11)) throw new Error('需要 Node.js 20.11 或更新版本。')
+    if (nodeVersion[0] < 22 || (nodeVersion[0] === 22 && nodeVersion[1] < 14)) throw new Error('需要 Node.js 22.14 或更新版本，以运行 DeepSeek Harness 内核。')
     const options = parseArgs(args)
     // A relative executable is relative to the invoking project, not the temporary npx package.
     if (options.python && /[/\\]/.test(options.python) && !isAbsolute(options.python)) options.python = resolve(cwd, options.python)
@@ -284,9 +292,26 @@ export async function main(args = process.argv.slice(2), dependencies = {}) {
     const metadata = JSON.parse(await readFile(join(root, 'package.json'), 'utf8'))
     if (options.help) { log(help); return 0 }
     if (options.version) { log(metadata.version); return 0 }
+    if (options.command === 'launcher') {
+      if (platform === 'win32' && options.open && !dependencies.launchControlPanel) {
+        const { launchDesktopWindow } = await import('./desktop-launcher.mjs')
+        const launcher = await launchDesktopWindow({ root, home: options.home, env })
+        log(`[code-agent] 桌面启动器已打开：${launcher.executable}`)
+        return 0
+      }
+      const { launchControlPanel } = await import('./launcher.mjs')
+      const launcher = await (dependencies.launchControlPanel || launchControlPanel)({
+        root, home: options.home, launcherPort: options.launcherPort, backendPort: options.port, open: options.open, env,
+      })
+      log(`[code-agent] 启动器：${launcher.url}`)
+      return 0
+    }
     if (options.command === 'update') return await updateLatest(options, { run, env, cwd, npmCli: dependencies.npmCli, log })
     const home = resolve(cwd, options.home || env.CODE_AGENT_HOME || join(homedir(), '.code-agent'))
     env.CODE_AGENT_HOME = home
+    // The Python wheel lives in its venv; these source-built JS assets ship in the package.
+    env.CODE_AGENT_HARNESS_NODE_DIR = join(root, 'code_agent', 'harness', 'node')
+    env.CODE_AGENT_NODE = process.execPath
     const checkPort = dependencies.checkPort || assertPortFree
     if (options.command === 'start') await checkPort(options.host, options.port)
     if (!existsSync(join(root, 'web', 'dist', 'index.html'))) throw new Error('此安装包缺少预构建界面，请重新下载正式发布包。')

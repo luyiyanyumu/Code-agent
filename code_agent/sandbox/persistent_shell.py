@@ -107,8 +107,8 @@ class PersistentShell:
             cwd=str(cwd) if cwd else None,
         )
         if _IS_WINDOWS:
-            # 独立进程组：超时/关闭时整棵树一起杀（与 executor._spawn 同一做法）
-            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+            # 保留进程组回收，后台 shell 不另开 Windows Terminal 窗口。
+            kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
         else:
             kwargs["start_new_session"] = True
         proc = await asyncio.create_subprocess_exec(*argv, **kwargs)

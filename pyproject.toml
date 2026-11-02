@@ -36,12 +36,20 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["code_agent*"]
+exclude = ["code_agent.harness.node*"]
 
 # 随包自带的技能目录必须被装进去：`config.builtin_skills_dir()` 指的就是它。
 # 不声明的话，`pip install` 出来的包里没有这些 SKILL.md/脚本——
 # 而技能目录在源码 checkout 里跑得好好的，本机测不出来（典型的"只在打包后坏"）。
 [tool.setuptools.package-data]
-code_agent = ["skills/**/*.md", "skills/**/*.py"]
+code_agent = [
+    "skills/**/*.md", "skills/**/*.py",
+    "harness/node/*.mjs", "harness/node/*.json", "harness/node/*.md", "harness/node/LICENSE*",
+    "harness/node/src/**/*", "harness/node/vendor/**/*",
+]
+
+[tool.setuptools.exclude-package-data]
+code_agent = ["harness/node/**/tests/**", "harness/node/**/node_modules/**", "harness/node/**/AGENTS.md", "harness/node/**/CLAUDE.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

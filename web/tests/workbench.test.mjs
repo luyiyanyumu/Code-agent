@@ -22,6 +22,23 @@ const file = (path = 'src/main.js', text = 'original', sha1 = 'hash-original') =
   path, text, sha1, lang: 'javascript', editable: true, total_lines: 1,
 })
 
+test('read errors preserve drafts and a reappearing file clears stale existence metadata even on conflict', t => {
+  const { workbench: w, storage } = setup(t)
+  w.activateProject('p')
+  const doc = w.openFile(file())
+  w.update(doc.key, { text: 'unsaved draft' })
+  w.markReadError(doc.key, '文件不存在', { missing: true })
+  assert.equal(doc.needsReload, true); assert.equal(doc.file.missing, true)
+  w.flush()
+  assert.equal(JSON.parse(storage.getItem(STORAGE_KEY)).scopes[0].documents[0].text, 'unsaved draft')
+  w.updateExternal(doc.key, file(undefined, 'new external disk', 'new-hash'))
+  assert.equal(doc.text, 'unsaved draft'); assert.equal(doc.savedText, 'original'); assert.equal(doc.sha1, 'hash-original')
+  assert.ok(doc.conflict); assert.equal(doc.file.editable, true); assert.notEqual(doc.file.missing, true)
+  assert.equal(doc.readError, ''); assert.equal(doc.needsReload, false)
+  w.markSaveError(doc.key, '保存失败'); w.markSaved(doc.key, { text: 'unsaved draft', sha1: 'saved-hash' })
+  assert.equal(doc.saveError, '')
+})
+
 test('project, tree and exact normalized path isolate documents and active tabs', (t) => {
   const { workbench: w } = setup(t)
   w.activateProject('first')

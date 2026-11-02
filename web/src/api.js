@@ -68,7 +68,8 @@ export async function request(method, path, body, options = {}) {
           '请重启后端进程后刷新页面。'
       }
     }
-    throw Object.assign(new Error(typeof msg === 'string' ? msg : JSON.stringify(msg)), { status: resp.status })
+    throw Object.assign(new Error(typeof msg === 'string' ? msg : JSON.stringify(msg)), { status: resp.status,
+      ...(resp.headers?.get?.('X-Code-Agent-Error-Code') ? { code: resp.headers.get('X-Code-Agent-Error-Code') } : {}) })
   }
   return data
 }
@@ -78,6 +79,8 @@ export const api = {
   me: () => request('GET', '/api/v1/auth/me'),
 
   listSessions: () => request('GET', '/api/v1/sessions'),
+  sessionModels: sid => request('GET', `/api/v1/sessions/${encodeURIComponent(sid)}/models`),
+  selectSessionModel: (sid, selection) => request('PUT', `/api/v1/sessions/${encodeURIComponent(sid)}/model`, selection),
   // opts.folder：把新会话直接建在某个工作区分组下；opts.permissionMode：三档权限
   // 模型不用传：用什么模型由"当前生效的配置档案"决定
   createSession: (opts = {}) =>
@@ -278,6 +281,16 @@ export const api = {
     closeTerminal: (pid, id) =>
       request('DELETE', `/api/v1/code/projects/${encodeURIComponent(pid)}/terminals/${encodeURIComponent(id)}`),
     runConfigs: (pid, options) => request('GET', `/api/v1/code/projects/${encodeURIComponent(pid)}/run-configs`, undefined, options),
+    integration: (pid, options) => request('GET', `/api/v1/code/projects/${encodeURIComponent(pid)}/integration`, undefined, options),
+    integrationConfig: (pid, options) => request('GET', `/api/v1/code/projects/${encodeURIComponent(pid)}/integration/config`, undefined, options),
+    saveIntegrationConfig: (pid, config, options) => request('PUT', `/api/v1/code/projects/${encodeURIComponent(pid)}/integration/config`, config, options),
+    startIntegration: (pid, config) => request('POST', `/api/v1/code/projects/${encodeURIComponent(pid)}/integration/start`, config),
+    stopIntegration: (pid, body = { role: 'all' }) => request('POST', `/api/v1/code/projects/${encodeURIComponent(pid)}/integration/stop`, body),
+    restartIntegration: (pid, body = { role: 'all' }) => request('POST', `/api/v1/code/projects/${encodeURIComponent(pid)}/integration/restart`, body),
+    integrationPreview: (pid, payload, options) => request('POST', `/api/v1/code/projects/${encodeURIComponent(pid)}/integration/preview`, payload || {}, options),
+    integrationRequest: (pid, body, options) => request('POST', `/api/v1/code/projects/${encodeURIComponent(pid)}/integration/request`, body, options),
+    integrationRequests: (pid, options) => request('GET', `/api/v1/code/projects/${encodeURIComponent(pid)}/integration/requests`, undefined, options),
+    integrationRequestDetail: (pid, id, options) => request('GET', `/api/v1/code/projects/${encodeURIComponent(pid)}/integration/requests/${encodeURIComponent(id)}`, undefined, options),
     designInfo: (pid, options) => request('GET', `/api/v1/code/projects/${encodeURIComponent(pid)}/frontend-design`, undefined, options),
     designPreview: (pid, payload, options) => request('POST', `/api/v1/code/projects/${encodeURIComponent(pid)}/frontend-design/preview`, payload, options),
     saveDesignStyles: (pid, payload, options) => request('PUT', `/api/v1/code/projects/${encodeURIComponent(pid)}/frontend-design/styles`, payload, options),
@@ -602,10 +615,10 @@ export const api = {
         `/api/v1/code/projects/${encodeURIComponent(pid)}/feature-briefs${missing ? `?missing=${missing}` : ''}`
       ),
     // 补描述：后台跑（批量问模型 + 服务端落库，不带任何工具），进度走 indexStatus.briefs
-    fillFeatureBriefs: (pid, { limit = 0 } = {}) =>
+    fillFeatureBriefs: (pid, { limit = 0, tree = 'main' } = {}) =>
       request(
         'POST',
-        `/api/v1/code/projects/${encodeURIComponent(pid)}/feature-briefs/fill${limit ? `?limit=${limit}` : ''}`
+          `/api/v1/code/projects/${encodeURIComponent(pid)}/feature-briefs/fill?${new URLSearchParams({ tree, ...(limit ? { limit: String(limit) } : {}) })}`
       ),
     symbolLogic: (pid, id, tree = 'main') =>
       request(

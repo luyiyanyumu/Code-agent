@@ -5,6 +5,7 @@ import { readFile } from 'node:fs/promises'
 import * as Vue from 'vue'
 import { compileScript, compileTemplate, parse } from '@vue/compiler-sfc'
 import { SETTINGS_SECTIONS } from '../src/lib/settingsCatalog.js'
+import { desktopRuntime } from '../src/lib/desktopRuntime.js'
 
 // Render the actual App template with small stateful editor/settings fixtures.
 // Their draft buffers let this regression detect accidental component remounts.
@@ -38,8 +39,10 @@ async function setup({ savedView, savedSection, storageBlocked = false } = {}) {
   const context = vm.createContext({
     ...Vue,
     SETTINGS_SECTIONS,
+    desktopRuntime,
     defineAsyncComponent: loader => component(loader.toString().match(/\/([\w]+)\.vue/)[1]),
     DialogHost: component('DialogHost'),
+    DesktopSystemPanel: component('DesktopSystemPanel'),
     AgentLogo: Vue.defineComponent({ name: 'AgentLogo', render: () => Vue.h('span', { 'data-component': 'AgentLogo' }) }),
     api: { me: async () => ({ id: 'fixture-owner', role: 'admin' }) }, getToken: () => '', setToken() {},
     usePreferences: () => ({ preferences: { defaultView: 'last' } }),

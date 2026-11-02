@@ -97,7 +97,8 @@ def test_direct_queued_submission_expires_before_any_model_request(environment, 
 
 def test_deadline_during_approval_requeue_clears_suspension_for_next_activation(environment, monkeypatch):
     manager, team, user, lead, roster, root = environment
-    monkeypatch.setattr(team, "limits", lambda: {"max_parallel": 1, "max_depth": 3})
+    limits = {"max_parallel": 2, "max_depth": 3}
+    monkeypatch.setattr(team, "limits", lambda: dict(limits))
     first, second = roster["agents"][:2]
 
     async def scenario():
@@ -118,13 +119,18 @@ def test_deadline_during_approval_requeue_clears_suspension_for_next_activation(
             OfflineProvider.text_turn("finished"),
         ]))
         assign_provider(occupier, Hold())
-        await team.followup(lead, user, first["session_id"], "bounded approval", budget={"max_seconds": 1})
+        # Prepare the occupied slot before starting the one-second deadline;
+        # loading a second official runtime is not the behaviour under test.
+        await team.followup(lead, user, second["session_id"], "hold slot", write_paths=[])
+        await asyncio.wait_for(entered.wait(), 2)
+        await team.followup(lead, user, first["session_id"], "bounded approval",
+                            write_paths=["queued-grant.txt"], budget={"max_seconds": 1})
         try:
             async with asyncio.timeout(2):
                 while writer.pending_approval() is None or first["session_id"] in team._capacity(first["project_id"]).active:
                     await asyncio.sleep(0.002)
-            await team.followup(lead, user, second["session_id"], "hold slot")
-            await asyncio.wait_for(entered.wait(), 1)
+            # The approval must now requeue behind exactly one allowed slot.
+            limits["max_parallel"] = 1
             writer.decide_approval(writer.pending_approval()["approval_id"], True)
             async with asyncio.timeout(2):
                 while team.descriptor(first["session_id"])["state"] in ("running", "queued", "waiting"):
@@ -140,7 +146,8 @@ def test_deadline_during_approval_requeue_clears_suspension_for_next_activation(
                     "purpose": "验证新执行编号能重新申请审批", "effects": ["尝试创建临时 new-approval.txt"]}}),
                 OfflineProvider.text_turn("finished"),
             ]))
-            await team.followup(lead, user, first["session_id"], "new activation approval")
+            await team.followup(lead, user, first["session_id"], "new activation approval",
+                                write_paths=["new-approval.txt"])
             async with asyncio.timeout(2):
                 while writer.pending_approval() is None:
                     await asyncio.sleep(0.002)

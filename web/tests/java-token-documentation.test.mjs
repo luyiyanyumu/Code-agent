@@ -47,7 +47,7 @@ test('Spring raw resource method declarations retain their exact name binding wi
 
 test('declared classes, interfaces, records, constructors, fields and locals use syntax evidence', () => {
   const text = 'interface Contract {} class Service implements Contract { private String name; public Service() {} public int run(final int count) { int total = count; return total; } } record Pair(String left, int right) {}'
-  const expected = { Contract: '接口', Service: '类', name: '字段', run: '方法', count: '参数', total: '局部变量', Pair: '记录类', left: '记录组件', right: '记录组件' }
+  const expected = { Contract: '接口', Service: '类', name: '成员变量', run: '方法', count: '参数', total: '局部变量', Pair: '记录类', left: '记录组件', right: '记录组件' }
   for (const [word, category] of Object.entries(expected)) assert.equal(at(text, word).category, category, word)
   assert.equal(at(text, 'Service', { offset: text.indexOf('Service()') }).category, '构造器')
   assert.equal(at(text, 'total', { offset: text.lastIndexOf('total') }).category, '局部变量')
@@ -108,7 +108,7 @@ test('authoritative JDT semantic categories and modifiers take precedence over i
   const text = 'Example item; item.run(); @RequestParam(required=false) String value;'
   assert.equal(at(text, 'Example', { semanticToken: { type: 'interface', modifiers: [] } }).category, '接口')
   const field = at(text, 'item', { semanticToken: { type: 'property', modifiers: ['private', 'static', 'readonly', 'declaration'] } })
-  assert.equal(field.category, '字段')
+  assert.equal(field.category, '类常量')
   assert.match(markdown(field), /private（私有）.*静态.*final.*声明位置/)
   const finalClass = at(text, 'Example', { semanticToken: { type: 'class', modifiers: ['readonly', 'public'] } })
   assert.match(markdown(finalClass), /final.*public/)
@@ -128,7 +128,7 @@ test('LSP signature evidence supplies real types without guessing from uppercase
   const result = at(text, 'run', { hoverContents: { kind: 'markdown', value: '```java\npublic java.util.List<String> example.Service.run(int count)\n```' } })
   assert.equal(result.category, '方法')
   assert.match(markdown(result), /`java.util.List<String>`/)
-  assert.equal(at(text, 'count', { hoverContents: [{ language: 'java', value: 'private int example.Service.count' }] }).category, '字段')
+  assert.equal(at(text, 'count', { hoverContents: [{ language: 'java', value: 'private int example.Service.count' }] }).category, '成员变量')
   assert.equal(at(text, 'unknown', { hoverContents: 'public interface unknown' }).category, '接口')
   assert.equal(at(text, 'unknown', { hoverContents: 'This unknown method could be anything.' }).category, '标识符（语义尚未解析）')
 })
@@ -136,7 +136,7 @@ test('LSP signature evidence supplies real types without guessing from uppercase
 test('member names are not resolved against unrelated same-named local variables', () => {
   const text = 'class A { String field; void run() { int value = 1; other.value; this.field; } }'
   assert.equal(at(text, 'value', { offset: text.indexOf('other.value') + 6 }).category, '标识符（语义尚未解析）')
-  assert.equal(at(text, 'field', { offset: text.indexOf('this.field') + 5 }).category, '字段')
+  assert.equal(at(text, 'field', { offset: text.indexOf('this.field') + 5 }).category, '成员变量')
 })
 
 test('Unicode identifiers preserve UTF-16 ranges and punctuation/whitespace do not borrow a neighbor', () => {
@@ -146,7 +146,7 @@ test('Unicode identifiers preserve UTF-16 ranges and punctuation/whitespace do n
   assert.equal(result.word, '𐐀值')
   assert.equal(result.end - result.start, 3)
   assert.equal(describeJavaToken({ text, offset: result.start + 1 }).word, '𐐀值')
-  assert.equal(at(text, '$数额').category, '字段')
+  assert.equal(at(text, '$数额').category, '成员变量')
   for (const offset of [-1, text.length, text.indexOf('{'), text.indexOf(' '), 0.5]) assert.equal(describeJavaToken({ text, offset }), null, String(offset))
   assert.equal(describeJavaToken({ text, offset: result.end }), null)
 })
@@ -179,7 +179,7 @@ test('scope indexes resolve shadowing and scale with many distinct declarations'
   const text = 'class Many { ' + Array.from({ length: 1200 }, (_, i) => `int field${i};`).join('\n') + ' void run(int arg) { int local = 1; { String local = "x"; use(local); } use(local); } }'
   const index = createJavaTokenIndex(text)
   assert.equal(index.declarations.size, 1202)
-  assert.equal(at(text, 'field1199', { index }).category, '字段')
+  assert.equal(at(text, 'field1199', { index }).category, '成员变量')
   assert.match(markdown(at(text, 'local', { index, offset: text.indexOf('use(local)') + 4 })), /`String`/)
   assert.match(markdown(at(text, 'local', { index, offset: text.lastIndexOf('use(local)') + 4 })), /`int`/)
 })
@@ -187,7 +187,7 @@ test('scope indexes resolve shadowing and scale with many distinct declarations'
 test('this-qualified names resolve only fields of the current type despite parameter shadowing', () => {
   const text = 'class A { String value; void run(int value) { use(this.value); use(value); } }'
   const field = at(text, 'value', { offset: text.indexOf('this.value') + 5 })
-  assert.equal(field.category, '字段')
+  assert.equal(field.category, '成员变量')
   assert.match(markdown(field), /`String`/)
   const parameter = at(text, 'value', { offset: text.lastIndexOf('use(value)') + 4 })
   assert.equal(parameter.category, '参数')
@@ -201,7 +201,7 @@ test('for declarations stop at the loop statement and do not shadow later field 
     assert.equal(within.category, '局部变量')
     assert.match(markdown(within), /`int`/)
     const outside = at(text, 'value', { offset: text.lastIndexOf('use(value)') + 4 })
-    assert.equal(outside.category, '字段')
+    assert.equal(outside.category, '成员变量')
     assert.match(markdown(outside), /`String`/)
   }
   const uncertain = 'class A { String value; void run() { for (int value=0; value<2; value++) if (ready) use(value); use(value); } }'
@@ -219,7 +219,7 @@ test('try resources and catch parameters stay within their own bodies', () => {
   assert.match(markdown(caught), /`Exception`/)
   for (const offset of uses.slice(2)) {
     const outside = at(text, 'value', { offset })
-    assert.equal(outside.category, '字段')
+    assert.equal(outside.category, '成员变量')
     assert.match(markdown(outside), /`String`/)
   }
 })
@@ -229,7 +229,7 @@ test('line comments end at CR, LF or CRLF without swallowing following Java code
     const text = '// comment' + newline + 'class A { int field; }'
     assert.equal(at(text, 'comment').category, '注释')
     assert.equal(at(text, 'A').category, '类')
-    assert.equal(at(text, 'field').category, '字段')
+    assert.equal(at(text, 'field').category, '成员变量')
   }
 })
 
@@ -255,7 +255,7 @@ test('plain hover prose is never treated as a variable type or method signature'
 
 test('local class fields belong to that class and annotation member declarations are attributes', () => {
   const text = 'class A { void m() { class Inner { int field; void n() { String local; } } } }'
-  assert.equal(at(text, 'field').category, '字段')
+  assert.equal(at(text, 'field').category, '成员变量')
   assert.equal(at(text, 'local').category, '局部变量')
   const annotation = '@interface Demo { boolean required() default false; String name(); }'
   assert.equal(at(annotation, 'Demo').category, '注解类型')
@@ -325,4 +325,98 @@ test('translated language-server prose does not displace verified Chinese librar
   assert.match(result.purpose, /HTTP.*GET/)
   assert.match(markdown(result), /作用依据：官方 API 摘要/)
   assert.doesNotMatch(markdown(result), /作用依据：.*模型中文翻译/)
+})
+
+test('Java storage labels follow declaration modifiers while keeping exact source docs and binding identity', () => {
+  const text = `class AutoFillConstant {
+    /** 实体类中创建时间的 setter 方法名称。 */ public static final String SET_CREATE_TIME = "setCreateTime";
+    static int counter = 0;
+    int updates;
+    final Object name = new Object();
+    int UPPERCASE;
+    void run(final int id) { final Object frozenId = new Object(); int current = id; use(frozenId); use(current); }
+  }`
+  const index = createJavaTokenIndex(text)
+  for (const [word, category] of Object.entries({ SET_CREATE_TIME: '类常量', counter: '静态变量', updates: '成员变量', name: '只读成员变量', UPPERCASE: '成员变量', frozenId: '只读局部变量', current: '局部变量', id: '参数' })) {
+    const declaration = index.declarations.get(word)[0]
+    const result = at(text, word, { index, offset: index.tokens[declaration.i].start })
+    assert.equal(result.category, category, word)
+    assert.equal(result.declarationOffset, index.tokens[declaration.i].start, word)
+    assert.match(markdown(result), new RegExp(`\\*\\*${category}\\*\\*`), word)
+    if (['字段', '局部变量'].includes(declaration.role.category)) assert.notEqual(declaration.role.category, '类常量', 'presentation does not rewrite binding categories')
+  }
+  assert.match(at(text, 'SET_CREATE_TIME', { index }).purpose, /创建时间的 setter/)
+  assert.match(markdown(at(text, 'SET_CREATE_TIME', { index })), /作用依据：本文件 Javadoc/)
+  assert.equal(at(text, 'frozenId', { index, offset: text.lastIndexOf('frozenId') }).category, '只读局部变量')
+  assert.match(at(text, 'frozenId', { index }).purpose, /对象的内容仍可能改变/)
+})
+
+test('static final semantic tokens and typed signatures refine member labels without classifying methods or parameters as constants', () => {
+  const text = 'class A { /** 当前上限。 */ static final int LIMIT = 1; void run(final int count) { final int total = count; use(total); } }'
+  for (const type of ['property', 'field', 'variable']) {
+    const result = at(text, 'LIMIT', { semanticToken: { type, modifiers: ['static', 'readonly', 'public'] } })
+    assert.equal(result.category, '类常量', type)
+    assert.match(result.purpose, /当前上限/, type)
+    assert.equal(result.declarationOffset, text.indexOf('LIMIT'), type)
+  }
+  assert.equal(at(text, 'total', { offset: text.lastIndexOf('total'), semanticToken: { type: 'variable', modifiers: ['readonly'] } }).category, '只读局部变量')
+  assert.equal(at(text, 'count', { semanticToken: { type: 'variable', modifiers: ['readonly'] } }).category, '参数')
+  assert.equal(at(text, 'run', { semanticToken: { type: 'method', modifiers: ['static', 'readonly'] } }).category, '方法')
+  for (const [signature, expected] of [
+    ['public static final String example.A.value', '类常量'],
+    ['static int example.A.value', '静态变量'],
+    ['final Object example.A.value', '只读成员变量'],
+    ['int example.A.value', '成员变量'],
+  ]) {
+    const result = at('other.value;', 'value', { hoverContents: { language: 'java', value: signature } })
+    assert.equal(result.category, expected, signature)
+    assert.equal(result.declarationOffset, undefined)
+  }
+  const external = at('other.value;', 'value', { semanticToken: { type: 'property', modifiers: ['static', 'readonly'] } })
+  assert.equal(external.category, '类常量')
+  const bareSignature = at('other.value;', 'value', { semanticToken: { type: 'property', modifiers: ['static', 'readonly'] }, hoverContents: { language: 'java', value: 'String value' } })
+  assert.equal(bareSignature.category, '类常量')
+  assert.match(markdown(bareSignature), /类型.*`String`/)
+  const contradictory = at(text, 'LIMIT', { semanticToken: { type: 'parameter', modifiers: [] } })
+  assert.equal(contradictory.category, '参数')
+  assert.equal(contradictory.declarationOffset, undefined)
+  assert.doesNotMatch(contradictory.purpose, /当前上限/)
+})
+
+test('interface and annotation fields are implicit class constants and grouped declarations share only their actual modifiers', () => {
+  const text = 'interface Flags { /** 默认大小。 */ int size = 1, count = 2; default void run() { int local = size; } } @interface Marker { String value = "x"; String name(); } class A { static final int first = f(1, 2), second = 2; static { final int local = 1; } }'
+  for (const word of ['size', 'count', 'value', 'first', 'second']) assert.equal(at(text, word).category, '类常量', word)
+  assert.match(at(text, 'size', { offset: text.lastIndexOf('size') }).purpose, /默认大小/)
+  assert.equal(at(text, 'local').category, '局部变量', 'an interface default-method local is not an implicit constant')
+  assert.equal(at(text, 'local', { offset: text.lastIndexOf('local') }).category, '只读局部变量', 'an initializer block variable is not a member')
+  assert.equal(at(text, 'name').category, '注解属性')
+  assert.equal(at('record Point(int x) {}', 'x').category, '记录组件')
+  assert.equal(at('Status.READY;', 'READY', { semanticToken: { type: 'enumMember', modifiers: ['static', 'readonly'] } }).category, '枚举常量')
+})
+
+test('bare, this and known-type member references retain categories and Javadoc under local shadowing', () => {
+  const text = `class A {
+    /** 共享上限。 */ static final int limit = 1;
+    /** 对象累计次数。 */ int updates;
+    void run(final int limit) { final int updates = limit; use(limit); use(updates); use(this.updates); use(A.limit); use(other.limit); }
+  }
+  class B { void run() { use(A.limit); } }`
+  const pick = (fragment, shift = 0) => at(text, fragment.split('.').at(-1).replace(/[);]/g, ''), { offset: text.indexOf(fragment) + shift })
+  const field = pick('this.updates', 5)
+  assert.equal(field.category, '成员变量')
+  assert.match(field.purpose, /对象累计次数/)
+  const constant = pick('A.limit', 2)
+  assert.equal(constant.category, '类常量')
+  assert.match(constant.purpose, /共享上限/)
+  assert.equal(constant.declarationOffset, text.indexOf('limit'))
+  const externalTypeReference = at(text, 'limit', { offset: text.lastIndexOf('A.limit') + 2 })
+  assert.equal(externalTypeReference.category, '类常量')
+  assert.match(externalTypeReference.purpose, /共享上限/)
+  assert.equal(at(text, 'limit', { offset: text.indexOf('use(limit)') + 4 }).category, '参数')
+  assert.equal(at(text, 'updates', { offset: text.indexOf('use(updates)') + 4 }).category, '只读局部变量')
+  assert.equal(pick('other.limit', 6).category, '标识符（语义尚未解析）')
+  const shadowedType = 'class A { static final int limit = 1; void m(Object A) { use(A.limit); } }'
+  const shadowed = at(shadowedType, 'limit', { offset: shadowedType.lastIndexOf('limit') })
+  assert.equal(shadowed.category, '标识符（语义尚未解析）')
+  assert.equal(shadowed.declarationOffset, undefined)
 })

@@ -4,7 +4,7 @@ import test from 'node:test'
 import vm from 'node:vm'
 import { computed, nextTick, ref, watch } from 'vue'
 import { usePreferences } from '../src/lib/preferences.js'
-import { SETTINGS_SECTIONS, WORKSPACE_SHORTCUTS, searchSettings } from '../src/lib/settingsCatalog.js'
+import { SETTINGS_GROUPS, SETTINGS_SECTIONS, WORKSPACE_SHORTCUTS, searchSettings } from '../src/lib/settingsCatalog.js'
 
 async function setup({ role = 'admin', failLoad = false, failSave = false, deferSave = false } = {}) {
   const calls = []
@@ -13,7 +13,7 @@ async function setup({ role = 'admin', failLoad = false, failSave = false, defer
   const source = (await readFile(new URL('../src/views/SettingsView.vue', import.meta.url), 'utf8')).match(/<script setup>([\s\S]*?)<\/script>/)[1].replace(/^import .*\r?\n/gm, '')
   const context = vm.createContext({
     defineAsyncComponent: loader => ({ loader }),
-    computed, nextTick, ref, watch, usePreferences, SETTINGS_SECTIONS, WORKSPACE_SHORTCUTS, searchSettings, defineEmits: () => () => {}, defineProps: () => ({ user: { role } }), onMounted() {},
+    computed, nextTick, ref, watch, usePreferences, SETTINGS_GROUPS, SETTINGS_SECTIONS, WORKSPACE_SHORTCUTS, searchSettings, defineEmits: () => () => {}, defineProps: () => ({ user: { role } }), onMounted() {},
     useDialog: () => ({}),
     api: { settings: {
       agentTeam: async () => {

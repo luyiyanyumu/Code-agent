@@ -3,22 +3,30 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
-// Real EditorPane + Monaco in Chrome, with an in-memory LSP only. The fixture
+// Real EditorPane + Monaco in Chrome, with in-memory LSP and business lookup. The fixture
 // cannot read a user project, write files, start language servers, or call AI.
 const pw = await import(process.env.PLAYWRIGHT_CORE_PATH || 'file:///C:/Users/dyh/.workbuddy/binaries/node/workspace/node_modules/playwright-core/index.js')
 const origin = new URL(process.argv[2] || 'http://127.0.0.1:5175').origin
 const output = path.resolve(process.argv[3] || fileURLToPath(new URL('../.tmp/java-hover-browser', import.meta.url)))
 fs.mkdirSync(output, { recursive: true })
-const checks = [], errors = [], unexpected = [], screenshots = [], observations = []
+const checks = [], errors = [], unexpected = [], screenshots = [], observations = [], businessRequests = []
 const source = `package demo;
 
 import org.springframework.web.bind.annotation.RequestParam;
 
 public class DocumentService implements Repository {
+    /** 保存创建时间 setter 的方法名。 */
+    public static final String SET_CREATE_TIME = "setCreateTime";
+    private static int counter = 0;
+    private int updates = 0;
     private final String name = "documents";
 
     public Long list(@RequestParam(required = false) Long categoryId) {
+        final Long frozenId = categoryId;
         Long localId = categoryId;
+        counter++;
+        this.updates++;
+        String label = DocumentService.SET_CREATE_TIME;
         return unknownResult;
     }
 }
@@ -63,6 +71,10 @@ function semantic(text,uri){
   else if(word==='Long')type=other?'interface':'class';
   else if(word==='list'||word==='read')type='method';
   else if(word==='name'){type='property';bits=2}
+  else if(word==='SET_CREATE_TIME'){type='property';bits=6}
+  else if(word==='counter'){type='property';bits=4}
+  else if(word==='updates')type='property';
+  else if(word==='frozenId'){type='variable';bits=2}
   else if(word==='categoryId')type='parameter';
   else if(word==='localId')type='variable';
   else if(word==='RequestParam'&&lineText.includes('@'))type='decorator';
@@ -119,6 +131,14 @@ try {
   const context = await browser.newContext({ viewport: { width: 1440, height: 930 }, serviceWorkers: 'block' })
   await context.route('**/*', route => {
     const url = new URL(route.request().url())
+    if (url.origin === origin && /^\/api\/v1\/code\/projects\/java-hover-fixture-(?:online|no-hover|offline)\/symbol\/business\/resolve$/.test(url.pathname)
+      && route.request().method() === 'POST') {
+      const payload = route.request().postDataJSON()
+      assert.ok(['src/demo/DocumentService.java', 'src/other/OtherService.java'].includes(payload.path))
+      assert.equal(payload.tree, 'main')
+      businessRequests.push(payload)
+      return route.fulfill({ contentType: 'application/json', body: JSON.stringify({ entity: null, business: null }) })
+    }
     if (url.origin !== origin || url.pathname.startsWith('/api/')) { unexpected.push(url.href); return route.abort() }
     if (url.pathname === '/__java-hover-fixture') return route.fulfill({ contentType: 'text/html', body: html })
     return route.continue()
@@ -170,13 +190,27 @@ try {
     { needle: 'public Long list', word: 'RequestParam', expected: /注解/, label: 'An annotation name has an annotation explanation' },
     { needle: 'public Long list', word: 'required', expected: /注解.*(?:属性|元素|参数)|(?:属性|元素).*注解/s, label: 'An annotation attribute is distinguished from an ordinary field' },
     { needle: 'public Long list', word: 'false', expected: /布尔.*字面量|字面量.*布尔/s, label: 'false is explained as a Boolean literal' },
-    { needle: 'public Long list', word: 'Long', expected: /Long\s*·\s*类(?:\s|$)[\s\S]*语言服务器语义信息/, label: 'A semantic class token enriches a type reference' },
+    { needle: 'public Long list', word: 'Long', expected: /Long\s*·\s*类(?:\s|$)/, label: 'A semantic class token enriches a type reference' },
   ]
   for (const item of cases) await inspectHover(item)
 
-  const annotation = await inspectHover({ needle: 'public Long list', word: 'RequestParam', expected: /注解/, label: 'Enhanced annotation hover retains original server documentation' })
-  assert.match(annotation, /org\.springframework\.web\.bind\.annotation\.RequestParam/)
-  assert.match(annotation, /Source:\s*spring-web-6\.2\.19\.jar/)
+  for (const item of [
+    { needle: 'public static final String', word: 'SET_CREATE_TIME', expected: /SET_CREATE_TIME\s*·\s*类常量/, label: 'Static final declaration displays as a class constant' },
+    { needle: 'String label =', word: 'SET_CREATE_TIME', expected: /SET_CREATE_TIME\s*·\s*类常量/, label: 'Qualified class constant reference keeps its classification' },
+    { needle: 'private static int', word: 'counter', expected: /counter\s*·\s*静态变量/, label: 'Mutable static field displays as a static variable' },
+    { needle: 'counter++;', word: 'counter', expected: /counter\s*·\s*静态变量/, label: 'Static variable reference keeps its classification' },
+    { needle: 'this.updates', word: 'updates', expected: /updates\s*·\s*成员变量/, label: 'This-qualified instance field displays as a member variable' },
+    { needle: 'private final String', word: 'name', expected: /name\s*·\s*只读成员变量/, label: 'Final instance field is not mislabeled as a class constant' },
+    { needle: 'final Long frozenId', word: 'frozenId', expected: /frozenId\s*·\s*只读局部变量/, label: 'Final method local displays as a readonly local variable' },
+    { needle: 'Long localId', word: 'localId', expected: /localId\s*·\s*局部变量/, label: 'Semantic variable token retains its local scope' },
+  ]) await inspectHover(item)
+  await inspectHover({ needle: 'public static final String', word: 'SET_CREATE_TIME', expected: /保存创建时间 setter 的方法名/, label: 'Refined constant label preserves the bound Javadoc' })
+  await shot('java-hover-class-constant.png')
+
+  const annotation = await inspectHover({ needle: 'public Long list', word: 'RequestParam', expected: /注解/, label: 'Compact annotation hover keeps its Chinese meaning without source boilerplate' })
+  assert.doesNotMatch(annotation, /org\.springframework\.web\.bind\.annotation\.RequestParam|spring-web-6\.2\.19\.jar/)
+  assert.doesNotMatch(annotation, /文档中文翻译：|识别依据：|作用依据：|功能描述：.*(?:待自动|尚未)/)
+  assert.match(annotation, /Ctrl\+Q/)
   await shot('java-hover-annotation.png')
   await inspectHover({ needle: 'public class', word: 'public', expected: /修饰符/, label: 'Modifier hover renders through the native Monaco surface' })
   await shot('java-hover-modifier.png')
@@ -193,9 +227,19 @@ try {
   await drawer.waitFor()
   await page.waitForFunction(() => document.querySelector('.documentation-body')?.getAttribute('aria-busy') === 'false')
   assert.match(await drawer.innerText(), /注解/)
+  assert.equal(await drawer.locator('.documentation-provenance').getAttribute('open'), null)
+  await drawer.locator('.documentation-provenance summary').click()
   assert.match(await drawer.innerText(), /org\.springframework\.web\.bind\.annotation\.RequestParam/)
   assert.match(await drawer.innerText(), /spring-web-6\.2\.19\.jar/)
   checks.push('Full documentation uses the same enriched explanation and preserves server sections')
+  await drawer.getByRole('button', { name: '关闭完整说明' }).click()
+
+  await page.keyboard.press('Escape'); await position('public static final String', 'SET_CREATE_TIME')
+  await openFullDocumentation(); await drawer.waitFor()
+  await page.waitForFunction(() => document.querySelector('.documentation-body')?.getAttribute('aria-busy') === 'false')
+  assert.match(await drawer.innerText(), /SET_CREATE_TIME\s*·\s*类常量/)
+  assert.match(await drawer.innerText(), /保存创建时间 setter 的方法名/)
+  checks.push('Full documentation shares the refined class constant classification and bound purpose')
   await drawer.getByRole('button', { name: '关闭完整说明' }).click()
 
   // An old class token must not survive a model revision. Hold the new semantic
@@ -236,6 +280,9 @@ try {
   await page.waitForFunction(() => window.__javaHoverFixture.mode === 'offline' && !!window.__javaHoverFixture.editor)
   await inspectHover({ needle: 'public class', word: 'class', expected: /关键字/, label: 'Java keyword explanations work with no language server' })
   await inspectHover({ needle: 'return unknownResult', word: 'unknownResult', expected: /标识符|未解析|待确认|无法确定/, label: 'Unknown identifier explanations remain available offline' })
+  await inspectHover({ needle: 'public static final String', word: 'SET_CREATE_TIME', expected: /SET_CREATE_TIME\s*·\s*类常量/, label: 'Class constants are correctly classified without a language server' })
+  await inspectHover({ needle: 'counter++;', word: 'counter', expected: /counter\s*·\s*静态变量/, label: 'Static variable references remain precise offline' })
+  await inspectHover({ needle: 'final Long frozenId', word: 'frozenId', expected: /frozenId\s*·\s*只读局部变量/, label: 'Readonly local variables remain precise offline' })
   assert.equal(await page.evaluate(() => window.__javaHoverFixture.sockets.length), socketCount)
   checks.push('Offline inspection opens no WebSocket or backend connection')
   await shot('java-hover-offline.png')
@@ -247,6 +294,15 @@ try {
 
   assert.equal(await page.evaluate(() => window.__javaHoverFixture.saves.length), 0)
   checks.push('Inspection never saves a file')
+  const constantLookups = businessRequests.filter(item => item.name === 'SET_CREATE_TIME')
+  assert.ok(constantLookups.length > 0)
+  const declarationLine = source.split('\n').findIndex(line => line.includes('public static final String'))
+  for (const item of constantLookups) {
+    assert.equal(item.path, 'src/demo/DocumentService.java')
+    assert.equal(item.line, declarationLine + 1)
+    assert.equal(item.column, source.split('\n')[declarationLine].indexOf('SET_CREATE_TIME') + 1)
+  }
+  checks.push('Refined class constants still resolve project meaning at their exact declaration')
   if (unexpected.length) errors.push(`Blocked unexpected requests: ${unexpected.join(', ')}`)
   assert.deepEqual(errors, [])
 } catch (error) {
@@ -254,7 +310,7 @@ try {
   if (page) await page.screenshot({ path: path.join(output, 'failure.png'), fullPage: true }).catch(() => {})
 } finally {
   await browser.close()
-  fs.writeFileSync(path.join(output, 'report.json'), JSON.stringify({ checks, errors, unexpected, observations, screenshots }, null, 2))
+  fs.writeFileSync(path.join(output, 'report.json'), JSON.stringify({ checks, errors, unexpected, observations, screenshots, businessRequests }, null, 2))
 }
 if (failure) throw failure
 console.log(JSON.stringify({ passed: checks.length, report: path.join(output, 'report.json') }))

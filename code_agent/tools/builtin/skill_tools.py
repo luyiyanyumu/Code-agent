@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -72,6 +73,7 @@ async def _run_cli(args: list[str], *, timeout: int) -> tuple[int, str, str]:
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=str(Path.home()),
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
     except OSError as exc:
         raise ToolError(f"启动 SkillHub CLI 失败：{exc}") from exc

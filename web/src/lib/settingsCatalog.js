@@ -2,7 +2,7 @@ export const SETTINGS_SECTIONS = [
   { id: 'general', label: '通用', icon: 'settings', description: '让工作区适应你的日常使用习惯。', scope: '此浏览器 · 自动保存' },
   { id: 'appearance', label: '外观', icon: 'layers', description: '选择舒适的主题，让界面与编辑器保持一致。', scope: '此浏览器 · 立即生效' },
   { id: 'editor', label: '编辑器', icon: 'code', description: '调整代码的显示方式与缩进偏好。', scope: '此浏览器 · 立即生效' },
-  { id: 'models', label: '模型与连接', icon: 'server', description: '管理模型服务、连接档案与上下文容量。', scope: '服务端 · 保存后生效' },
+  { id: 'models', label: '模型与连接', icon: 'server', description: '管理模型提供商、可用模型列表与全局默认。', scope: '服务端 · 保存后生效' },
   { id: 'agents', label: '智能体协作', icon: 'git-branch', description: '控制团队规模、任务拆分层级和执行预算。', scope: '服务端 · 所有项目' },
   { id: 'permissions', label: '执行与权限', icon: 'shield', description: '设置新会话的执行方式，了解工具与角色的权限边界。', scope: '服务端 · 新会话默认值' },
   { id: 'extensions', label: '工具与扩展', icon: 'tools', description: '管理工具能力、MCP 服务器、插件、技能与专家。', scope: '服务端' },
@@ -13,6 +13,19 @@ export const SETTINGS_SECTIONS = [
   { id: 'audit', label: '审计', icon: 'audit', description: '查看工具执行记录，校验操作历史的完整性。', scope: '管理 · 仅管理员' },
   { id: 'shortcuts', label: '快捷键', icon: 'terminal', description: '快速查阅工作区中可用的键盘操作。', scope: '快捷键参考' },
   { id: 'system', label: '关于与诊断', icon: 'server', description: '查看服务连接状态和设置的存储范围。', scope: '当前服务' },
+]
+
+// Leaf IDs remain stable for saved preferences, links and search destinations.
+// The sidebar groups related screens without mounting their resources together.
+export const SETTINGS_GROUPS = [
+  { id: 'workspace', label: '工作区与外观', icon: 'settings', sections: ['general', 'appearance', 'shortcuts'] },
+  { id: 'editor', label: '编辑器', icon: 'code', sections: ['editor'] },
+  { id: 'models', label: '模型与连接', icon: 'server', sections: ['models'] },
+  { id: 'agents', label: '智能体与权限', icon: 'git-branch', sections: ['agents', 'permissions'] },
+  { id: 'extensions', label: '工具与扩展', icon: 'tools', sections: ['extensions'] },
+  { id: 'knowledge', label: '知识与记忆', icon: 'knowledge', sections: ['knowledge', 'memory'] },
+  { id: 'activity', label: '运行与记录', icon: 'usage', sections: ['usage', 'automations', 'audit'] },
+  { id: 'system', label: '关于与诊断', icon: 'server', sections: ['system'] },
 ]
 
 // Search metadata contains labels only: never index connection values or credentials.
@@ -34,7 +47,7 @@ export const SETTINGS_ITEMS = [
   ['models', 'context-window', '上下文窗口', '容量 Token context'],
   ['models', 'max-output-tokens', '最大输出 Token', '容量 限制 output'],
   ['models', 'provider-proxy-mode', '网络代理', '系统 直连 proxy'],
-  ['models', 'saved-profiles', '已保存配置', '档案 添加 编辑 启用 删除 预设'],
+  ['models', 'saved-profiles', '模型提供商', '已保存配置 档案 添加 编辑 启用 删除 预设 多模型'],
   ['agents', 'agent-team-depth', '最大递归深度', '团队 子智能体 层级 Lead'],
   ['agents', 'agent-team-parallel', '并行子智能体上限', '团队 并发 性能 调度'],
   ['agents', 'agent-budget-task-tokens', '单次执行 Token 上限', '预算 子任务 消耗 input output tokens 成本'],
@@ -66,7 +79,8 @@ export function searchSettings(query) {
   if (!terms.length) return []
   return SETTINGS_ITEMS.filter(item => {
     const section = SETTINGS_SECTIONS.find(s => s.id === item.section)
-    const text = `${section.label} ${item.label} ${item.keywords}`.toLocaleLowerCase()
+    const group = SETTINGS_GROUPS.find(group => group.sections.includes(item.section))
+    const text = `${group.label} ${section.label} ${item.label} ${item.keywords}`.toLocaleLowerCase()
     return terms.every(term => text.includes(term))
   })
 }

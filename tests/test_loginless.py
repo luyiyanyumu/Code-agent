@@ -62,7 +62,10 @@ def test_local_websocket_metadata_restores_running_state(local_client):
     user_id = local_client.get("/api/v1/auth/me").json()["id"]
     runtime = local_client.app.state.sessions.get_runtime(sid, user_id)
     runtime.router.provider_override = OfflineProvider(script=[
-        OfflineProvider.tool_call_turn("bash", {"command": "make all"}),
+        OfflineProvider.tool_call_turn("bash", {"command": "make all", "_approval": {
+            "purpose": "检查当前测试工作区的构建是否可以执行",
+            "effects": ["将在隔离测试工作区运行 make all；批准前不执行构建"],
+        }}),
         OfflineProvider.text_turn("finished"),
     ])
     with local_client.websocket_connect(f"/api/v1/sessions/{sid}/stream") as ws:

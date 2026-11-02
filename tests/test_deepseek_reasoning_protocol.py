@@ -242,10 +242,23 @@ def test_actual_agent_loop_repeated_pressure_compaction_keeps_all_assistants_pro
     requests = []
     saw_omission = []
     saw_trimmed = []
+    complete_latest_source = []
 
     def handler(request):
         body = json.loads(request.content)
         requests.append(body)
+        # Include opaque provider text in the budget even though the HTTP wire
+        # has already unsealed it. All call/result bundles must remain paired.
+        history = [message for message in body["messages"] if message.get("role") != "system"]
+        assert messages_size_chars(history) + sum(len(message.get("reasoning_content") or "") for message in history) <= history_budget
+        pending = []
+        for message in history:
+            if message.get("role") == "tool":
+                assert pending and message["tool_call_id"] == pending.pop(0)
+            else:
+                assert not pending
+                pending = [call["id"] for call in message.get("tool_calls") or []]
+        assert not pending
         # The strict documented DeepSeek contract applies to every assistant,
         # not merely assistants with tool calls. Old fallback summaries failed
         # here despite every genuine tool call retaining its private payload.
@@ -255,6 +268,11 @@ def test_actual_agent_loop_repeated_pressure_compaction_keeps_all_assistants_pro
         saw_omission.extend(message for message in body["messages"]
                             if message.get("role") != "tool" and "[compact]" in str(message.get("content") or ""))
         number = len(requests)
+        if number > 1 and history_budget == 520:
+            latest = next((message for message in history if message.get("tool_call_id") == f"pressure-{number - 1}"), None)
+            assert latest is not None and f"line_{number - 1}: " + "x" * 100 in latest["content"]
+            assert "[compact]" not in latest["content"]
+            complete_latest_source.append(number)
         if sum(len(message.get("tool_calls") or []) for message in body["messages"]) < number - 1:
             saw_trimmed.append(number)
         if number <= 14:
@@ -280,7 +298,9 @@ def test_actual_agent_loop_repeated_pressure_compaction_keeps_all_assistants_pro
     assert result.text == "Checked fourteen source windows." and result.turns == 15
     assert len(requests) == 15 and saw_trimmed
     if history_budget == 520:
-        assert saw_omission
+        # Source receipts now take priority over a historical omission notice.
+        # The remaining reserve need not fit its full low-trust data wrapper.
+        assert len(complete_latest_source) == 14
     assert all(message["role"] == "user" for message in saw_omission)
     assert len([event for event in events if event.type.value == "tool_result"]) == 14
     assert PRIVATE not in json.dumps([event.model_dump() for event in events])

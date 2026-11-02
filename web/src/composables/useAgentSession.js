@@ -55,9 +55,14 @@ export function useAgentSession() {
   const teamChange = ref(null)
   const lastStopReason = ref('end_turn')
   //: 联网开关（M19）。默认关，用户显式打开；`webInfo` 是后端的能力探测结果
-  //: （没有检索 key 时开关点不开，并给出"怎么配"）。
+  //: 不可用时仍可重新检测；只有后端确认保存后才改变会话开关。
   const web = ref(false)
   const webInfo = ref(null)
+  const webLoading = ref(false)
+  const webPending = ref(false)
+  const webError = ref('')
+  let webCapabilityVersion = 0
+  let webActionVersion = 0
 
   let lastSeq = 0
   let loadToken = 0
@@ -135,6 +140,11 @@ export function useAgentSession() {
 
   function pushEvent(ev) {
     if (ev.type === 'session_meta') {
+      if (!replaying && ev.seq === 0 && ev.payload?.kind === 'model_stream_reset') {
+        streaming.value = thinking.value = ''
+        thinkSink.buffer = ''
+        thinkSink.startedTs = 0
+      }
       if (ev.payload?.team_changed && !replaying) {
         teamChange.value = ev.payload.team_changed
         teamRevision.value += 1
@@ -178,8 +188,8 @@ export function useAgentSession() {
         refreshApprovalOnMeta = false
         void restorePendingApproval()
       }
-      // 联网开关（M19）：本地没有显式覆盖时，采用后端会话行里的状态
-      if (typeof ev.payload?.web_enabled === 'boolean' && localWebOverride(sessionId.value) === null) {
+      // 后端会话状态优先于旧浏览器记录；正在保存时由该请求的响应确认。
+      if (typeof ev.payload?.web_enabled === 'boolean' && !webPending.value) {
         web.value = !!ev.payload.web_enabled && webInfo.value?.available !== false
       }
       // Completion receipts are persisted metadata, unlike transient runtime
@@ -303,6 +313,9 @@ export function useAgentSession() {
 
   function closeStream() {
     loadToken += 1
+    webCapabilityVersion += 1
+    webActionVersion += 1
+    webLoading.value = webPending.value = false
     historyController?.abort()
     historyController = null
     replayFrames = []
@@ -455,6 +468,8 @@ export function useAgentSession() {
     teamChange.value = null
     lastStopReason.value = 'end_turn'
     web.value = false
+    webInfo.value = null
+    webError.value = ''
     runtimeMetaReceived = false
     historyError.value = ''
     if (!id) return
@@ -503,37 +518,67 @@ export function useAgentSession() {
   }
 
   async function loadWebState(id, token = loadToken) {
-    if (!webInfo.value) {
-      try {
-        webInfo.value = await api.webCapability()
-      } catch {
-        webInfo.value = { available: false, reason: '拿不到联网能力信息' }
-      }
-    }
     if (!isCurrent(id, token)) return
     const local = id ? localWebOverride(id) : null
     if (local !== null) web.value = local === '1'
-    if (web.value && webInfo.value?.available === false) web.value = false
+    await refreshWebInfo()
   }
 
-  /** 切换联网开关：本地记一份 + 同步到会话行（后端下次重建运行时也要是打开的）。 */
-  async function setWeb(enabled) {
-    const next = !!enabled
-    if (next && webInfo.value?.available === false) return
-    const id = sessionId.value
-    const mine = loadToken
-    web.value = next
+  async function refreshWebInfo() {
+    const id = sessionId.value, mine = loadToken, request = ++webCapabilityVersion
+    const current = () => isCurrent(id, mine) && request === webCapabilityVersion
+    if (!id) return null
+    webLoading.value = true
     try {
-      if (sessionId.value) window.localStorage.setItem(`code-agent:web:${sessionId.value}`, next ? '1' : '0')
+      const info = await api.webCapability()
+      if (!current()) return null
+      webInfo.value = info && typeof info.available === 'boolean' ? info
+        : { available: false, reason: '无法确认联网能力，请重新检测。' }
+      if (!webInfo.value.available) web.value = false
+      if (webInfo.value.available) webError.value = ''
+      else if (webError.value) webError.value = webInfo.value.reason || '联网暂不可用，请重新检测。'
+      return webInfo.value
     } catch {
-      /* 隐私模式下写不了 localStorage：不影响后端那份 */
+      if (!current()) return null
+      webInfo.value = { available: false, reason: '联网能力检测失败，请重新检测。' }
+      if (webError.value) webError.value = webInfo.value.reason
+      return webInfo.value
+    } finally {
+      if (current()) webLoading.value = false
     }
-    if (sessionId.value) {
-      try {
-        await api.setSessionWeb(sessionId.value, next)
-      } catch (e) {
-        if (isCurrent(id, mine)) setBanner(e.message)
+  }
+
+  /** 开启前重新检测，保存成功后再提交显示状态，旧会话的响应不能回写。 */
+  async function setWeb(enabled) {
+    if (typeof enabled !== 'boolean' || !sessionId.value || webPending.value) return false
+    const next = enabled, id = sessionId.value, mine = loadToken, request = ++webActionVersion
+    const current = () => isCurrent(id, mine) && request === webActionVersion
+    webPending.value = true
+    webError.value = ''
+    try {
+      if (next) {
+        const info = await refreshWebInfo()
+        if (!current()) return false
+        if (!info?.available) {
+          webError.value = info?.reason || '联网暂不可用，请重新检测。'
+          return false
+        }
       }
+      const result = await api.setSessionWeb(id, next)
+      if (!current()) return false
+      const actual = typeof result?.web_enabled === 'boolean' ? result.web_enabled
+        : [0, 1].includes(result?.web_enabled) ? !!result.web_enabled : null
+      if (actual === null) throw new Error('联网设置返回异常，请重新检测后重试。')
+      web.value = actual
+      try { window.localStorage.setItem(`code-agent:web:${id}`, actual ? '1' : '0') }
+      catch { /* 后端保存已成功；浏览器存储不可用不改变确认结果。 */ }
+      if (actual !== next) webError.value = '联网设置未能生效，请重新检测后重试。'
+      return actual === next
+    } catch (cause) {
+      if (current()) webError.value = cause?.message || '联网设置未能保存，请重试。'
+      return false
+    } finally {
+      if (current()) webPending.value = false
     }
   }
 
@@ -644,7 +689,7 @@ export function useAgentSession() {
   return {
     sessionId, events, timeline, busy, phase, banner, bannerDismissed, submissionError, recoveredThroughSeq, dismissBanner, approval, approvalSubmitting, approvalError, streaming, thinking,
     modelName, streamState, historyLoading, historyError, usage, lastExecutionUsage, lastStopReason, teamRevision, teamChange,
-    web, webInfo, webHint, setWeb,
+    web, webInfo, webHint, webLoading, webPending, webError, refreshWebInfo, setWeb,
     questions, pendingQuestions, questionSubmitting, questionError, answerQuestions, dismissQuestions,
     refreshQuestions: restorePendingQuestions,
     load, send, stop, decide, closeStream, refreshApproval: restorePendingApproval,

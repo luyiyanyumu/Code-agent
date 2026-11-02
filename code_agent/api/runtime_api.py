@@ -28,6 +28,8 @@ class RunStart(BaseModel):
     command: str = Field(default="", max_length=8192)
     cwd: str = Field(default="", max_length=4096)
     name: str = Field(default="", max_length=200)
+    args: list[str] = Field(default_factory=list, max_length=100)
+    env: dict[str, str] = Field(default_factory=dict)
 
 
 def _err(exc: Exception) -> HTTPException:

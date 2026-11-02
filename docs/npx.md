@@ -1,12 +1,16 @@
 # npx 安装与更新
 
-Code-agent 通过 [npm · @luyiyanyumu/code-agent](https://www.npmjs.com/package/@luyiyanyumu/code-agent) 提供包含已构建前端的发行包。`npx` 下载启动器，启动器自动创建独立 Python 环境并安装后端；使用时不需要源码仓库，也不需要单独构建前端。
+Windows 用户也可使用 [完整 Windows 安装包](windows-installer.md)：安装后通过桌面或开始菜单打开，前后端、Node.js、Python、Git 和 WebView2 都随包提供，无需预先安装运行环境或保留源码目录。下文环境要求仅适用于 npx 发行方式。
+
+Code-agent 通过 [npm · @luyiyanyumu/code-agent](https://www.npmjs.com/package/@luyiyanyumu/code-agent) 提供包含已构建前端的发行包。`npx` 下载启动器及由仓库内 DeepSeek Harness 源码构建的内核，启动器自动创建独立 Python 环境并准备后端；使用时不需要源码仓库，也不需要单独构建前端。
+
+> Harness 源码合并与独立启动器目前只在本地仓库中，尚未发布新的 npm 版本。下文涉及这些能力的部分描述此仓库构建的安装包；公共 `@latest` 不包含本次修改。
 
 ## 环境要求
 
-- Node.js **20.11+**，包含 `npm` 和 `npx`。
+- Node.js **22.14+**，包含 `npm` 和 `npx`。源码合并的 Harness 内核运行在独立 Node 子进程中。
 - Python **3.11+**，可创建 `venv` 并使用 `pip` 安装依赖。
-- 首次安装与更新需要联网下载发行包和 Python 依赖。
+- 首次安装与更新需要联网下载发行包和 Python 依赖。Harness 构建产物已在包内，内核启动不连接 npm、不安装额外依赖。
 - Git、Java、语言服务器与调试器按项目功能需要另行安装。
 
 ## 启动
@@ -28,6 +32,29 @@ npx @luyiyanyumu/code-agent@latest --provider offline
 ```
 
 离线模式使用演示提供方，不调用真实 AI 服务。
+
+## 独立启动器
+
+当前源码中可执行：
+
+```bash
+npm run launcher
+# 等价入口
+node bin/code-agent-launcher.mjs
+node bin/code-agent.mjs launcher
+```
+
+Windows 默认打开独立桌面窗口，也可直接双击项目根目录的 `Code-agent Launcher.exe`。源码首次构建 exe 使用 `npm run build:launcher`。窗口中可分别管理前端 **5175**、后端 **8765** 的启动、重启、停止和打开，查看健康状态、日志及更新结果；关闭窗口不会停止前后端。
+
+需要兼容网页面板时，显式执行 `node bin/code-agent-launcher.mjs --web`，地址为 `http://127.0.0.1:19387`。
+
+**待包含启动器的新版发布后**，npm 安装入口为：
+
+```bash
+npx @luyiyanyumu/code-agent@latest launcher
+```
+
+此命令目前不适用于公共 npm 上的旧版。源码模式启动 Vite 开发前端；安装包模式使用包内预构建界面，并在独立前端端口转发后端接口。`--home` 延用原数据目录；桌面版内部使用随机本机端口，`--launcher-port` 适用于兼容网页面板，`--no-open` 仅运行兼容控制服务。详见 [启动器使用说明](launcher.md)。
 
 ## 下载与更新
 
@@ -51,6 +78,8 @@ npx @luyiyanyumu/code-agent@latest
 
 更新不会自动中断正在运行的任务。npm 管理发行包的下载缓存；如需优先检查在线内容，可在 `npx` 后添加 `--prefer-online`。详情见 [npm exec 官方说明](https://docs.npmjs.com/cli/commands/npm-exec/)。
 
+控制面板中的 npm 更新同样只下载并准备新版，不替换正在运行的服务，也不把当前旧版启动器标成新版。准备完成后，先在任务空闲时停止旧服务，再使用新版包重新启动；继续使用同一个 `--home` 可保留会话和配置。源码控制面板更新则要求先停止前后端，并拒绝覆盖未提交或未跟踪的文件；仅对官方跟踪分支执行快进更新和构建。
+
 ## 自定义启动
 
 ```bash
@@ -70,6 +99,8 @@ npx @luyiyanyumu/code-agent@latest --version
 | `start` | 准备运行环境并启动工作台；省略子命令时默认执行 |
 | `install` | 仅准备当前下载版本的运行环境 |
 | `update` | 从 npm registry 获取 `latest` 版本并执行安装 |
+| `launcher` | 打开独立服务控制面板；需包含此功能的新版包 |
+| `--launcher-port` | 控制面板端口，默认 `19387`，用于 `launcher` |
 | `--no-open` | 启动后不自动打开浏览器 |
 | `--host` | 指定监听地址，默认 `127.0.0.1` |
 | `--port` | 指定端口，默认 `8765` |
@@ -88,9 +119,12 @@ npx @luyiyanyumu/code-agent@latest --version
 
 - npm 管理发行包的下载缓存。
 - 启动器在应用数据目录的 `runtime/npm/<版本>-<内容标识>` 下创建 Python 虚拟环境，按版本隔离后端依赖。
+- npm 包与 Python wheel 均包含 Harness 原始源码、构建产物、来源记录和许可证。启动只校验并加载包内产物，不创建 `runtime/harness` 依赖缓存；修改源代码后需重新构建。
 - 会话、项目记录、配置和密钥继续保存在应用数据目录，升级程序不会覆盖用户数据。
 
 发行包提供 Code-agent 主工作台；仓库中的独立 `chat-app` 仍按自己的 README 安装与启动。
+
+内核版本、权限边界与源码安装的准备命令见 [Agent loop](agent-loop.md)。
 
 ## 维护者发布
 

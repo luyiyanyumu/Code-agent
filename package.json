@@ -7,24 +7,47 @@
     "code-agent": "bin/code-agent.mjs"
   },
   "engines": {
-    "node": ">=20.11.0"
+    "node": ">=22.14.0"
   },
   "files": [
     "bin/*.mjs",
     "npm/*.mjs",
+    "npm/launcher-process.ps1",
+    "Code-agent.exe",
+    "Code-agent Launcher.exe",
+    "desktop/launcher/LICENSE-WebView2.txt",
+    "desktop/launcher/NOTICE-WebView2.txt",
+    "npm/launcher-ui/**",
     "npm/release.json",
+    "scripts/backend_idle_check.py",
+    "scripts/launcher_process.py",
     "code_agent/**/*.py",
+    "code_agent/harness/node/*.mjs",
+    "code_agent/harness/node/*.json",
+    "code_agent/harness/node/*.md",
+    "code_agent/harness/node/LICENSE*",
+    "code_agent/harness/node/src/**",
+    "code_agent/harness/node/vendor/**",
+    "!code_agent/harness/node/**/tests/**",
+    "!code_agent/harness/node/**/node_modules/**",
     "code_agent/skills/**/*.md",
     "pyproject.toml",
     "web/dist/**",
-    ".env.example"
+    ".env.example",
+    "!code_agent/harness/node/**/AGENTS.md",
+    "!code_agent/harness/node/**/CLAUDE.md"
   ],
   "scripts": {
     "start": "node bin/code-agent.mjs",
+    "launcher": "node bin/code-agent-launcher.mjs",
+    "build:launcher": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-launcher-exe.ps1",
+    "build:installer": "powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/build-windows-release.ps1",
     "test": "node --test npm/tests/*.test.mjs",
     "build": "node npm/build.mjs",
     "prepack": "node npm/build.mjs",
-    "test:package": "node npm/smoke.mjs"
+    "test:package": "node npm/smoke.mjs",
+    "build:harness": "node code_agent/harness/node/build.mjs",
+    "check:harness": "node code_agent/harness/node/build.mjs --check"
   },
   "repository": {
     "type": "git",
@@ -37,5 +60,9 @@
   "publishConfig": {
     "access": "public",
     "registry": "https://registry.npmjs.org/"
+  },
+  "devDependencies": {
+    "esbuild": "0.25.12",
+    "zod": "4.4.3"
   }
 }

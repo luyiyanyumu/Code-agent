@@ -32,6 +32,8 @@ class GenerationOptions:
 
     max_output_tokens: int | None = None
     simple_answer: bool = False
+    # Only consumers that can discard an unfinished preview may opt in.
+    stream_retry_reset: bool = False
 
     def __post_init__(self) -> None:
         normalize_capacity(self.max_output_tokens, "max_output_tokens")
@@ -99,6 +101,8 @@ class StreamChunk:
     text_delta: str = ""
     thinking_delta: str = ""
     turn: ModelTurn | None = None
+    reset: bool = False
+    retry_attempt: int = 0
 
 
 class Provider(ABC):

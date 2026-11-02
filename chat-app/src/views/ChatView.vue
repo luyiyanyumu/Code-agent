@@ -1138,6 +1138,11 @@ async function activateModel(p) {
 
 function pushEvent(ev) {
   if (ev.type === 'session_meta') {
+    if (!replaying && ev.seq === 0 && ev.payload?.kind === 'model_stream_reset') {
+      streaming.value = thinking.value = ''
+      thinkSink.buffer = ''
+      thinkSink.startedTs = 0
+    }
     // WS 首帧带 {session_id, model, model_override, web_enabled}；ping 的 pong 也走这个类型
     if (ev.payload?.model) modelName.value = ev.payload.model
     if (ev.payload?.title && current.value) {

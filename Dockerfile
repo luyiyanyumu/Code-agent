@@ -1,21 +1,27 @@
 # Code-agent 生产镜像（M7 部署）
-# 单阶段即可：纯 Python 依赖，无需编译产物
+# 仓库内 Harness 源码的预构建内核运行在 Node.js；启动不安装 npm 依赖。
+FROM node:22-bookworm-slim AS harness-node
 FROM python:3.13-slim
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    CODE_AGENT_HOME=/data
+    CODE_AGENT_HOME=/data \
+    CODE_AGENT_NODE=/usr/local/bin/node \
+    CODE_AGENT_HARNESS_NODE_DIR=/app/code_agent/harness/node
+
+COPY --from=harness-node /usr/local/bin/node /usr/local/bin/node
 
 WORKDIR /app
 
 # 先装依赖再拷源码：利用层缓存，改代码不重装依赖
 COPY pyproject.toml README.md ./
 COPY code_agent ./code_agent
-RUN pip install --no-cache-dir . \
-    && apt-get update \
-    && apt-get install -y --no-install-recommends procps \
-    && rm -rf /var/lib/apt/lists/*
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends procps libstdc++6 \
+    && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir . \
+    && python -m code_agent.harness --prepare
 
 # 4 层防御之最小权限：非 root 运行，数据目录归属该用户
 RUN useradd -m -u 10001 agent \

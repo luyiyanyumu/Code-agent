@@ -211,8 +211,12 @@ async def _spawn(command: str, cwd: Path | None) -> asyncio.subprocess.Process:
             *argv,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
+            creationflags=(subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW)
+            if platform.system() == "Windows" else 0,
         )
     if platform.system() == "Windows":
+        # Process groups retain tree cancellation; NO_WINDOW keeps these
+        # background tools in the app's output pane instead of Windows Terminal.
         bash = find_bash()
         if bash:
             # 有 Git Bash 就真的用 bash：`curl … | head`、`$(...)`、`&&` 才成立。
@@ -223,7 +227,7 @@ async def _spawn(command: str, cwd: Path | None) -> asyncio.subprocess.Process:
                 cwd=str(cwd) if cwd else None,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
-                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+                creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW,
             )
         # 独立进程组：便于超时时整棵树一起杀
         return await asyncio.create_subprocess_shell(
@@ -231,7 +235,7 @@ async def _spawn(command: str, cwd: Path | None) -> asyncio.subprocess.Process:
             cwd=str(cwd) if cwd else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
-            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW,
         )
     return await asyncio.create_subprocess_exec(
         "bash", "-c", command,
@@ -280,6 +284,7 @@ async def _kill(proc: asyncio.subprocess.Process) -> None:
                 "taskkill", "/F", "/T", "/PID", str(proc.pid),
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW,
             )
             await killer.wait()
             # **taskkill 自己也是一个子进程**：不回收它，它持有的管道句柄就会留到

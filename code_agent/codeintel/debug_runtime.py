@@ -349,6 +349,38 @@ class DebugSession:
                 self._references.add(item["variablesReference"])
         return {"reference": reference, "pause_seq": generation, "variables": values}
 
+    async def evaluate(self, expression: str, frame_id: int, pause_seq: int, context: str = "repl") -> dict:
+        """Evaluate only in a frame belonging to the current suspended stop.
+
+        DAP evaluation can execute user code. It is never retried, and a late
+        response cannot revive object references after a continue/stop.
+        """
+        if not isinstance(expression, str) or not expression.strip() or len(expression) > 8192 or "\0" in expression:
+            raise DebugError("表达式不能为空，且不能超过 8192 个字符", 422)
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0 for value in (frame_id, pause_seq)):
+            raise DebugError("frame_id 与 pause_seq 必须是非负整数", 422)
+        if not isinstance(context, str) or context not in {"repl", "watch"}:
+            raise DebugError("求值上下文仅支持 repl 或 watch", 422)
+        async with self._lock:
+            if self._inspection and not self._inspection.done():
+                await asyncio.gather(self._inspection, return_exceptions=True)
+            generation = self._generation
+            if (self.state["status"] != "paused" or pause_seq != generation
+                    or frame_id not in {frame["id"] for frame in self.state["stack"]}):
+                raise DebugError("调用栈帧或暂停位置已失效，请在当前暂停位置重新求值")
+        result = await self.request("evaluate", {"expression": expression.strip(), "frameId": frame_id, "context": context})
+        if (generation != self._generation or self.state["status"] != "paused"
+                or frame_id not in {frame["id"] for frame in self.state["stack"]}):
+            raise DebugError("程序已继续运行，求值结果已失效")
+        reference = result.get("variablesReference", 0)
+        if isinstance(reference, bool) or not isinstance(reference, int) or reference < 0:
+            reference = 0
+        if reference:
+            self._references.add(reference)
+        return {"expression": expression.strip(), "result": str(result.get("result", ""))[:16000],
+                "type": str(result.get("type", ""))[:512], "variablesReference": reference,
+                "frame_id": frame_id, "pause_seq": generation}
+
     async def action(self, action: str, thread_id: int | None = None):
         if action == "stop":
             await self.stop()

@@ -111,11 +111,23 @@ def test_real_breakpoint_steps_stack_locals_and_output(debug_script):
             assert items["variablesReference"] > 0
             array = await session.variables(items["variablesReference"], stopped["pause_seq"])
             assert any(v["value"] == "2" for v in array["variables"])
+            evaluated = await session.evaluate("number + 2", stopped["frame_id"], stopped["pause_seq"])
+            assert evaluated["result"] == "5" and evaluated["type"] == "int"
+            assert evaluated["frame_id"] == stopped["frame_id"]
+            watched = await session.evaluate("nested['items']", stopped["frame_id"], stopped["pause_seq"], "watch")
+            assert watched["variablesReference"] > 0
+            watched_items = await session.variables(watched["variablesReference"], watched["pause_seq"])
+            assert any(v["value"] == "2" for v in watched_items["variables"])
+            with pytest.raises(DebugError):
+                await session.evaluate("missing_expression_name", stopped["frame_id"], stopped["pause_seq"])
+            assert session.snapshot()["status"] == "paused"
             await session.action("stepIn")
             entered = await wait_state(session, lambda s: s["status"] == "paused" and s["pause_seq"] > stopped["pause_seq"] and bool(s["stack"]))
             assert entered["stack"][0]["name"] == "increment"
             with pytest.raises(DebugError, match="失效"):
                 await session.variables(reference, stopped["pause_seq"])
+            with pytest.raises(DebugError, match="失效"):
+                await session.evaluate("number", stopped["frame_id"], stopped["pause_seq"])
             await session.action("stepOut")
             returned = await wait_state(session, lambda s: s["status"] == "paused" and s["pause_seq"] > entered["pause_seq"] and bool(s["stack"]))
             assert returned["stack"][0]["name"] == "compute"
@@ -305,6 +317,16 @@ def test_api_real_session_owner_and_state(debug_script):
                 assert state.status_code == 200 and state.json()["frame_id"] == paused["stack"][0]["id"]
                 with pytest.raises(KeyError):
                     runtime.get("other", "project", sid)
+                evaluate_url = prefix + "/sessions/" + sid + "/evaluate"
+                payload = {"expression": "1 + 2", "frame_id": paused["frame_id"], "pause_seq": paused["pause_seq"], "context": "watch"}
+                evaluated = await client.post(evaluate_url, json=payload)
+                assert evaluated.status_code == 200 and evaluated.json()["result"] == "3"
+                for update in ({"expression": ""}, {"expression": "x" * 8193}, {"frame_id": True}, {"pause_seq": None}, {"context": "unknown"}):
+                    assert (await client.post(evaluate_url, json={**payload, **update})).status_code == 422
+                assert (await client.post(evaluate_url, json={**payload, "frame_id": 999999})).status_code == 409
+                app.dependency_overrides[get_current_user] = lambda: CurrentUser(user_id="other", username="other", role="user")
+                assert (await client.post(evaluate_url, json=payload)).status_code == 404
+                app.dependency_overrides[get_current_user] = lambda: CurrentUser(user_id="owner", username="test", role="user")
                 assert len((await client.get(prefix + "/sessions")).json()["sessions"]) == 1
                 action = await client.post(prefix + "/sessions/" + sid + "/action", json={"action": "evaluate"})
                 assert action.status_code == 422
@@ -312,6 +334,35 @@ def test_api_real_session_owner_and_state(debug_script):
                 assert stale.status_code == 409
                 stopped = await client.post(prefix + "/sessions/" + sid + "/action", json={"action": "stop"})
                 assert stopped.status_code == 200 and stopped.json()["status"] == "stopped"
+                assert (await client.post(evaluate_url, json=payload)).status_code == 409
         finally:
             await runtime.close()
+    run(exercise())
+
+
+def test_evaluate_discards_late_dap_reply_and_never_registers_stale_objects(tmp_path, monkeypatch):
+    from code_agent.codeintel.debug_runtime import DebugSession
+
+    async def exercise():
+        session = DebugSession("owner", "project", tmp_path, tmp_path / "main.py", tmp_path, [])
+        session._generation = 2
+        session.state.update(status="paused", pause_seq=2, frame_id=10, stack=[{"id": 10}])
+        entered, response = asyncio.Event(), asyncio.get_running_loop().create_future()
+
+        async def delayed(command, arguments):
+            assert command == "evaluate"
+            assert arguments == {"expression": "nested", "frameId": 10, "context": "watch"}
+            entered.set()
+            return await response
+
+        monkeypatch.setattr(session, "request", delayed)
+        pending = asyncio.create_task(session.evaluate("nested", 10, 2, "watch"))
+        await entered.wait()
+        session._invalidate()
+        session.state["status"] = "running"
+        response.set_result({"result": "[1, 2]", "variablesReference": 50})
+        with pytest.raises(DebugError, match="失效"):
+            await pending
+        assert 50 not in session._references
+
     run(exercise())

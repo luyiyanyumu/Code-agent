@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { getTokenHover, getJavaTokenTarget, rememberSemanticTokens, clearSemanticTokens, registerTokenHoverSource, registerTokenBusinessSource, installTokenHoverProvider } from '../src/lib/tokenHover.js'
-import { createBusinessMeaningSource } from '../src/lib/businessMeaning.js'
+import { createBusinessMeaningSource, appendBusinessMeaning } from '../src/lib/businessMeaning.js'
 
 function model(text, language = 'java') {
   return { text, version: 1, disposed: false,
@@ -69,13 +69,43 @@ test('pending Java translation keeps original purpose honest until a ready trans
   const position = pos(file.text.indexOf('read()') + 1)
   const pending = getTokenHover(file, position, { contents: 'Returns the supplied value.',
     documentation_translation: { language: 'zh-CN', source: 'configured-model', status: 'pending' } })
-  assert.match(value(pending), /正在准备中文说明/)
+  assert.match(value(pending), /正在翻译中文说明/)
   assert.doesNotMatch(value(pending), /模型中文翻译|模型翻译，/)
-  assert.match(pending.tokenSection.value, /Returns the supplied value/)
+  assert.doesNotMatch(value(pending), /Returns the supplied value/)
+  assert.ok(pending.originalSections.some(section => section.value.includes('Returns the supplied value')))
+  assert.match(pending.tokenSection.value, /返回类型.*String/s)
   const ready = getTokenHover(file, position, { contents: '返回传入的值。',
     documentation_translation: { language: 'zh-CN', source: 'configured-model', status: 'ready' } })
   assert.match(ready.tokenSection.value, /返回传入的值/)
   assert.doesNotMatch(ready.tokenSection.value, /Returns the supplied value/)
+})
+
+test('Spring annotation keeps Chinese facts and project meaning while complete English receipts remain opt-in', () => {
+  const file = model('@RequestMapping("/employees")')
+  const signature = '@Target({ElementType.TYPE, ElementType.METHOD})\npublic @interface org.springframework.web.bind.annotation.RequestMapping'
+  const english = 'Annotation for mapping web requests onto methods in request-handling classes.\n\nSee [Spring MVC](https://docs.spring.io/spring-framework/reference/web/webmvc.html).'
+  const contents = [{ language: 'java', value: signature }, { kind: 'markdown', value: english }]
+  const pending = getTokenHover(file, pos(4), { contents,
+    documentation_translation: { language: 'zh-CN', source: 'configured-model', status: 'pending' } })
+  const enriched = appendBusinessMeaning(pending, {
+    entity: { id: 'employee-api', name: 'RequestMapping' },
+    business: { status: 'current', source: 'human', business_meaning: '员工接口的统一路径入口。' },
+  })
+  assert.match(value(enriched), /注解/)
+  assert.match(value(enriched), /员工接口的统一路径入口/)
+  assert.match(value(enriched), /正在翻译中文说明/)
+  assert.match(value(enriched), /public @interface/)
+  assert.doesNotMatch(value(enriched), /Annotation for mapping web requests/)
+  assert.ok(enriched.originalSections.some(section => section.value === english))
+  assert.equal(enriched.businessBaseSections, pending.sections)
+  const translated = getTokenHover(file, pos(4), {
+    contents: [contents[0], { kind: 'markdown', value: '将 Web 请求映射到处理类或方法。\n\n支持 Spring MVC 和 Spring WebFlux。' }],
+    documentation_translation: { language: 'zh-CN', source: 'configured-model', status: 'ready' },
+    _code_agent_original: { contents },
+  })
+  assert.match(value(translated), /将 Web 请求映射/)
+  assert.doesNotMatch(value(translated), /正在翻译中文说明/)
+  assert.deepEqual(translated.originalSections, [{ kind: 'code', language: 'java', value: signature }, contents[1]])
 })
 
 test('separate models and owners never share semantic classifications', () => {
@@ -98,7 +128,9 @@ test('Java classification precedes original typed documentation and retains safe
     { kind: 'plaintext', value: '**literal**' }]
   const hover = getTokenHover(file, pos(4), { contents })
   assert.match(hover.sections[0].value, /注解/)
-  assert.deepEqual(hover.sections.slice(1), [{ kind: 'code', language: 'java', value: contents[0].value }, contents[1], contents[2]])
+  assert.deepEqual(hover.originalSections, [{ kind: 'code', language: 'java', value: contents[0].value }, contents[1], contents[2]])
+  assert.ok(hover.sections.some(section => section.kind === 'code' && section.value === contents[0].value))
+  assert.match(value(hover), /来源：.*spring-web-6.2.19.jar/)
   assert.ok(hover.contents.every(section => section.isTrusted === false && section.supportHtml === false))
   assert.equal(hover.source, 'Java 语法与语言服务')
 })
@@ -109,7 +141,8 @@ test('GetMapping purpose is prepended to the original language signature and JAR
     { kind: 'markdown', value: 'Source: *spring-web-6.2.19.jar*' }]
   const hover = getTokenHover(file, pos(file.text.indexOf('GetMapping') + 1), { contents })
   assert.match(hover.sections[0].value, /\*\*作用：\*\*.*HTTP.*GET/)
-  assert.deepEqual(hover.sections.slice(1), [{ kind: 'code', language: 'java', value: contents[0].value }, contents[1]])
+  assert.deepEqual(hover.originalSections, [{ kind: 'code', language: 'java', value: contents[0].value }, contents[1]])
+  assert.deepEqual(hover.sections.slice(-2), [{ kind: 'code', language: 'java', value: contents[0].value }, { kind: 'markdown', value: '来源：*spring-web-6.2.19.jar*' }])
   assert.ok(hover.contents.every(section => section.isTrusted === false && section.supportHtml === false))
 })
 
@@ -167,8 +200,9 @@ test('translation provenance is opt-in for legacy Java responses and is shared b
   assert.equal(legacy.documentationTranslation, undefined)
   const other = getTokenHover(model('of', 'python'), pos(), { contents,
     documentation_translation: { language: 'zh-CN', source: 'configured-model' } })
-  assert.deepEqual(other.sections.slice(-2), [{ kind: 'code', language: 'java', value: contents[0].value }, contents[1]])
-  assert.match(value(other), /文档中文翻译/)
+  assert.deepEqual(other.originalSections, [{ kind: 'code', language: 'java', value: contents[0].value }, contents[1]])
+  assert.doesNotMatch(value(other), /Returns an unmodifiable set|模型翻译，/)
+  assert.match(value(other), /尚未翻译/)
   assert.equal(other.documentation_translation.language, 'zh-CN')
   assert.equal(other.documentationTranslation, undefined)
 })
@@ -208,6 +242,52 @@ test('raw resource method hover reaches the shared function lookup at its declar
   assert.equal(calls[0].payload.line, position.lineNumber)
   assert.equal(calls[0].payload.column, position.column)
   assert.equal(calls[0].payload.text, text)
+})
+
+test('Java native hover compacts after business merge and leaves complete source documentation intact', async t => {
+  const text = 'class C { /** 保存创建时间方法名。 */ public static final String SET_CREATE_TIME = "setCreateTime"; }'
+  const file = model(text), position = pos(text.indexOf('SET_CREATE_TIME') + 1)
+  const full = getTokenHover(file, position, {
+    contents: [{ language: 'java', value: 'public static final String com.demo.C.SET_CREATE_TIME' },
+      { language: 'java', value: 'com' }, { kind: 'markdown', value: '来源：sky-server' }],
+    documentation_translation: { language: 'zh-CN', source: 'configured-model', status: 'ready' },
+    _code_agent_original: { contents: 'Creation time setter name.' },
+  })
+  const source = createBusinessMeaningSource({
+    contextForModel: candidate => candidate === file ? { projectId: 'hover-compact', tree: 'main', path: 'C.java', uri: 'file:///C.java', textForUri: () => text } : null,
+    targetForModel: getJavaTokenTarget,
+    resolve: async () => ({ entity: { id: 'constant', name: 'SET_CREATE_TIME' },
+      business: { status: 'current', source: 'human', business_meaning: '指定自动填充创建时间时调用的方法。', detail: '完整业务详情保留在展开说明中。' } }),
+  })
+  const business = registerTokenBusinessSource(source)
+  const language = registerTokenHoverSource({ matches: candidate => candidate === file, provide: async () => full })
+  t.after(() => { business.dispose(); language.dispose(); source.dispose() })
+  const native = await provider().provideHover(file, position)
+  const compact = native.contents.map(item => item.value).join('\n')
+  assert.match(compact, /SET_CREATE_TIME/)
+  assert.ok(native.contents.every(item => item.isTrusted === false && item.supportHtml === false && item.supportThemeIcons === false))
+  assert.match(compact, /类常量/)
+  assert.match(compact, /指定自动填充创建时间时调用的方法/)
+  assert.doesNotMatch(compact, /文档中文翻译|作用依据|识别依据|功能依据|sky-server|(?:^|\n)com(?:\n|$)/)
+  assert.equal(native.businessBaseSections, full.sections)
+  assert.equal(native.originalSections, full.originalSections)
+  assert.equal(native.documentation_translation, full.documentation_translation)
+  assert.equal(native._code_agent_original, full._code_agent_original)
+  assert.ok(native.sections.some(section => section.value.includes('完整业务详情')))
+  assert.ok(native.sections.some(section => section.value.includes('sky-server')))
+  assert.ok(native.sections.some(section => section.value === 'com'))
+  assert.ok(native.sections.some(section => section.value.includes('文档中文翻译')))
+  assert.match(value(full), /识别依据|作用依据/)
+})
+
+test('offline Java keyword provider also uses the compact presentation without changing its full lexical explanation', async () => {
+  const file = model('public class C {}'), position = pos(2)
+  const full = getTokenHover(file, position)
+  const native = await provider().provideHover(file, position)
+  assert.deepEqual(native.sections, full.sections)
+  assert.equal(native.localOnly, true)
+  assert.match(native.contents.map(item => item.value).join('\n'), /public|修饰符/)
+  assert.doesNotMatch(native.contents.map(item => item.value).join('\n'), /识别依据|作用依据/)
 })
 
 test('keywords work offline without contacting registered language sources', async t => {

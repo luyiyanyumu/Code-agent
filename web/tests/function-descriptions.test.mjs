@@ -24,6 +24,22 @@ test('automatic progress reports missing descriptions and failures without hidin
   assert.match(failed.label, /失败 2 条.*待补 5/)
 })
 
+test('missing model configuration offers settings without calling untouched entities failed', () => {
+  const view = functionDescriptionPresentation(progress({ state: 'waiting', running: false, failed: 0,
+    block_reason: 'model_not_configured', action: 'configure_model', note: '请配置可用模型' }))
+  assert.equal(view.label, '功能描述等待模型配置 · 待补 5')
+  assert.equal(view.action, 'configure_model')
+  assert.equal(view.tone, 'missing')
+  assert.match(view.summary, /结构图仍可正常浏览/)
+  const legacy = functionDescriptionPresentation(progress({ state: 'error', running: false, failed: 24,
+    error: '第 1 批调用失败：DEEPSEEK_API_KEY 未配置（set DEEPSEEK_API_KEY=...）' }))
+  assert.equal(legacy.action, 'configure_model')
+  assert.doesNotMatch(legacy.label, /失败/)
+  assert.match(legacy.title, /第 1 批调用失败/)
+  const active = functionDescriptionPresentation(progress({ block_reason: 'model_not_configured', action: 'configure_model' }))
+  assert.equal(active.tone, 'running', 'new running progress supersedes a previous configuration block')
+})
+
 test('the current fill batch is separate from project coverage and explains entity counting and reuse', () => {
   const view = functionDescriptionPresentation(progress({ total: 45, done: 12, written: 10, failed: 1, skipped: 1,
     added: 30, stale: 15, reused: 28560, coverage_total: 28605, described: 28570, missing: 35,

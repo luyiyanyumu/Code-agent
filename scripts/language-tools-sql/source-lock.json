@@ -1,0 +1,311 @@
+{
+  "repository": "https://github.com/joe-re/sql-language-server",
+  "commit": "dbab8d8273f2580cb493c7d27f29ed39edccf99c",
+  "files": [
+    {
+      "path": "LICENSE",
+      "gitSha1": "6000a4c106480c13868cb79a4991a093869b0a5a",
+      "sha256": "8515f8a196023a1806ca458e269d7108c7e4c2e4643986dca03e325177ab546f"
+    },
+    {
+      "path": "packages/server/LICENSE",
+      "gitSha1": "6000a4c106480c13868cb79a4991a093869b0a5a",
+      "sha256": "8515f8a196023a1806ca458e269d7108c7e4c2e4643986dca03e325177ab546f"
+    },
+    {
+      "path": "packages/server/bin/cli.ts",
+      "gitSha1": "2cf8d70591da4a5dde454273a75051c5e1e41fef",
+      "sha256": "13acd6306e23ed6f6adfbc45ab3360fad51586bd4e3200b266087548b749de3f"
+    },
+    {
+      "path": "packages/server/bin/vscodeExtensionServer.ts",
+      "gitSha1": "2c2f09711924b87eee57479e431f7cc3be146dd8",
+      "sha256": "57cb4e867281c7b746f86c5da372f057b91f5d407485912e8d078e1226f29387"
+    },
+    {
+      "path": "packages/server/package.json",
+      "gitSha1": "097e8eef1ff4201d7852bf6782959680f36bdc0a",
+      "sha256": "d24d5dbaf861794352eef985a8b918dd32bf41ba16427a2018b388b0573a367e"
+    },
+    {
+      "path": "packages/server/src/SettingStore.ts",
+      "gitSha1": "afc8bad656752bd207995a0460fe9cb7c74972a1",
+      "sha256": "84e124c558b6ccf6d116f17388732b84226f2bf5a4cbf8245b892c8ea4e7324b"
+    },
+    {
+      "path": "packages/server/src/ambient.d.ts",
+      "gitSha1": "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "path": "packages/server/src/cache.ts",
+      "gitSha1": "cc0d4c3aa01ca04facc5776b5f9ce7bdd52b6bf8",
+      "sha256": "52af822b85b7cb1db98352f1f7147e2e612b624f501fa17c08b1e26659db9d11"
+    },
+    {
+      "path": "packages/server/src/complete/AstUtils.ts",
+      "gitSha1": "62e72baa3dad86897eb13287ea39712d7158d3e6",
+      "sha256": "198bedd61db2a76772ff7adbd3f801341dad2b9291d1f039c5b66d25db45d8c3"
+    },
+    {
+      "path": "packages/server/src/complete/CompletionItemUtils.ts",
+      "gitSha1": "98c4c273a989ed511666717c7fa9c75060516897",
+      "sha256": "1497d0b463e298c1b160b6432a176d7162bef0a776afe220d2bd98919ab9c82f"
+    },
+    {
+      "path": "packages/server/src/complete/Identifier.ts",
+      "gitSha1": "2716aa5b8fc4ef97d8c41bac73b89f6e474eefe1",
+      "sha256": "6cdcb88f7755782992dea8e8822cab9a4946b1b8d912302158de092698bd015c"
+    },
+    {
+      "path": "packages/server/src/complete/StringUtils.ts",
+      "gitSha1": "484de3480bfdf8d2a34d18f9829497680568f121",
+      "sha256": "4c05a5c8d8636566db08890025b10482ba3c7cb21d8b08a731b7d045b52e7951"
+    },
+    {
+      "path": "packages/server/src/complete/candidates/createAliasCandidates.ts",
+      "gitSha1": "9f1d98954038a254c607484f83f7af9ff3b43050",
+      "sha256": "18b07dbdc13c42944a01eb7a046d020ca13da22d66a83d3b77799a23f6f999fa"
+    },
+    {
+      "path": "packages/server/src/complete/candidates/createBasicKeywordCandidates.ts",
+      "gitSha1": "839226ca891d3fc1af20cf0208bee5e0d9083389",
+      "sha256": "f43798722c7e528585fdff7644b2de689a1e1e7040b9cbc2ab3380bc811e2286"
+    },
+    {
+      "path": "packages/server/src/complete/candidates/createColumnCandidates.ts",
+      "gitSha1": "7b87e4b9f8668b67cfa19634b910278db6e03854",
+      "sha256": "0f2fbb95bac440f4d6616160033e6908543e0460b7b704f6b95e9eded32789c0"
+    },
+    {
+      "path": "packages/server/src/complete/candidates/createFunctionCandidates.ts",
+      "gitSha1": "87483edadb0fc5a99da6a3fceb21e85d7dc15939",
+      "sha256": "6443d89c7aa73719c388f706ecce74504be7ebb3310a15cda6c8f1783278483e"
+    },
+    {
+      "path": "packages/server/src/complete/candidates/createJoinTableCndidates.ts",
+      "gitSha1": "a34cf34e11441e85b7e75e17d588c1b69b67b3bf",
+      "sha256": "5f88d18edc9ff5a505bb10187946885444abba4cc397a5f9e1c2c44df405e14c"
+    },
+    {
+      "path": "packages/server/src/complete/candidates/createKeywordCandidatesFromExpectedLiterals.ts",
+      "gitSha1": "fa2007e83efd585abc9d62722f79849b9f649cb7",
+      "sha256": "f79ebf4c4a9193064f9f78e71c6a40d6ec2c7022cc5836ecd311efa5b6a4f5d1"
+    },
+    {
+      "path": "packages/server/src/complete/candidates/createSelectAllColumnsCandidates.ts",
+      "gitSha1": "f30989b574fb3f858826a2b575831e9dd0b1ef0d",
+      "sha256": "aba988bf7c5110016a0ebbc46299e3c92d226723fade62f9981ab04b340885a6"
+    },
+    {
+      "path": "packages/server/src/complete/candidates/createTableCandidates.ts",
+      "gitSha1": "f5429ef2a5ad162f30226d2b991a4765f9f90730",
+      "sha256": "0b3d0bdad24fdbbd32af3993d1f0472d68181e2af046127e54fd1dbfbe0c25c0"
+    },
+    {
+      "path": "packages/server/src/complete/complete.ts",
+      "gitSha1": "c3303a99a52f02562f6abbbeadd055618b1adc1a",
+      "sha256": "fd28c4777e254591c28ea7f2e1f43e5b7bd2b7f683ab1b11dc0f00043bce8ba4"
+    },
+    {
+      "path": "packages/server/src/complete/index.ts",
+      "gitSha1": "73bd392f7c97b2ac23ffcb5dea4667dc147c6f8a",
+      "sha256": "dd2e5b20c62fa4c493e1c685dfef18fcd0ab6f8a8b45230d23b5c9ef65f1e812"
+    },
+    {
+      "path": "packages/server/src/complete/utils/getLastToken.ts",
+      "gitSha1": "94f291ef8fe4bd2a7e0f0deca469e7dff141e7bb",
+      "sha256": "a84e0efc89921cb09a187b8bf4cb4229f6b04d3bcf0921d1815728387f680646"
+    },
+    {
+      "path": "packages/server/src/createConnection.ts",
+      "gitSha1": "feafca21c2e90882ee9611d2cb2b6d38f53c4c7a",
+      "sha256": "0912ea26a262cc0774e6dfed7ccc56321f4ce4094f9380480ea672a04e9ce0d4"
+    },
+    {
+      "path": "packages/server/src/createDiagnostics.ts",
+      "gitSha1": "cb499f57777a4e93f93a986ea24aa54d7c897b84",
+      "sha256": "cee739fc2a9d961d09f4b9f97755417d0c364fdb6dae3de1d77e2bd27f5f8a33"
+    },
+    {
+      "path": "packages/server/src/createServer.ts",
+      "gitSha1": "7912b7c87eda5f8afbc85ed3713eff7bf3d83d01",
+      "sha256": "8e54bfa7cfa98c567c230528dd0d02ddd87c2a016ff69edac69492b47f5a8f17"
+    },
+    {
+      "path": "packages/server/src/database_libs/AbstractClient.ts",
+      "gitSha1": "3fd717e7897f4992194b2ca23873d78ad4e7f755",
+      "sha256": "7b96ca624728dc34e25ed0b522e78998506a1d4599353d51e8aa0929a4b31c18"
+    },
+    {
+      "path": "packages/server/src/database_libs/BigqueryClient.ts",
+      "gitSha1": "b76e7e944a8be46bf8fb030f4ad19b978d42c4e3",
+      "sha256": "1511f51aa7eb07a8269d2dc9705626a85761892ea3f61a91a01cd60e57fc861e"
+    },
+    {
+      "path": "packages/server/src/database_libs/MysqlClient.ts",
+      "gitSha1": "63b68ce4f1e295774e47a2012717a3cb551d4566",
+      "sha256": "2d7b692a423c57259069da7aed662d1684ef3c2fdaa3a3f6400b4d50a4b25b7f"
+    },
+    {
+      "path": "packages/server/src/database_libs/PostgresClient.ts",
+      "gitSha1": "a3b43d38f5ecf194ac2c69439d028709f1294120",
+      "sha256": "a401cbef065d96b5a863cee5efd6e2d748721d0d81a91409135204df147d9b91"
+    },
+    {
+      "path": "packages/server/src/database_libs/Sqlite3Client.ts",
+      "gitSha1": "0159637ab35e7883e5519ed6d1151c545a42a09d",
+      "sha256": "e755300875a8da2ab411600771aed2437e47bf4c470109d6faf2651f04f64ed2"
+    },
+    {
+      "path": "packages/server/src/database_libs/getDatabaseClient.ts",
+      "gitSha1": "02c9551ae29497eeff029367a0034f1a9ec4fbb9",
+      "sha256": "86d986584800287a88b33d4c731539f160d3b549f82ee7512996cfcff6aae030"
+    },
+    {
+      "path": "packages/server/src/database_libs/sshTunnel.ts",
+      "gitSha1": "c35e61c0ae0aaaeddced4191b2ba0880e0b57739",
+      "sha256": "6b650e13c3d3b31a01aa88fced370fef51079bfc9e7a8c77fd34fa5b66620417"
+    },
+    {
+      "path": "packages/server/src/index.ts",
+      "gitSha1": "6ecfe3d114c4390b4f158b68e1b774d98f02f97b",
+      "sha256": "90ead89fed14b1833852fa917ea9488ebf615973317c52a7441429d30aec87cb"
+    },
+    {
+      "path": "packages/server/src/initializeLogging.ts",
+      "gitSha1": "87059e4e64bf5ece71bdf121292007fcc0741df9",
+      "sha256": "705c20161680ec82455a83d00e652733652e2719d83343352291db4ee01d443e"
+    },
+    {
+      "path": "packages/server/src/resolveRootPath.ts",
+      "gitSha1": "d037c2d0d4f1a5bb7e42662fcba29742949c98d9",
+      "sha256": "58ab5743e97231331803f11c5d841e93446eeca2415b737402f7de68812ac23f"
+    },
+    {
+      "path": "packages/sql-parser/LICENSE",
+      "gitSha1": "6000a4c106480c13868cb79a4991a093869b0a5a",
+      "sha256": "8515f8a196023a1806ca458e269d7108c7e4c2e4643986dca03e325177ab546f"
+    },
+    {
+      "path": "packages/sql-parser/package.json",
+      "gitSha1": "bed3829a8691ff8f3c06b82438713bee9718a161",
+      "sha256": "141f28821d01defdbaba7992fd1797f44b8b202de682d1b516cb443e773962db"
+    },
+    {
+      "path": "packages/sql-parser/src/ast.ts",
+      "gitSha1": "2253fed7fcdfcf8d53c6c9c43443bd32da1a73c6",
+      "sha256": "c90241e92c190211e1ee1d47c91d123cd5d654af4c82c0f8f7253f46ccf56afd"
+    },
+    {
+      "path": "packages/sql-parser/src/completion.ts",
+      "gitSha1": "1c839a5db5848bdd6e22dc8739cf03a22f132dbd",
+      "sha256": "fc5804eaebf6cd8b7cf0054a5643d66dfd83f20b7ad04a7f3c161eb7b8184036"
+    },
+    {
+      "path": "packages/sql-parser/src/errors.ts",
+      "gitSha1": "e927375e907db038f1ba2dbc9e4679fc02bf588e",
+      "sha256": "28a76cebbaf7789d2fc413f99be66a8e5ee5843d64cf2f0f09e4aa7fe9ef8b0e"
+    },
+    {
+      "path": "packages/sql-parser/src/index.ts",
+      "gitSha1": "1d7e38281610b2147a937ecb059d5b03b5540446",
+      "sha256": "ce84b3fbd2271283ff6b6915274b7d55e54833c3e9a4eb0e1d59dade8969801b"
+    },
+    {
+      "path": "packages/sql-parser/src/lexer.ts",
+      "gitSha1": "9c4dee76ff590c27d573ff7cb198af121f0bbbec",
+      "sha256": "b5596393fa50900b8ecbabb35a4854a39184b421fbd4539502788783750f3240"
+    },
+    {
+      "path": "packages/sql-parser/src/parser.ts",
+      "gitSha1": "8d9e4fc3b842442b6ad40f119c3584103451631a",
+      "sha256": "c6c945ddd5fad5baf502fa776c70c9559921bd675d82b5e2b7319ae73a50d00e"
+    },
+    {
+      "path": "packages/sqlint/LICENSE",
+      "gitSha1": "6000a4c106480c13868cb79a4991a093869b0a5a",
+      "sha256": "8515f8a196023a1806ca458e269d7108c7e4c2e4643986dca03e325177ab546f"
+    },
+    {
+      "path": "packages/sqlint/package.json",
+      "gitSha1": "19c28ac9dba8123ec15423e1a2e7203d02176e03",
+      "sha256": "acff2aedd2d53a6458dcd3dc222f21eb8163068bec1e5ad8c1f6e289aaebe629"
+    },
+    {
+      "path": "packages/sqlint/src/cli/lint.ts",
+      "gitSha1": "3bbbf2742dc62416a593bfae818c780b61c531b7",
+      "sha256": "9373345ad947b238212c1197da1e2d4f76042edfd3a1cbfc2aaae9e558785766"
+    },
+    {
+      "path": "packages/sqlint/src/cli/loadConfig.ts",
+      "gitSha1": "696b67223603a599199ac448abd0b37620876720",
+      "sha256": "2866d2ba78b8ce580d89594cc69d368f38d7c0e354513f6f2dfa5b95050e91cb"
+    },
+    {
+      "path": "packages/sqlint/src/cli/utils.ts",
+      "gitSha1": "7abd7d68ed794de038572a2a7d79b2da16224e12",
+      "sha256": "f3f631b5c1b4aab9f1daca1e9fd647180fda4e79a9e69948f731e292e0b06be5"
+    },
+    {
+      "path": "packages/sqlint/src/fixer.ts",
+      "gitSha1": "9e2fb9accd6991b1946e23ff07a8139b41ca5b8a",
+      "sha256": "0cd560471d64b412abddf585e1334e42100d1ee88cf8df93fb9147b0f9261fb8"
+    },
+    {
+      "path": "packages/sqlint/src/index.ts",
+      "gitSha1": "d830e1a959cc016b44a4e41b1f450151653e15cf",
+      "sha256": "706195a11c898f1e562cca8278e9f86c2da97c3ff0be7f1e0c8cc0ac6cf89a4a"
+    },
+    {
+      "path": "packages/sqlint/src/rules/alignColumnToTheFirst.ts",
+      "gitSha1": "ca934e22920cffb48177f0a0662f24d058da84ec",
+      "sha256": "b41c18bbc2be51e1f62078fd089e0d695e0b89ba91f9f4dfb9c4becba1dc8785"
+    },
+    {
+      "path": "packages/sqlint/src/rules/alignWhereClauseToTheFirst.ts",
+      "gitSha1": "edb76be23bdbd5d4e4e756d0ef985cf6814cebf6",
+      "sha256": "f304eaf20107e0fc85080d7d4a539a49722e333d05c0ae8c29b6cff0bf8ea3d0"
+    },
+    {
+      "path": "packages/sqlint/src/rules/columnNewLine.ts",
+      "gitSha1": "9ca5cd0bab5d24da2c78e4d36bb6a7d35a3a6cba",
+      "sha256": "08df9f80341b8123485c3c839c67f20f38c174721f21da37ba9e6a5b45007ac2"
+    },
+    {
+      "path": "packages/sqlint/src/rules/index.ts",
+      "gitSha1": "ef087c613b69ecad4fe23340ecbaabe2964b264b",
+      "sha256": "8945ee67126f9ce362b76ebb06252a770822af160c45fcf3e38069a6f7e20896"
+    },
+    {
+      "path": "packages/sqlint/src/rules/linebreakAfterClauseKeyword.ts",
+      "gitSha1": "4b5dc359c22e13320354f110d026158ca6f50c39",
+      "sha256": "140732bb67ba29800e1ad2a66239e7b29c00ed07fbc3278ab5b04bcfe822ff1d"
+    },
+    {
+      "path": "packages/sqlint/src/rules/requireAsToRenameColumn.ts",
+      "gitSha1": "b13de02e466653d2924377a20879e5c5d0c6eaf2",
+      "sha256": "2d6ecccc633c2815039f849cf3e52050ce62ede064ff9246fb47c800cc1c8e4c"
+    },
+    {
+      "path": "packages/sqlint/src/rules/reservedWordCase.ts",
+      "gitSha1": "38bf205df23329acc6db15eb9bb47e0711ebbb85",
+      "sha256": "01bf2e2141929c73449f8e7e6df645fa441cfe05292ea5d790b5aa021c3a409f"
+    },
+    {
+      "path": "packages/sqlint/src/rules/spaceSurroundingOperators.ts",
+      "gitSha1": "713f336af86f40be596ea83ee9e2207cdfbbb8db",
+      "sha256": "e800c64df0b8a4cdd4f471e779022686e338c7d2b55fabbd7777ecf3e590cf79"
+    },
+    {
+      "path": "packages/sqlint/src/rules/whereClauseNewLine.ts",
+      "gitSha1": "861bfde6f97b43fd77147066af6091d72fa07d67",
+      "sha256": "ce9a2466d2c8769ab2d6f8fd1ae5fe0c74fd1d00120ed9e3d623ca6bbe1cd403"
+    },
+    {
+      "path": "packages/sqlint/schema.conf.ts",
+      "gitSha1": "b0579a6d9686b25621f5e77c0a8666bc5f31c932",
+      "sha256": "0bc418ca2c072e071600103fa78e40f00c931cc469fa6007a65e41ec690c7289"
+    }
+  ]
+}

@@ -33,7 +33,17 @@ async function setup(t, initialProps = {}) {
   })
   const props = vue.reactive({ projectId: 'a', tree: 'main', diagnostics: null, overlay: null, ...initialProps })
   const timers = new Map()
-  let timerId = 0, mount, unmount
+  const frames = new Map(), listeners = new Map()
+  let timerId = 0, frameId = 0, clock = 0, mount, unmount
+  const testWindow = {
+    addEventListener(type, callback) {
+      if (!listeners.has(type)) listeners.set(type, new Set())
+      listeners.get(type).add(callback)
+    },
+    removeEventListener(type, callback) { listeners.get(type)?.delete(callback) },
+    requestAnimationFrame(callback) { frames.set(++frameId, callback); return frameId },
+    cancelAnimationFrame(id) { frames.delete(id) },
+  }
   const bindings = {
     defineProps: () => props,
     defineEmits: () => (...args) => calls.push(args),
@@ -42,7 +52,8 @@ async function setup(t, initialProps = {}) {
     clearInterval: (id) => timers.delete(id),
     setTimeout: (fn, delay) => { timers.set(++timerId, { fn, delay, interval: false }); return timerId },
     clearTimeout: (id) => timers.delete(id),
-    window: { addEventListener() {}, removeEventListener() {} },
+    window: testWindow,
+    performance: { now: () => clock },
   }
   const url = new URL('../src/components/code/MindMap.vue', import.meta.url)
   const source = readFileSync(url, 'utf8')
@@ -65,7 +76,7 @@ async function setup(t, initialProps = {}) {
   }
   bindings.onMounted = (fn) => { mount = fn }
   bindings.onBeforeUnmount = (fn) => { unmount = fn }
-  const expose = '({ map, loading, error, detail, loadMap, loadDetail, invalidateDetail, closeDetail, poll, refresh, loadFeatureChildren, featureKids, featureBusyIds, loadBriefState, briefMissing, briefLoading, briefJob, briefPresentation, view, onlyChanged, changedFiles, changedIds, visibleNodes, visibleLinks, featureMap, featureOpen, featureParent, purposeCache, onBusinessChanged, loadFeatures, hover, onNodeHover })'
+  const expose = '({ map, loading, error, detail, loadMap, loadDetail, invalidateDetail, closeDetail, poll, refresh, loadFeatureChildren, featureKids, featureBusyIds, loadBriefState, briefMissing, briefLoading, briefJob, briefPresentation, retryBriefs, briefRetrying, openModelSettings, view, onlyChanged, changedFiles, changedIds, visibleNodes, visibleLinks, featureMap, featureOpen, featureParent, purposeCache, onBusinessChanged, loadFeatures, hover, onNodeHover, onNodeLeave, cameraEl, svgEl, pan, zoom, layout, userZoomed, onPointerDown, onPointerMove, onPointerUp, onWheel })'
   const scope = vue.effectScope()
   const state = scope.run(() => new Function(...Object.keys(bindings), `${script}\nreturn ${expose}`)(...Object.values(bindings)))
   t.after(() => {
@@ -73,8 +84,167 @@ async function setup(t, initialProps = {}) {
     scope.stop()
     api.code = originalCodeApi
   })
-  return { state, props, stubs, timers, calls, mount: () => mount(), unmount: () => unmount() }
+  return { state, props, stubs, timers, calls, frames, listeners,
+    dispatch(type, event = {}) { for (const callback of [...(listeners.get(type) || [])]) callback({ ...event, type }) },
+    frame() { const pending = [...frames.values()]; frames.clear(); for (const callback of pending) callback(16) },
+    advance(milliseconds) { clock += milliseconds },
+    mount: () => mount(), unmount: () => unmount() }
 }
+
+function pointer(clientX, clientY, more = {}) {
+  return { button: 0, pointerId: 7, clientX, clientY, preventDefault() {}, ...more }
+}
+
+async function cameraSetup(t) {
+  const fixture = await setup(t), s = fixture.state, writes = [], classes = new Set(), captures = new Set()
+  s.svgEl.value = {
+    getBoundingClientRect: () => ({ left: 30, top: 50, width: 1200, height: 800 }),
+    closest: () => ({ getBoundingClientRect: () => ({ left: 30, top: 50, width: 1200, height: 800 }) }),
+    classList: {
+      add: name => classes.add(name), remove: name => classes.delete(name), contains: name => classes.has(name),
+      toggle(name, force) { const add = force ?? !classes.has(name); if (add) classes.add(name); else classes.delete(name); return add },
+    },
+    setPointerCapture: id => captures.add(id), releasePointerCapture: id => captures.delete(id),
+    hasPointerCapture: id => captures.has(id),
+  }
+  s.cameraEl.value = { setAttribute: (name, value) => writes.push({ name, value }) }
+  await vue.nextTick()
+  fixture.frame()
+  writes.length = 0
+  return { ...fixture, writes, classes, captures }
+}
+
+test('one hundred pointer moves paint one camera frame while preserving scene and layout identities', async t => {
+  const fixture = await cameraSetup(t), { state: s, writes, frames } = fixture
+  const layout = s.layout.value, nodes = s.visibleNodes.value, links = s.visibleLinks.value
+  s.onPointerDown(pointer(100, 100))
+  s.onPointerMove(pointer(101, 101))
+  assert.deepEqual(s.pan.value, { x: 0, y: 0 }, 'a sub-threshold initial movement remains a click')
+  assert.equal(frames.size, 0)
+  for (let i = 1; i <= 100; i++) s.onPointerMove(pointer(100 + i, 100 + i / 2))
+  assert.deepEqual(s.pan.value, { x: 100, y: 50 })
+  assert.equal(frames.size, 1, 'all input samples share the next animation frame')
+  assert.equal(writes.length, 0, 'event handlers do not repeatedly paint the scene')
+  await vue.nextTick()
+  assert.equal(s.layout.value, layout)
+  assert.equal(s.visibleNodes.value, nodes)
+  assert.equal(s.visibleLinks.value, links)
+  fixture.frame()
+  assert.deepEqual(writes, [{ name: 'transform', value: 'translate(100, 50) scale(1)' }])
+  assert.equal(frames.size, 0)
+  s.onPointerMove(pointer(101, 101))
+  assert.deepEqual(s.pan.value, { x: 1, y: 1 }, 'an active drag still follows movement back inside the initial click threshold')
+  fixture.dispatch('pointerup', pointer(101, 101))
+  assert.deepEqual(s.pan.value, { x: 1, y: 1 })
+  assert.equal(frames.size, 0)
+  assert.deepEqual(writes.at(-1), { name: 'transform', value: 'translate(1, 1) scale(1)' })
+})
+
+test('camera zoom preserves the graph coordinate beneath the cursor and coalesces pan and scale writes', async t => {
+  const fixture = await cameraSetup(t), { state: s, writes, frames } = fixture
+  s.pan.value = { x: 80, y: -20 }; s.zoom.value = 0.8
+  fixture.frame(); writes.length = 0
+  const oldPan = { ...s.pan.value }, oldZoom = s.zoom.value, cursor = { x: 210, y: 150 }
+  let prevented = false
+  // The viewport starts at (30,50); pass client coordinates for its local cursor.
+  fixture.state.onWheel({ clientX: cursor.x + 30, clientY: cursor.y + 50, deltaY: -1,
+    preventDefault() { prevented = true } })
+  assert.equal(prevented, true)
+  assert.equal(frames.size, 1)
+  assert.equal(writes.length, 0)
+  assert.ok(Math.abs((cursor.x - s.pan.value.x) / s.zoom.value - (cursor.x - oldPan.x) / oldZoom) < 1e-10)
+  assert.ok(Math.abs((cursor.y - s.pan.value.y) / s.zoom.value - (cursor.y - oldPan.y) / oldZoom) < 1e-10)
+  fixture.frame()
+  assert.equal(writes.length, 1)
+})
+
+test('pointer release flushes the release position once and removes all transient drag listeners', async t => {
+  const fixture = await cameraSetup(t), { state: s, writes, frames, listeners } = fixture
+  s.onPointerDown(pointer(100, 100)); s.onPointerMove(pointer(125, 120))
+  assert.equal(frames.size, 1)
+  fixture.dispatch('pointerup', pointer(140, 130))
+  assert.deepEqual(s.pan.value, { x: 40, y: 30 })
+  assert.equal(frames.size, 0, 'the pending paint cannot run again after release')
+  assert.deepEqual(writes, [{ name: 'transform', value: 'translate(40, 30) scale(1)' }])
+  for (const type of ['pointermove', 'pointerup', 'pointercancel', 'blur']) assert.equal(listeners.get(type)?.size || 0, 0, type)
+  s.onPointerMove(pointer(200, 200))
+  assert.deepEqual(s.pan.value, { x: 40, y: 30 }, 'movement after release no longer pans')
+})
+
+test('pointer cancellation and window blur finish the last known pan without accepting later movement', async t => {
+  const fixture = await cameraSetup(t), { state: s, frames, listeners } = fixture
+  for (const type of ['pointercancel', 'blur']) {
+    const before = { ...s.pan.value }
+    s.onPointerDown(pointer(100, 100)); s.onPointerMove(pointer(140, 130))
+    fixture.dispatch(type, type === 'pointercancel' ? pointer(140, 130) : {})
+    assert.deepEqual(s.pan.value, { x: before.x + 40, y: before.y + 30 }, type)
+    assert.equal(frames.size, 0, type)
+    for (const event of ['pointermove', 'pointerup', 'pointercancel', 'blur']) assert.equal(listeners.get(event)?.size || 0, 0, `${type}/${event}`)
+    s.onPointerMove(pointer(200, 200))
+    assert.deepEqual(s.pan.value, { x: before.x + 40, y: before.y + 30 }, type)
+  }
+})
+
+test('unrelated pointers cannot move or end the active pan, and losing capture finishes it safely', async t => {
+  const fixture = await cameraSetup(t), { state: s, frames, listeners, captures } = fixture
+  s.onPointerDown(pointer(100, 100))
+  assert.equal(captures.has(7), true)
+  s.onPointerDown(pointer(200, 200, { pointerId: 9 }))
+  s.onPointerMove(pointer(150, 140, { pointerId: 9 }))
+  fixture.dispatch('pointerup', pointer(150, 140, { pointerId: 9 }))
+  assert.deepEqual(s.pan.value, { x: 0, y: 0 })
+  assert.equal(listeners.get('pointermove').size, 1)
+  s.onPointerMove(pointer(150, 140))
+  s.onPointerUp(pointer(150, 140, { type: 'lostpointercapture' }))
+  assert.deepEqual(s.pan.value, { x: 50, y: 40 })
+  assert.equal(frames.size, 0)
+  assert.equal(captures.size, 0)
+  assert.equal(listeners.get('pointermove').size, 0)
+})
+
+test('dragging dismisses node documentation and suppresses new hover requests until release', async t => {
+  const fixture = await cameraSetup(t), { state: s, timers } = fixture
+  const node = { id: 'sym:Example.java#run', kind: 'method', label: 'run' }
+  await s.onNodeHover(node, pointer(100, 100))
+  assert.ok(s.hover.value)
+  assert.equal([...timers.values()].filter(timer => timer.delay === 140).length, 1)
+  s.onPointerDown(pointer(100, 100)); s.onPointerMove(pointer(120, 120))
+  assert.equal(s.hover.value, null)
+  await s.onNodeHover(node, pointer(120, 120))
+  assert.equal(s.hover.value, null)
+  assert.equal([...timers.values()].filter(timer => timer.delay === 140).length, 0)
+  s.onPointerUp(pointer(120, 120))
+  await s.onNodeHover(node, pointer(120, 120))
+  assert.ok(s.hover.value, 'normal node explanations remain available after movement')
+  assert.equal([...timers.values()].filter(timer => timer.delay === 140).length, 1)
+})
+
+test('wheel zoom suppresses transient node tips without losing normal hover after the interaction settles', async t => {
+  const fixture = await cameraSetup(t), { state: s, timers } = fixture
+  const node = { id: 'sym:Example.java#run', kind: 'method', label: 'run' }
+  s.onWheel({ clientX: 100, clientY: 100, deltaY: -1, preventDefault() {} })
+  await s.onNodeHover(node, pointer(100, 100))
+  assert.equal(s.hover.value, null)
+  assert.equal([...timers.values()].filter(timer => timer.delay === 140).length, 0)
+  fixture.advance(161)
+  await s.onNodeHover(node, pointer(100, 100))
+  assert.ok(s.hover.value)
+  assert.equal([...timers.values()].filter(timer => timer.delay === 140).length, 1)
+})
+
+test('unmount cancels pending camera work and releases drag listeners without writing after teardown', async t => {
+  const fixture = await cameraSetup(t), { state: s, frames, writes, listeners } = fixture
+  s.onPointerDown(pointer(100, 100)); s.onPointerMove(pointer(160, 140))
+  assert.equal(frames.size, 1)
+  fixture.unmount()
+  assert.equal(frames.size, 0)
+  const writesAfterUnmount = writes.length
+  fixture.frame()
+  assert.equal(writes.length, writesAfterUnmount)
+  for (const type of ['pointermove', 'pointerup', 'pointercancel', 'blur']) assert.equal(listeners.get(type)?.size || 0, 0, type)
+  s.onPointerMove(pointer(200, 200))
+  assert.equal(frames.size, 0)
+})
 
 test('map load keeps the newer request and its loading state when older responses arrive', async (t) => {
   const { state: s, stubs } = await setup(t)
@@ -375,7 +545,7 @@ test('restoring expanded branches cannot bring old project children back after a
   assert.equal(s.featureBusyIds.value.size, 0)
 })
 
-test('automatic description status shares the index poll and never invokes the removed manual fill', async t => {
+test('automatic description status shares the index poll without starting manual generation', async t => {
   const { state: s, stubs, mount, timers } = await setup(t, { projectId: 'automatic-mount' })
   let manualCalls = 0, obsoleteStatusCalls = 0
   stubs.fillFeatureBriefs = async () => { manualCalls++; throw new Error('Manual generation must not run') }
@@ -390,9 +560,27 @@ test('automatic description status shares the index poll and never invokes the r
   assert.equal(manualCalls, 0)
   assert.equal(obsoleteStatusCalls, 0)
   const source = readFileSync(new URL('../src/components/code/MindMap.vue', import.meta.url), 'utf8')
-  assert.doesNotMatch(source, /fillBriefs|fillFeatureBriefs|briefButtonLabel|具体业务含义|业务含义/)
+  assert.doesNotMatch(source, /fillBriefs|briefButtonLabel|具体业务含义|业务含义/)
   assert.match(source, /class="description-progress"[\s\S]*?role="status"/)
   assert.match(source, /<div class="description-progress"/, 'automatic progress stays visible in both map views')
+})
+
+test('explicit description retry is single-flight, preserves the selected worktree and offers model settings', async t => {
+  const { state: s, stubs, calls } = await setup(t, { tree: 'task:work' })
+  await s.loadMap()
+  const pending = deferred(), requests = []
+  stubs.fillFeatureBriefs = async (pid, options) => { requests.push({ pid, options }); return pending.promise }
+  const first = s.retryBriefs()
+  await s.retryBriefs()
+  assert.equal(requests.length, 1)
+  assert.equal(s.briefRetrying.value, true)
+  assert.deepEqual(requests[0], { pid: 'a', options: { tree: 'task:work' } })
+  pending.resolve({ state: 'waiting', running: false, block_reason: 'model_not_configured', action: 'configure_model', coverage_known: true, missing: 12 })
+  await first
+  assert.equal(s.briefPresentation.value.action, 'configure_model')
+  assert.equal(s.briefRetrying.value, false)
+  s.openModelSettings()
+  assert.deepEqual(calls.at(-1), ['open-settings', 'models'])
 })
 
 test('unknown, unavailable model, failed, and API errors remain visible instead of claiming descriptions are complete', async t => {

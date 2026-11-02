@@ -14,10 +14,13 @@ import json
 import os
 from pathlib import Path
 import sqlite3
+from threading import local
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlsplit
-from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
+from urllib.request import (HTTPDefaultErrorHandler, HTTPErrorProcessor, HTTPHandler,
+                            HTTPRedirectHandler, HTTPSHandler, OpenerDirector,
+                            ProxyHandler, Request, UnknownHandler)
 
 
 BUSY_STATES = frozenset({"queued", "running", "waiting", "planning", "merging"})
@@ -87,13 +90,31 @@ class InspectionClient:
             raise CannotConfirm("invalid_base_url")
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+        self.scheme = parts.scheme
+        self._local = local()
+
+    def _opener(self):
+        opener = getattr(self._local, "opener", None)
+        if opener is None:
+            # build_opener() installs HTTPSHandler even for local HTTP. On
+            # Windows its default SSL context imports the system trust store,
+            # which costs seconds per request and is unused on this path.
+            # Keep each mutable opener private to the inspection worker thread.
+            opener = OpenerDirector()
+            for handler in (ProxyHandler({}), UnknownHandler(), HTTPHandler(),
+                            HTTPDefaultErrorHandler(), NoRedirect(), HTTPErrorProcessor()):
+                opener.add_handler(handler)
+            if self.scheme == "https":
+                # HTTPS retains Python's certificate and hostname validation.
+                opener.add_handler(HTTPSHandler())
+            self._local.opener = opener
+        return opener
 
     def __call__(self, path: str) -> Any:
         try:
             # Explicit GET, no inherited proxies, cookies, credentials or redirects.
-            opener = build_opener(ProxyHandler({}), NoRedirect())
             request = Request(self.base_url + path, headers={"Accept": "application/json"}, method="GET")
-            with opener.open(request, timeout=self.timeout) as response:
+            with self._opener().open(request, timeout=self.timeout) as response:
                 if response.status != 200:
                     raise CannotConfirm("inspection_http_status", http_status=response.status)
                 payload = response.read(8 * 1024 * 1024 + 1)
@@ -101,6 +122,7 @@ class InspectionClient:
                     raise CannotConfirm("inspection_response_too_large")
                 return json.loads(payload)
         except HTTPError as exc:
+            exc.close()
             raise CannotConfirm("inspection_http_status", http_status=exc.code) from exc
         except (URLError, OSError, TimeoutError) as exc:
             raise CannotConfirm("inspection_unreachable") from exc

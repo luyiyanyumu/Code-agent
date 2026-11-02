@@ -79,7 +79,9 @@ class FakeClient:
 
 
 @pytest.fixture(autouse=True)
-def _key(monkeypatch):
+def _key(monkeypatch, agent_home):
+    for name in ("CODE_AGENT_SEARCH_BASE_URL", "CODE_AGENT_SEARCH_MODEL", "CODE_AGENT_SEARCH_API_KEY"):
+        monkeypatch.delenv(name, raising=False)
     monkeypatch.setenv("DEEPSEEK_API_KEY", "test-key")
 
 

@@ -26,7 +26,7 @@ const props = defineProps({
   // 地图叠加层：一眼看清"这次任务动了哪些类/函数"。
   overlay: { type: Object, default: null },
 })
-const emit = defineEmits(['open-file', 'select', 'ask', 'error'])
+const emit = defineEmits(['open-file', 'select', 'ask', 'error', 'open-settings'])
 
 // ---- P7：覆盖率上地图（三态：直接 / 文件级 / 无）----
 const showCoverage = ref(false)
@@ -249,6 +249,9 @@ function tipPos(ev) {
 }
 
 async function onNodeHover(node, ev) {
+  // Moving the scene can pass many nodes under a stationary pointer. Their
+  // tooltips are unrelated to the gesture and must not re-render the graph.
+  if (dragging || performance.now() < wheelInteractionUntil) return
   holdNodeTip()
   const cached = purposeCache.get(node.id)
   hover.value = {
@@ -401,9 +404,50 @@ const changedIds = ref(new Set())      // 本轮增量变更的节点（临时�
 const changedFiles = ref([])
 const zoom = ref(1)
 const pan = ref({ x: 0, y: 0 })
+const cameraEl = ref(null)
+let cameraFrame = null
+let wheelInteractionUntil = 0
+
+// Camera state is deliberately absent from the scene template. Vue continues
+// to own all node data, while movement writes just one SVG transform per frame.
+function paintCamera() {
+  cameraFrame = null
+  if (disposed || !cameraEl.value) return
+  cameraEl.value.setAttribute('transform', `translate(${pan.value.x}, ${pan.value.y}) scale(${zoom.value})`)
+}
+
+function scheduleCameraPaint() {
+  if (disposed || !cameraEl.value || cameraFrame !== null) return
+  cameraFrame = window.requestAnimationFrame(paintCamera)
+}
+
+function flushCameraPaint() {
+  if (cameraFrame !== null) window.cancelAnimationFrame(cameraFrame)
+  cameraFrame = null
+  paintCamera()
+}
+
+watch([pan, zoom], scheduleCameraPaint, { flush: 'sync' })
+watch(cameraEl, flushCameraPaint, { flush: 'post' })
 //: 用户自己缩放过就不再自动适配（别抢他的视野）
 const userZoomed = ref(false)
 const svgEl = ref(null)
+let viewportObserver = null
+let viewportFrame = null
+
+function observeViewport() {
+  if (typeof ResizeObserver === 'undefined' || !svgEl.value) return
+  viewportObserver = new ResizeObserver(entries => {
+    const box = entries[0]?.contentRect
+    if (!box?.width || !box.height || userZoomed.value) return
+    if (viewportFrame !== null) window.cancelAnimationFrame(viewportFrame)
+    viewportFrame = window.requestAnimationFrame(() => {
+      viewportFrame = null
+      if (!disposed && !userZoomed.value) fitView()
+    })
+  })
+  viewportObserver.observe(svgEl.value)
+}
 
 let pollTimer = null
 let lastSeq = 0
@@ -628,6 +672,11 @@ const briefMissing = ref(null)
 const briefLoading = ref(false)
 const briefJob = ref(null)
 const briefStatusError = ref('')
+const briefDetailsOpen = ref(false)
+const briefRetrying = ref(false)
+const briefStatusEl = ref(null)
+const briefDetailsEl = ref(null)
+const briefTriggerEl = ref(null)
 let lastBriefRevision = null
 function briefRevisionToken(job) {
   return Number.isInteger(job?.revision) ? `${job.revision_epoch || ''}\0${job.revision}` : null
@@ -635,6 +684,39 @@ function briefRevisionToken(job) {
 const briefPresentation = computed(() => functionDescriptionPresentation(briefJob.value, {
   loading: briefLoading.value, error: briefStatusError.value,
 }))
+const briefReason = computed(() => briefPresentation.value.summary || briefStatusError.value || briefJob.value?.error || briefJob.value?.note || '')
+const briefDetailsId = computed(() => `map-description-details-${props.projectId}`)
+
+async function toggleBriefDetails() {
+  briefDetailsOpen.value = !briefDetailsOpen.value
+  if (briefDetailsOpen.value) { await nextTick(); briefDetailsEl.value?.focus() }
+}
+function closeBriefDetails() {
+  briefDetailsOpen.value = false
+  briefTriggerEl.value?.focus()
+}
+function onDescriptionOutside(event) {
+  if (briefDetailsOpen.value && !briefStatusEl.value?.contains(event.target)) briefDetailsOpen.value = false
+}
+function openModelSettings() {
+  briefDetailsOpen.value = false
+  emit('open-settings', 'models')
+}
+async function retryBriefs() {
+  if (briefRetrying.value || briefJob.value?.running) return
+  const context = captureContext()
+  briefRetrying.value = true
+  try {
+    const job = await api.code.fillFeatureBriefs(context.projectId, { tree: context.tree })
+    if (!contextCurrent(context)) return
+    if (job && typeof job.state === 'string') await applyBriefState(job, context)
+    else await loadBriefState()
+  } catch (cause) {
+    if (contextCurrent(context)) briefStatusError.value = cause.message || '功能描述重试失败'
+  } finally {
+    if (contextCurrent(context)) briefRetrying.value = false
+  }
+}
 
 async function refreshFunctionViews() {
   purposeSeq += 1
@@ -1018,14 +1100,19 @@ async function poll() {
 
 onMounted(async () => {
   window.addEventListener('code-agent:business-meaning-changed', onBusinessChanged)
+  window.addEventListener('pointerdown', onDescriptionOutside, true)
   await loadMap({ ensure: true })
   if (disposed) return
+  observeViewport()
   loadBriefState()
   pollTimer = setInterval(poll, 2500)
 
 })
 onBeforeUnmount(() => {
   window.removeEventListener('code-agent:business-meaning-changed', onBusinessChanged)
+  window.removeEventListener('pointerdown', onDescriptionOutside, true)
+  viewportObserver?.disconnect()
+  if (viewportFrame !== null) window.cancelAnimationFrame(viewportFrame)
   disposed = true
   contextSeq += 1
   mapSeq += 1
@@ -1060,6 +1147,8 @@ watch([() => props.projectId, () => props.tree], () => {
   lastBriefRevision = null
   briefJob.value = null
   briefStatusError.value = ''
+  briefDetailsOpen.value = false
+  briefRetrying.value = false
   onNodeLeave(true)
   if (changedTimer !== null) clearTimeout(changedTimer)
   changedTimer = null
@@ -1305,6 +1394,7 @@ function centerOn(node) {
   const el = svgEl.value
   if (!el) return
   const box = el.getBoundingClientRect()
+  if (box.width <= 0 || box.height <= 0) return
   pan.value = {
     x: box.width / 2 - (node.x + node.width / 2) * zoom.value,
     y: box.height / 2 - (node.y + node.height / 2) * zoom.value,
@@ -1316,6 +1406,8 @@ function onWheel(ev) {
   const el = svgEl.value
   if (!el) return
   const box = el.getBoundingClientRect()
+  onNodeLeave(true)
+  wheelInteractionUntil = performance.now() + 160
   const mx = ev.clientX - box.left
   const my = ev.clientY - box.top
   const next = Math.min(2.5, Math.max(0.06, zoom.value * (ev.deltaY > 0 ? 0.9 : 1.1)))
@@ -1329,27 +1421,45 @@ function onWheel(ev) {
 }
 
 function onPointerDown(ev) {
-  if (ev.button !== 0) return
-  dragging = { x: ev.clientX, y: ev.clientY, px: pan.value.x, py: pan.value.y }
+  if (ev.button !== 0 || ev.isPrimary === false || dragging) return
+  onNodeLeave(true)
+  dragging = { x: ev.clientX, y: ev.clientY, px: pan.value.x, py: pan.value.y, pointerId: ev.pointerId, moved: false }
+  try { svgEl.value?.setPointerCapture?.(ev.pointerId) } catch { /* Synthetic/ended pointers cannot be captured. */ }
   window.addEventListener('pointermove', onPointerMove)
   window.addEventListener('pointerup', onPointerUp)
+  window.addEventListener('pointercancel', onPointerUp)
+  window.addEventListener('blur', onPointerUp)
 }
 function onPointerMove(ev) {
   if (!dragging) return
-  if (Math.abs(ev.clientX - dragging.x) + Math.abs(ev.clientY - dragging.y) < 3) return
+  if (ev.pointerId != null && dragging.pointerId != null && ev.pointerId !== dragging.pointerId) return
+  if (!dragging.moved && Math.abs(ev.clientX - dragging.x) + Math.abs(ev.clientY - dragging.y) < 3) return
+  dragging.moved = true
   userZoomed.value = true
   pan.value = { x: dragging.px + (ev.clientX - dragging.x), y: dragging.py + (ev.clientY - dragging.y) }
 }
-function onPointerUp() {
+function onPointerUp(ev) {
+  if (dragging && ev?.pointerId != null && dragging.pointerId != null && ev.pointerId !== dragging.pointerId) return
+  if (dragging && ev?.type === 'pointerup') onPointerMove(ev)
+  const pointerId = dragging?.pointerId
   dragging = null
   window.removeEventListener('pointermove', onPointerMove)
   window.removeEventListener('pointerup', onPointerUp)
+  window.removeEventListener('pointercancel', onPointerUp)
+  window.removeEventListener('blur', onPointerUp)
+  try { if (pointerId != null) svgEl.value?.releasePointerCapture?.(pointerId) } catch { /* Capture may already be lost. */ }
+  // Keep the exact final position even if the last move preceded a display
+  // frame. Unmount sets disposed first, so this only cancels its pending frame.
+  flushCameraPaint()
 }
 
 function fitView(mode = 'width') {
   const el = svgEl.value
   if (!el || !layout.value.nodes.length) return
   const box = el.getBoundingClientRect()
+  // A retained map can finish loading while hidden with v-show. Its first
+  // nonzero ResizeObserver measurement will fit the visible viewport.
+  if (box.width <= 0 || box.height <= 0) return
   const widthScale = box.width / (layout.value.width + 40)
   const heightScale = box.height / (layout.value.height + 40)
   // 默认保留可读字号；全览允许继续缩小，保证大图也能完整进入视口。
@@ -1464,8 +1574,8 @@ defineExpose({ refresh, verify, loadMap, poll })
         <button class="ghost" title="定位到首个匹配" @click="locate">↵</button>
       </div>
 
-      <div class="map-actions">
-      <span class="spacer" />
+    </div>
+    <div class="map-actions" aria-label="地图操作">
       <button class="ghost" title="展开所有目录（不含文件）" @click="expandDirs">展开目录</button>
       <button class="ghost" title="回到只看模块骨架" @click="collapseAll">折叠</button>
       <button class="ghost" title="适应宽度（保持文字可读，纵向滚动看更多）" @click="fitView('width')">适应宽度</button>
@@ -1490,14 +1600,31 @@ defineExpose({ refresh, verify, loadMap, poll })
         @click="toggleEvidence"
       >证据</button>
       <button class="ghost" title="复制给模型的紧凑地图" @click="copyDigest">摘要</button>
-      </div>
     </div>
-    <div class="description-progress" :class="briefPresentation.tone" role="status" :title="briefPresentation.title">
-      <span class="description-dot" aria-hidden="true" />
-      <span>{{ briefPresentation.label }}</span>
-      <span v-if="briefJob?.running && briefJob.total" class="muted tiny">已写 {{ briefJob.written || 0 }} · 失败 {{ briefJob.failed || 0 }}</span>
-      <span v-else-if="briefJob?.error || briefJob?.note" class="description-reason muted tiny">{{ briefJob.error || briefJob.note }}</span>
-      <span class="description-scope muted tiny">共用于功能导图、结构详情和编辑器词说明</span>
+    <div ref="briefStatusEl" class="description-status">
+      <div class="description-progress" :class="briefPresentation.tone">
+        <button ref="briefTriggerEl" class="description-trigger" :aria-expanded="briefDetailsOpen" :aria-controls="briefDetailsId"
+          :aria-label="`${briefPresentation.label}，查看详情`" @click="toggleBriefDetails">
+          <span class="description-dot" aria-hidden="true" />
+          <span class="description-label" role="status">{{ briefPresentation.label }}</span>
+          <span class="description-chevron" aria-hidden="true">{{ briefDetailsOpen ? '▴' : '▾' }}</span>
+        </button>
+        <span v-if="briefReason" class="description-reason">{{ briefReason }}</span>
+        <button v-if="briefPresentation.action === 'configure_model'" class="ghost tiny description-action" @click="openModelSettings">模型设置</button>
+        <button v-else-if="['error', 'missing'].includes(briefPresentation.tone)" class="ghost tiny description-action"
+          :disabled="briefRetrying || briefJob?.running" @click="retryBriefs">{{ briefRetrying ? '正在重试…' : '重试' }}</button>
+      </div>
+      <section v-if="briefDetailsOpen" :id="briefDetailsId" ref="briefDetailsEl" class="description-details card" role="region"
+        aria-label="功能描述详情" tabindex="-1" @keydown.esc.stop.prevent="closeBriefDetails">
+        <header><strong>功能描述</strong><button class="ghost tiny" aria-label="关闭功能描述详情" @click="closeBriefDetails">×</button></header>
+        <p v-if="briefReason" class="description-explanation">{{ briefReason }}</p>
+        <p class="description-counts">{{ briefPresentation.title }}</p>
+        <footer>
+          <span class="muted tiny">结构图、功能导图与编辑器共用说明；描述生成不影响浏览代码。</span>
+          <button v-if="briefPresentation.action === 'configure_model'" class="small" @click="openModelSettings">打开模型设置</button>
+          <button v-else-if="['error', 'missing'].includes(briefPresentation.tone)" class="small" :disabled="briefRetrying || briefJob?.running" @click="retryBriefs">{{ briefRetrying ? '正在重试…' : '重试补全' }}</button>
+        </footer>
+      </section>
     </div>
     <div v-if="kindPanel" class="kindpick card">
       <div class="kp-head">
@@ -1544,21 +1671,6 @@ defineExpose({ refresh, verify, loadMap, poll })
       <span class="muted tiny">未覆盖的公共符号 {{ coverage.uncovered?.length || 0 }} 条（详情见节点抽屉）</span>
     </div>
 
-    <div class="meta">
-      <span>v{{ map?.version || 0 }}</span>
-      <span>{{ stats.files || 0 }} 文件</span>
-      <span>{{ stats.symbols || 0 }} 符号</span>
-      <span>{{ stats.edges || 0 }} 关系</span>
-      <span v-if="scanInfo.finished_at">上次扫描 {{ String(scanInfo.finished_at).slice(11, 19) }}</span>
-      <span v-if="scanInfo.reused">复用 {{ scanInfo.reused }}</span>
-      <span v-if="scanInfo.externals">外部依赖 {{ scanInfo.externals }}</span>
-      <span v-if="!showSkipped && skippedTotal" title="密钥/二进制/超大文件：不在结构树里画，但数量如实标出（勾选「未索引」可展开）">
-        未索引文件 {{ skippedTotal }}（已折叠）
-      </span>
-      <span class="spacer" />
-      <span v-if="notice" class="notice" role="status" :title="notice">{{ notice }}</span>
-    </div>
-
     <div v-if="focus.active" class="focusbar">
       <span class="up">上游（谁用到它）{{ focus.up.size - 1 }}</span>
       <span class="down">下游（它用到谁）{{ focus.down.size - 1 }}</span>
@@ -1585,9 +1697,10 @@ defineExpose({ refresh, verify, loadMap, poll })
         class="svg"
         @wheel="onWheel"
         @pointerdown="onPointerDown"
+        @lostpointercapture="onPointerUp"
         @dblclick="fitView('width')"
       >
-        <g :transform="`translate(${pan.x}, ${pan.y}) scale(${zoom})`">
+        <g ref="cameraEl">
           <!-- 结构投影的连接线：父右 → 子左的三次贝塞尔（思维导图的曲线），
                不是肘形折线——折线在几十行的时候会连成一片网格 -->
             <path
@@ -1760,20 +1873,29 @@ defineExpose({ refresh, verify, loadMap, poll })
         @error="(message) => emit('error', message)"
       />
     </div>
+    <div class="meta" aria-label="地图索引状态">
+      <span>{{ stats.files || 0 }} 文件 · {{ stats.symbols || 0 }} 符号 · {{ stats.edges || 0 }} 关系</span>
+      <span v-if="scanInfo.finished_at">扫描 {{ String(scanInfo.finished_at).slice(11, 19) }}</span>
+      <span v-if="scanInfo.externals">外部依赖 {{ scanInfo.externals }}</span>
+      <span v-if="!showSkipped && skippedTotal" title="密钥、二进制和超大文件默认折叠，可勾选「未索引」查看">未索引 {{ skippedTotal }}</span>
+      <span class="spacer" />
+      <span v-if="notice" class="notice" role="status" :title="notice">{{ notice }}</span>
+      <span class="index-version" :title="`索引版本 ${map?.version || 0}${scanInfo.reused ? ` · 复用 ${scanInfo.reused}` : ''}`">v{{ map?.version || 0 }}</span>
+    </div>
   </div>
 </template>
 
 <style scoped>
-.map { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; height: 100%; position: relative; }
+.map { display: flex; flex: 1; flex-direction: column; min-width: 0; min-height: 0; height: 100%; position: relative; overflow: hidden; }
 .bar {
   display: flex; align-items: center; gap: var(--sp-2); flex-wrap: wrap;
-  padding: 10px 12px 0; border-bottom: 1px solid var(--border); font-size: var(--fs-xs); background: var(--panel); flex: none;
+  padding: 8px 12px; border-bottom: 1px solid var(--border); font-size: var(--fs-xs); background: var(--panel); flex: none; overflow-x: auto; scrollbar-width: thin;
 }
 .seg { display: flex; flex: none; gap: 2px; padding: 3px; background: var(--panel-soft); border: 1px solid var(--border); border-radius: 6px; }
-.map-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 2px; flex-basis: calc(100% + 24px); margin: 2px -12px 0; padding: 5px 9px; border-top: 1px solid var(--border); background: var(--panel-soft); }.map-actions > .spacer { display: none; }
+.map-actions { display: flex; align-items: center; flex: none; gap: 2px; min-width: 0; overflow-x: auto; scrollbar-width: thin; padding: 3px 9px; border-bottom: 1px solid var(--border); background: var(--panel-soft); }.map-actions > button { flex: none; min-height: 27px; }
 .seg button { font-size: var(--fs-xs); min-height: 26px; padding: 3px 10px; background: transparent; border: 1px solid transparent; border-radius: 4px; color: var(--muted); }
 .seg button.active { background: var(--panel); color: var(--accent); border-color: var(--border); font-weight: var(--fw-semibold); box-shadow: 0 1px 3px #20273508; }
-.ctl { display: flex; align-items: center; gap: var(--sp-1); color: var(--muted); }
+.ctl { display: flex; align-items: center; flex: none; white-space: nowrap; gap: var(--sp-1); color: var(--muted); }
 .ctl select, .ctl input[type='checkbox'] { font-size: var(--fs-xs); padding: var(--sp-0-5) var(--sp-1); }
 .search { display: flex; align-items: center; gap: 4px; min-width: 0; flex: 1 1 170px; max-width: 280px; }.search input { min-width: 0; flex: 1; }
 .search input { width: 150px; min-height: 29px; padding: 4px 8px; font-size: var(--fs-xs); }
@@ -1798,16 +1920,21 @@ defineExpose({ refresh, verify, loadMap, poll })
 .kindpick .kp-foot { margin-top: var(--sp-1-5); line-height: var(--lh-snug); }
 
 .meta {
-  display: flex; align-items: center; gap: 14px; flex: none; padding: 6px 12px; overflow-x: auto; white-space: nowrap; background: var(--panel-soft);
-  border-bottom: 1px solid var(--border); font-size: var(--fs-xs); color: var(--muted);
+  display: flex; align-items: center; gap: 12px; flex: none; min-height: 28px; padding: 3px 12px; overflow-x: auto; white-space: nowrap; background: var(--panel);
+  border-top: 1px solid var(--border); font-size: var(--fs-2xs); color: var(--muted); scrollbar-width: thin;
 }
+.meta > span:not(.spacer) { flex: none; }.meta .notice { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; }.index-version { opacity: .75; }
 .notice { color: var(--accent); }
-.description-progress { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; flex: none; padding: 7px 12px; border-bottom: 1px solid var(--border); background: var(--panel); font-size: var(--fs-xs); color: var(--muted); }
+.description-status { position: relative; flex: none; min-width: 0; z-index: 21; }
+.description-progress { display: flex; align-items: center; gap: 10px; height: 33px; min-width: 0; padding: 0 10px; border-bottom: 1px solid var(--border); background: var(--panel); font-size: var(--fs-xs); color: var(--muted); }
+.description-trigger { display: inline-flex; justify-content: flex-start; gap: 7px; flex: 0 1 auto; min-width: 0; min-height: 27px; padding: 3px 2px; color: inherit; background: transparent; border: 0; font-size: inherit; border-radius: 3px; }
+.description-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.description-chevron { font-size: 10px; opacity: .65; flex: none; }
 .description-dot { width: 6px; height: 6px; flex: none; border-radius: 50%; background: currentColor; }
 .description-progress.running { color: var(--accent); }.description-progress.complete { color: var(--ok); }.description-progress.error { color: var(--err); }.description-progress.missing { color: var(--warn); }
-.description-scope { margin-left: auto; }
-.description-reason { max-width: min(480px, 100%); overflow-wrap: anywhere; }
-.error {
+.description-reason { flex: 1 1 100px; min-width: 0; color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.description-action { flex: none; margin-left: auto; color: var(--accent); }
+.description-details { position: absolute; top: calc(100% + 6px); left: 10px; width: min(540px, calc(100% - 20px)); max-height: min(380px, 50vh); overflow: auto; padding: 14px; font-size: var(--fs-xs); box-shadow: var(--shadow-pop); }
+.description-details header { display: flex; align-items: center; justify-content: space-between; gap: 12px; }.description-details p { margin: 9px 0; line-height: 1.65; overflow-wrap: anywhere; white-space: pre-wrap; }.description-counts { color: var(--muted); }.description-details footer { display: flex; align-items: flex-start; flex-wrap: wrap; gap: 10px; padding-top: 10px; border-top: 1px solid var(--border); }.description-details footer > span { flex: 1 1 180px; }
+.map > .error {
   display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-1-5) var(--sp-2-5);
   font-size: var(--fs-xs); color: var(--err); background: var(--err-soft);
 }
@@ -1815,7 +1942,7 @@ defineExpose({ refresh, verify, loadMap, poll })
   padding: 5px var(--sp-2-5); font-size: var(--fs-xs); color: var(--warn); background: var(--warn-soft);
   border-bottom: 1px solid var(--border);
 }
-.canvas { position: relative; flex: 1; min-height: 0; display: flex; }
+.canvas { position: relative; flex: 1 1 0; min-width: 0; min-height: 0; display: flex; overflow: hidden; }
 .graph-viewport { position: relative; flex: 1; min-width: 0; min-height: 0; display: flex; overflow: hidden; }
 .svg { flex: 1; min-width: 0; width: 100%; height: 100%; background: var(--panel-soft); cursor: grab; touch-action: none; }
 .svg:active { cursor: grabbing; }
@@ -1905,7 +2032,7 @@ defineExpose({ refresh, verify, loadMap, poll })
 /* 悬停给一点反馈：一眼知道"这里可以点" */
 .node:hover .box { fill: #f1f5f9; }
 .node:focus-visible { outline: none; }.node:focus-visible .box { stroke: var(--accent); stroke-width: 2; }
-@media (max-width: 760px) { .meta { flex-wrap: wrap; gap: 5px 9px; } .search input { width: 155px; } }
+@media (max-width: 760px) { .search input { width: 155px; }.description-reason { display: none; }.description-trigger { flex: 1 1 0; }.description-details { max-height: min(420px, 58vh); } }
 .focusbar {
   display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-1) var(--sp-2-5);
   border-bottom: 1px solid var(--border); font-size: var(--fs-xs); background: #fbfdff;

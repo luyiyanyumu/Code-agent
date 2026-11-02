@@ -30,6 +30,7 @@ from code_agent.providers.base import (
 )
 from code_agent.providers.capacity import effective_model_capacity, estimate_tokens, normalize_capacity
 from code_agent.providers.network import connection_error_detail, normalize_proxy_mode
+from code_agent.providers.reasoning import reasoning_request_fields, resolve_reasoning_effort
 
 DEFAULT_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_MODEL = "gpt-4o-mini"
@@ -38,10 +39,6 @@ RETRY_MAX_HEADER_WAIT = 20.0
 
 # 触发重试的状态码：限流 + 服务端错误
 RETRYABLE_STATUS = {429, 500, 502, 503, 504}
-
-# Only these model IDs are known to accept the documented thinking switch.
-_SIMPLE_ANSWER_MODELS = {"deepseek-flash", "deepseek-v4-pro", "deepseek-v4-flash"}
-
 
 def _cached_tokens(usage: dict[str, Any]) -> int:
     """提取提示词缓存命中数，兼容两种上报格式：
@@ -99,6 +96,7 @@ class OpenAICompatProvider(Provider):
         proxy_mode: str = "system",
         context_window: int | None = None,
         max_output_tokens: int | None = None,
+        reasoning_effort: str | None = None,
         transport: httpx.AsyncBaseTransport | None = None,
         max_retries: int | None = None,
     ):
@@ -106,6 +104,7 @@ class OpenAICompatProvider(Provider):
         self.model = model or os.environ.get(self.env_model, self.default_model)
         self.base_url = (base_url or os.environ.get(self.env_base_url, self.default_base_url)).rstrip("/")
         self.proxy_mode = normalize_proxy_mode(proxy_mode)
+        self.reasoning_effort = resolve_reasoning_effort(self.name, self.model, reasoning_effort)
         # Capture settings on this provider. A router reload only changes future loops.
         self.context_window = normalize_capacity(context_window, "context_window")
         self.max_output_tokens = normalize_capacity(max_output_tokens, "max_output_tokens")
@@ -152,12 +151,10 @@ class OpenAICompatProvider(Provider):
             body["max_tokens"] = output_cap
         if tools:
             body["tools"] = [{"type": "function", "function": t} for t in tools]
-        if (
-            options is not None and options.simple_answer and not tools
-            and self.model.lower().rsplit("/", 1)[-1] in _SIMPLE_ANSWER_MODELS
-        ):
-            body["thinking"] = {"type": "disabled"}
-            body["tool_choice"] = "none"
+        # The immutable provider captures the session's effort, including the
+        # advertised default. A simple/final answer must not silently override
+        # the user's choice after the selector has displayed it.
+        body.update(reasoning_request_fields(self.reasoning_effort))
         if self.context_window is not None or output_cap is not None:
             capacity = effective_model_capacity(self.model, self.context_window, output_cap)
             # Pinned user instructions and the latest tool result are deliberately not
@@ -224,14 +221,16 @@ class OpenAICompatProvider(Provider):
     ) -> AsyncIterator[StreamChunk]:
         """按 SSE 解析增量；tool_calls 分片按 index 累积，最后合成 ModelTurn。
 
-        重试规则（关键）：只在**尚未向调用方吐出任何增量**时重试。
-        一旦已经 yield 过文本，重试会导致内容重复，此时宁可失败——
-        这正是"流式不能无脑重试"与"非流式可以随便重试"的区别。
+        默认仅在尚未输出增量时重试。支持重置预览的调用方可为本次请求
+        显式启用 stream_retry_reset；重试前发送不含生成内容的重置信号。
+        不完整的工具参数只存在于本次尝试的缓冲，完整 turn 才能被执行。
         """
         self._require_key()
         url = f"{self.base_url}/chat/completions"
         body = self._body(messages, tools, stream=True)
         client = self._get_client()
+        options = current_generation_options()
+        reset_aware = bool(options and options.stream_retry_reset)
 
         attempt = 0
         while True:
@@ -244,6 +243,7 @@ class OpenAICompatProvider(Provider):
             tool_seq = 0  # 后端不报 index 时的人工序号，见下方 tool_calls 解析
             usage = TokenUsage()
             finish_reason: str | None = None
+            done = False
 
             try:
                 async with client.stream("POST", url, headers=self._headers(), json=body) as resp:
@@ -267,6 +267,7 @@ class OpenAICompatProvider(Provider):
                             continue
                         payload = line[5:].strip()
                         if payload == "[DONE]":
+                            done = True
                             break
                         try:
                             chunk = json.loads(payload)
@@ -322,11 +323,19 @@ class OpenAICompatProvider(Provider):
                                 elif args:
                                     # 个别后端把参数当对象直接塞进来（native 风格）
                                     slot["arguments"] = json.dumps(args, ensure_ascii=False)
+                    if not done and finish_reason is None:
+                        raise httpx.RemoteProtocolError("SSE ended without a terminal marker")
             except (RetryableStream, httpx.TimeoutException, httpx.TransportError) as exc:
-                if emitted:
+                # A terminal choice commits the generation; losing a trailing
+                # usage/[DONE] frame must not regenerate an already complete turn.
+                if finish_reason is not None:
+                    break
+                if emitted and not reset_aware:
                     raise LLMError(f"流式传输中断（已输出增量，不再重试）：{connection_error_detail(exc, self.base_url, self.proxy_mode)}") from exc
                 if attempt > self.max_retries:
                     raise LLMError(f"模型请求失败（重试 {self.max_retries} 次后放弃）：{connection_error_detail(exc, self.base_url, self.proxy_mode)}") from exc
+                if reset_aware:
+                    yield StreamChunk(reset=True, retry_attempt=attempt)
                 retry_after = getattr(exc, "retry_after", None)
                 await asyncio.sleep(retry_after or self._backoff(attempt))
                 continue

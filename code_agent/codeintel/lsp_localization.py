@@ -12,6 +12,8 @@ import json
 import re
 from typing import Any
 
+from code_agent.codeintel.documentation_translation import needs_translation
+
 
 _ORIGINAL = "_code_agent_original"
 _ADDED = "__added__"
@@ -105,7 +107,8 @@ class _Fields:
     def add(self, owner: Any, key: str, *, contents: bool = False, detail: bool = False) -> None:
         if not isinstance(owner, dict) or key not in owner:
             return
-        if isinstance(owner.get(_ORIGINAL), dict) and key in owner[_ORIGINAL]:
+        if (isinstance(owner.get(_ORIGINAL), dict) and key in owner[_ORIGINAL]
+                and owner[key] != owner[_ORIGINAL][key]):
             return  # Already localized; retain its original receipt.
         value = owner[key]
         valid = isinstance(value, str) and bool(value.strip())
@@ -119,7 +122,7 @@ class _Fields:
             self._seen.add(identity)
             self.slots.append((owner, key, copy.deepcopy(value)))
 
-    async def translate(self, translator: Any, *, scope: str) -> None:
+    async def translate(self, translator: Any, *, scope: str, cache_only: bool = False) -> None:
         # Keep ordinary messages in one request. Very large completion lists
         # are split by serialized input size, rather than one call per item.
         batches: list[list[tuple[dict, str, Any]]] = []
@@ -142,7 +145,10 @@ class _Fields:
                 identifiers.update(match[2] for match in _QUOTED_NAME.finditer(text))
                 identifiers.update(_CALL_NAME.findall(text))
             try:
-                translated = await translator.translate_contents(
+                translate = getattr(translator, "cached_contents", None) if cache_only else translator.translate_contents
+                if not callable(translate):
+                    continue
+                translated = await translate(
                     values, scope=scope, identifiers=identifiers, single_words=True,
                 )
             except asyncio.CancelledError:
@@ -202,22 +208,32 @@ def _symbols(fields: _Fields, symbols: Any) -> None:
         _symbols(fields, symbol.get("children"))
 
 
-async def localize_result(translator: Any, method: str, result: Any, *, scope: str = "") -> Any:
+async def localize_result(translator: Any, method: str, result: Any, *, scope: str = "",
+                          completion_cache_only: bool = False,
+                          completion_timeout: float | None = None,
+                          hover_mode: str | None = None, hover_retry: bool = False) -> Any:
     """Translate only the known display fields of one LSP result."""
     output = copy.deepcopy(result)
     if method == "textDocument/hover" and isinstance(output, dict):
         if isinstance(output.get(_ORIGINAL), dict) and "contents" in output[_ORIGINAL]:
-            return output
+            if hover_mode is None:
+                return output
+            output = restore_protocol_text(output)
         try:
-            translated = await translator.translate_hover(copy.deepcopy(output), scope=scope)
+            if hover_mode == "background":
+                translated = await translator.project_hover(copy.deepcopy(output), scope=scope, retry=hover_retry)
+            elif hover_mode == "wait":
+                translated = await translator.translate_hover_state(copy.deepcopy(output), scope=scope)
+            else:
+                translated = await translator.translate_hover(copy.deepcopy(output), scope=scope)
         except asyncio.CancelledError:
             raise
         except Exception:
             return output
-        if (isinstance(translated, dict) and "contents" in output and "contents" in translated
-                and translated["contents"] != output["contents"]):
-            _remember(output, "contents", output["contents"])
-            output["contents"] = copy.deepcopy(translated["contents"])
+        if isinstance(translated, dict) and "contents" in output and "contents" in translated:
+            if translated["contents"] != output["contents"] or hover_mode is not None:
+                _remember(output, "contents", output["contents"])
+                output["contents"] = copy.deepcopy(translated["contents"])
             if "documentation_translation" in translated:
                 if "documentation_translation" in output:
                     _remember(output, "documentation_translation", output["documentation_translation"])
@@ -275,7 +291,49 @@ async def localize_result(translator: Any, method: str, result: Any, *, scope: s
         for report in _each(output.get("items")):
             if isinstance(report, dict):
                 _diagnostics(fields, report.get("items"))
-    await fields.translate(translator, scope=scope)
+    cache_only = completion_cache_only and method == "textDocument/completion"
+    warming = False
+    if method == "completionItem/resolve" and completion_timeout is not None:
+        if completion_timeout <= 0:
+            # The LSP request used its deadline. Do not start work which the
+            # caller has no remaining budget to wait for.
+            cache_only = True
+            await fields.translate(translator, scope=scope, cache_only=True)
+        else:
+            try:
+                await asyncio.wait_for(fields.translate(translator, scope=scope), completion_timeout)
+            except asyncio.TimeoutError:
+                # Cancelling this waiter leaves the translator's shielded
+                # paragraph jobs alive. Return resolved edits now; the next
+                # completion list can reuse the permanent cache they fill.
+                warming = True
+                await fields.translate(translator, scope=scope, cache_only=True)
+    else:
+        await fields.translate(translator, scope=scope, cache_only=cache_only)
+    if method in {"textDocument/completion", "completionItem/resolve"}:
+        by_owner: dict[int, list] = {}
+        for owner, key, original in fields.slots:
+            if needs_translation(original, single_words=True):
+                by_owner.setdefault(id(owner), []).append((owner, key, original))
+        for slots in by_owner.values():
+            owner = slots[0][0]
+            status = "ready" if all(owner[key] != original for _, key, original in slots) else (
+                "pending" if warming else "untranslated" if cache_only else "failed")
+            for _, key, original in slots:
+                _remember(owner, key, original)
+            if "documentation_translation" in owner:
+                # A previous display marker must not replace the true server
+                # original when a deferred item is read again after warming.
+                added = _metadata(owner).get(_ADDED, [])
+                if "documentation_translation" not in added:
+                    _remember(owner, "documentation_translation", owner["documentation_translation"])
+            else:
+                added = _metadata(owner).setdefault(_ADDED, [])
+                if "documentation_translation" not in added:
+                    added.append("documentation_translation")
+            owner["documentation_translation"] = {"language": "zh-CN", "source": "configured-model", "status": status}
+            if status == "pending":
+                owner["documentation_translation"]["refresh_required"] = True
     return output
 
 

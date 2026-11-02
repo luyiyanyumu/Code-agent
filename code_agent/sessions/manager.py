@@ -27,11 +27,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 
 from code_agent.agent import loop as loop_module
-from code_agent.agent.breaker import FailureBreaker
-from code_agent.agent.code_question import match_code_question
-from code_agent.agent.execution_progress import ExecutionProgress
 from code_agent.agent.loop import DEFAULT_SYSTEM_PROMPT, AgentLoop, LoopResult
-from code_agent.agent.repeat_reminder import RepeatReminder
 from code_agent.agent.router import ModelRouter
 from code_agent.agent.routing import classify as route_task
 from code_agent.agent.routing import route_hint
@@ -53,6 +49,7 @@ from code_agent.sessions.acceptance import (
 )
 from code_agent.sessions.checkpoints import CheckpointStore, report_text, rewind_to
 from code_agent.sessions.rewind import RewindNotes, summarize as rewind_summary
+from code_agent.sessions.model_selection import SessionModelDirectory
 from code_agent.storage.db import ApprovalRepo, SessionRepo
 from code_agent.storage.jsonl import TranscriptStore
 from code_agent.tools.base import ToolContext
@@ -61,6 +58,17 @@ from code_agent.tools.registry import FilteredToolRegistry, ToolRegistry
 from code_agent.tools.builtin.web_tools import WEB_SYSTEM_SUFFIX, WEB_TOOL_NAMES
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_web_enabled(enabled: bool) -> None:
+    if type(enabled) is not bool:
+        raise ValueError("enabled 必须是布尔值")
+    if enabled:
+        from code_agent.web import availability
+
+        info = availability()
+        if not info["available"]:
+            raise ValueError(info["reason"])
 
 
 def _provider_requires_attention(exc: Exception) -> bool:
@@ -231,10 +239,6 @@ class SessionRuntime:
         #: 运行时重建（重启/重开）即清空——"我以为那个后台任务还在跑"是最危险的假设。
         #: 结算回调只做调度（繁忙留给下一步注入、空闲起一轮唤醒），不在这里等待。
         self.jobs = JobRegistry(on_settle=self._on_job_settled)
-        #: 重复调用提醒（M47）。在 `_run_loop` 开头**重新建一个**（每条用户消息一次），
-        #: 但跨段共用同一个实例——段边界会重建 AgentLoop，挂在 loop 上等于每段清零。
-        self.repeat_reminder = RepeatReminder()
-        self.execution_progress = ExecutionProgress(self.workspace)
         #: 持久 shell（M48）。会话级：跨调用保留 cwd / 导出的变量 / 函数。
         #: 懒起（第一次用到 `bash_persistent` 才 spawn）；停止会话时杀掉当前那只
         #: （`cancel`），运行时被释放时彻底关闭（`shutdown`）。
@@ -304,7 +308,6 @@ class SessionRuntime:
         self.code_intel: Any | None = None
         #: 任务类型路由（M29）：每条 prompt 重新分类，就近附着在 system prompt 上
         self._route_obj: Any | None = None
-        self._code_question = None
         #: 本轮已记录的检查点（回退后要按需清理）
         self._checkpoint_seq: int = 0
         #: 本次 prompt 的起点时间（patch 台账按它过滤"这一轮的改动"，M29）
@@ -452,7 +455,9 @@ class SessionRuntime:
         self._tool_calls.clear()
         self.current_tool = ""
         if web is not None:
-            self.web_enabled = bool(web)
+            _validate_web_enabled(web)
+            self.session_repo.set_web_enabled(self.session_id, web)
+            self.web_enabled = web
         # M45：用户自己说话了 → 唤醒预算重置（对齐 DSH：用户撰写的消息重置所有者预算）
         self._consecutive_wakes = 0
         self.session_repo.touch(self.session_id, title=prompt[:40] if prompt else None)
@@ -490,9 +495,15 @@ class SessionRuntime:
             self._task.cancel()
         for approval_id, fut in list(self._pending_approvals.items()):
             if not fut.done():
-                fut.set_result(False)
+                # Harness tool callbacks run in their own tasks. A false result
+                # can race ahead of the transport cancellation and turn a user
+                # stop into an ordinary denial; cancel the actual waiter.
+                fut.cancel()
                 self.approval_repo.decide(approval_id, "denied", decided_by=f"{self.user_id} (cancel)")
         self._pending_approvals.clear()
+        for future in self._pending_questions.values():
+            if not future.done():
+                future.cancel()
         self._pending_questions.clear()
         self._pending_question_payloads.clear()
         # M48：持久 shell 是**会话级**的长驻进程。这里只杀"当前这一只"——
@@ -507,9 +518,12 @@ class SessionRuntime:
             self._task.cancel()
         for approval_id, future in list(self._pending_approvals.items()):
             if not future.done():
-                future.set_result(False)
+                future.cancel()
                 self.approval_repo.decide(approval_id, "denied", decided_by=f"{self.user_id} (interrupt)")
         self._pending_approvals.clear()
+        for future in self._pending_questions.values():
+            if not future.done():
+                future.cancel()
         self._pending_questions.clear()
         self._pending_question_payloads.clear()
         self.shells.kill_nowait()
@@ -745,11 +759,11 @@ class SessionRuntime:
     ) -> LoopResult:
         """一条 prompt 的执行入口：准备上下文并执行普通模型/工具循环。
 
-        M29 在这里挂三样东西，它们都是"一条 prompt"的生命周期：
+        这里管理产品层的"一条 prompt"生命周期：
         · **任务类型路由**：按 prompt 分类，把一句"这类任务通常只需要哪些工具"写进
           system prompt（只提示，不摘工具）；
-        · **熔断器**：跨段/跨轮共用同一个计数，否则每段重置等于没熔断；
         · **起始检查点**：记在 prompt 落轨迹**之前**，所以"回退到这条消息"能把它一起撤掉。
+        模型、工具和自然结束的步进由官方 Harness 驱动。
 
         `auto_meta`（M45）用于**系统自己发起**的轮次（后台任务完成唤醒）：带上
         `auto/quiet` 之后，界面上那条消息渲染成一行淡字而不是"用户说的话"，
@@ -758,25 +772,18 @@ class SessionRuntime:
         self._event_loop = asyncio.get_running_loop()
         self._set_phase("preparing_context")
         self._route_for_prompt(prompt)
-        self._code_question = (match_code_question(prompt)
-                               if not auto_meta and not attachments else None)
-        # M47：重复调用提醒**每条用户消息重置一次**（跨段共用，见 __init__ 的说明）。
-        # 用户新说一句话就是新的起点，把上一条消息里的重复计数带过来会误报。
-        self.repeat_reminder = RepeatReminder()
-        self.execution_progress = ExecutionProgress(self.workspace)
         #: 本次 prompt 的起点（patch 台账的时间过滤条件）。台账 ts 是秒级 ISO 串，
         #: 用 >= 比较，所以同秒内落下的改动也归本轮。
         self._prompt_started_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
         #: 保存本次 prompt 的事件起点，不把自动通知当作新用户任务。
         self._prompt_start_seq = self.transcript.last_seq(self.session_id)
         self._record_checkpoint(kind="prompt", label=f"发消息前：{prompt[:60]}", before_append=True)
-        breaker = FailureBreaker()
         history, memory = await self._prepare_context(prompt)
         context_blocks, context_meta = await asyncio.to_thread(self._code_context_blocks, prompt, code_context)
         if auto_meta:
             context_meta = {**(context_meta or {}), **auto_meta}
         result = await self._run_execution(
-            prompt, history, memory, attachments, context_blocks, context_meta, breaker
+            prompt, history, memory, attachments, context_blocks, context_meta
         )
         self._record_checkpoint(kind="segment", label="本轮结束")
         return result
@@ -1204,7 +1211,7 @@ class SessionRuntime:
         member = self.agent_team.descriptor(self.session_id) if self.agent_team is not None else None
         role = member["role"] if member else ""
         # 代码模式：每轮都把"作业规程 + 地图 digest"按最新索引版本刷新一次
-        code_suffix = self.refresh_code_context() if self.code_context_provider and self._code_question is None else ""
+        code_suffix = self.refresh_code_context() if self.code_context_provider else ""
         code_suffix = role_session_suffix(code_suffix, role)
         parts = [DEFAULT_SYSTEM_PROMPT]
         if self._system_suffix:
@@ -1215,6 +1222,12 @@ class SessionRuntime:
         # 模型看不到就不会去调，也就不会浪费一轮拿一个"工具不存在"的错误。
         # 每轮都重读禁用清单（_build_loop 每次 run 都会调用），所以页面上点一下即生效。
         excluded: set[str] = set()
+        if self.web_enabled:
+            from code_agent.web import availability
+
+            if not availability()["available"]:
+                self.web_enabled = False
+                self.session_repo.set_web_enabled(self.session_id, False)
         if self.web_enabled:
             parts.append(WEB_SYSTEM_SUFFIX)
         else:
@@ -1256,8 +1269,9 @@ class SessionRuntime:
         system_prompt = overrides.get("system_prompt", system_prompt)
         registry = overrides.get("registry", registry)
         provider = overrides.get("provider") or self.router.resolve_default()
+        self._usage_model_name = str(getattr(provider, "model", "") or self.router.model_name())
         params: dict[str, Any] = dict(
-            # 模型由当前生效配置（默认模型）决定——会话级指定已去掉
+            # Capture a provider for this loop; later selection never mutates it.
             provider=provider,
             registry=registry,
             permissions=self._make_permissions(),
@@ -1272,7 +1286,8 @@ class SessionRuntime:
             system_prompt=system_prompt,
             on_tool_executed=self._audit_tool,
             history_max_chars=self._history_budget(provider, system_prompt=system_prompt, registry=registry),
-            reuse_schema_budget=True,
+            history_ceiling_chars=self._history_ceiling(provider, system_prompt=system_prompt, registry=registry),
+            on_history_budget=lambda value: setattr(self, "_context_history_budget", value),
             # M31 提问通道：工具通过它阻塞等待用户回答（CLI/自动化没有这个桥，
             # 工具会如实报错而不是假装问过）
             on_question=self._ask_user,
@@ -1288,10 +1303,6 @@ class SessionRuntime:
             memory_root=self.memory_root,
             session_memory_root=self.session_memory_root,
             project_id=(self.session_repo.get(self.session_id) or {}).get("project_id") or "",
-            # M47 重复调用提醒（与熔断器互补：它管"成功但没用的重复"）
-            repeat_reminder=self.repeat_reminder,
-            execution_progress=self.execution_progress,
-            code_question=self._code_question,
             # M48 持久 shell：跨调用保留 cwd / 变量 / 函数（挂在会话上，不随段重建）
             shells=self.shells,
         )
@@ -1337,7 +1348,6 @@ class SessionRuntime:
         attachments: list[dict[str, Any]] | None = None,
         context_blocks: list[str] | None = None,
         context_meta: dict[str, Any] | None = None,
-        breaker: FailureBreaker | None = None,
     ) -> LoopResult:
         """Run model/tool steps to a natural stop, with external budget limits.
 
@@ -1353,7 +1363,7 @@ class SessionRuntime:
                 return min(segment, remaining) if segment else remaining
             return segment
 
-        loop = await self._build_loop_async(breaker=breaker, max_turns=turn_limit(0))
+        loop = await self._build_loop_async(max_turns=turn_limit(0))
         result = await loop.run(
             prompt,
             user_id=self.user_id,
@@ -1464,7 +1474,7 @@ class SessionRuntime:
         if self.usage_repo is not None:
             try:
                 self.usage_repo.record(
-                    self.session_id, self.user_id, self.model_name,
+                    self.session_id, self.user_id, getattr(self, "_usage_model_name", "") or self.model_name,
                     result.usage.input_tokens, result.usage.output_tokens,
                     result.usage.cached_tokens,
                 )
@@ -1488,7 +1498,7 @@ class SessionRuntime:
             pass
 
     def _history_budget(
-        self, provider=None, *, system_prompt: str | None = None, registry=None,
+        self, provider=None, *, system_prompt: str | None = None, registry=None, budget_cap: int | None = None,
     ) -> int:
         """动态历史字符预算：窗口的 50% 与预留输出后的空间取小值。
 
@@ -1501,15 +1511,25 @@ class SessionRuntime:
         if system_prompt is None or registry is None:
             system_prompt, registry = self._loop_context()
         output_cap = capacity["max_output_tokens"]
-        if self._code_question is not None and not getattr(self._code_question, "detailed", False):
-            output_cap = min(output_cap, 3072) if output_cap is not None else 3072
         return dynamic_history_budget(
             capacity["context_window"],
             system_chars=len(system_prompt.encode("utf-8")),
-            tools_chars=(0 if self._code_question is not None else
-                         len(json.dumps(registry.schemas(), ensure_ascii=False).encode("utf-8"))),
+            tools_chars=len(json.dumps(registry.schemas(), ensure_ascii=False).encode("utf-8")),
             max_output_tokens=output_cap,
+            budget_cap=budget_cap,
         )
+
+    def _history_ceiling(self, provider=None, *, system_prompt: str | None = None, registry=None) -> int | None:
+        # Only the default working budget may grow, and only inside the known
+        # model input window after output/system/schema reservations.
+        if "CODE_AGENT_HISTORY_BUDGET" in os.environ:
+            return None
+        from code_agent.providers.capacity import known_context_window_for_model
+
+        resolved = provider if provider is not None else self.router.resolve_default()
+        if not (getattr(resolved, "context_window", None) or known_context_window_for_model(getattr(resolved, "model", ""))):
+            return None
+        return self._history_budget(provider, system_prompt=system_prompt, registry=registry, budget_cap=48_000)
 
     # ------------------------------------------------------------------
     # 审批桥接（M1 CLI y/n 的服务端等价物）
@@ -1769,6 +1789,7 @@ class SessionManager:
         self.workspace_repo = workspace_repo
         self.project_repo = project_repo
         self.code_intel = code_intel
+        self.model_directory = SessionModelDirectory(router, session_repo)
         self.agent_team: Any | None = None
         self.workspaces_root = workspaces_root or (agent_home() / "workspaces")
         self.workspaces_root.mkdir(parents=True, exist_ok=True)
@@ -1830,6 +1851,28 @@ class SessionManager:
             # 移进新名字时自动登记工作区，否则分组要等下次创建才出现
             self.workspace_repo.create(user_id, folder)
         return self.get_meta(session_id, user_id)
+
+    def model_options(self, session_id: str, user_id: str) -> dict:
+        return self.model_directory.view(self.get_meta(session_id, user_id))
+
+    def select_model(self, session_id: str, user_id: str, provider: str, model: str, reasoning_effort: str | None = None) -> dict:
+        meta = self.get_meta(session_id, user_id)
+        if meta.get("status") != "active":
+            raise ValueError("已关闭的会话不能切换模型")
+        provider, model = provider.strip(), model.strip()
+        if bool(provider) != bool(model):
+            raise ValueError("请选择完整的提供方和模型")
+        if not provider and reasoning_effort is not None:
+            raise ValueError("请先选择推理强度对应的提供方和模型")
+        selection = self.model_directory.validate_selection(provider, model, reasoning_effort) if provider else None
+        saved = json.dumps(selection, separators=(",", ":")) if selection else ""
+        self.session_repo.set_model_selection(session_id, saved)
+        state = self.model_options(session_id, user_id)
+        runtime = self._runtimes.get(session_id)
+        if runtime is not None:
+            runtime.broadcast(Event(seq=0, type=EventType.session_meta,
+                                    payload={"model": state["current"]["model"], "model_selection": state["current"]}))
+        return state
 
     # ------------------------------------------------------------------
     # 工作区（侧栏分组，M14）
@@ -1921,6 +1964,7 @@ class SessionManager:
         `web_search` / `web_fetch`，也就不会浪费一轮去调它。
         """
         self.get_meta(session_id, user_id)
+        _validate_web_enabled(enabled)
         self.session_repo.set_web_enabled(session_id, enabled)
         runtime = self._runtimes.get(session_id)
         if runtime is not None:
@@ -1931,6 +1975,15 @@ class SessionManager:
         meta = self.session_repo.get(session_id)
         if meta is None or meta["user_id"] != user_id:
             raise KeyError("会话不存在或无权访问")
+        if meta.get("web_enabled"):
+            from code_agent.web import availability
+
+            if not availability()["available"]:
+                self.session_repo.set_web_enabled(session_id, False)
+                meta = {**meta, "web_enabled": 0}
+                runtime = self._runtimes.get(session_id)
+                if runtime is not None:
+                    runtime.web_enabled = False
         return meta
 
     def workspace_for(self, meta: dict) -> Path:
@@ -2304,7 +2357,7 @@ class SessionManager:
             user_id=meta["user_id"],
             transcript=self.transcript,            session_repo=self.session_repo,
             approval_repo=self.approval_repo,
-            router=self.router,
+            router=self.model_directory.router_for(meta["id"]),
             registry=self.registry,
             workspace=resolved,
             extra_policies=self.extra_policies,
@@ -2459,15 +2512,18 @@ class SessionManager:
             _est_tokens(msgs_json),
         )
         total = system_t + tools_t + msgs_t
-        model = self.router.model_name()
-        provider = self.router.resolve_default()
-        capacity = self.router.model_capacity(provider)
+        routing = runtime.router if runtime is not None else self.model_directory.router_for(session_id)
+        model = routing.model_name()
+        provider = routing.resolve_default()
+        capacity = routing.model_capacity(provider)
         window = capacity["context_window"]
         # 实际发送量：历史超过动态预算时会被 compact_messages 截到预算内
         from code_agent.context.prompt import dynamic_history_budget
 
         if runtime is not None:
-            budget = runtime._history_budget(provider, system_prompt=system, registry=registry)
+            base = runtime._history_budget(provider, system_prompt=system, registry=registry)
+            ceiling = runtime._history_ceiling(provider, system_prompt=system, registry=registry) or base
+            budget = min(ceiling, max(base, getattr(runtime, "_context_history_budget", base)))
         else:
             budget = dynamic_history_budget(
                 window, system_chars=len(system.encode("utf-8")),

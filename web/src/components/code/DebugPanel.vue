@@ -9,6 +9,8 @@ const path = ref(''), argsText = ref('[]'), cwd = ref('')
 const language = ref('auto'), javaRequest = ref('launch'), mainClass = ref(''), projectName = ref('')
 const attachHost = ref('127.0.0.1'), attachPort = ref('5005'), stopOnEntry = ref(true)
 const expanded = ref({}), variableLoading = ref({}), consoleHost = ref(null)
+const expression = ref(''), evaluation = ref(null), evaluationError = ref(''), evaluating = ref(false), watches = ref([])
+let evaluationEpoch = 0, watchSequence = 0
 let generation = 0, timer = null, refreshing = false, disposed = false
 let breakpointVersion = 0, updatingBreakpoints = false
 let projectReady = Promise.resolve()
@@ -26,18 +28,25 @@ const canStart = computed(() => Boolean(props.projectId && adapter.value.availab
 const statusText = computed(() => acting.value && !active.value ? attach.value ? '连接中' : '启动中'
   : ({ starting: '启动中', running: '运行中', paused: '已暂停', stopped: '已结束', error: '调试失败' })[session.value?.status] || '未启动')
 const reasonText = computed(() => ({ entry: '程序入口', breakpoint: '断点', step: '逐步', pause: '手动暂停', exception: '异常' })[session.value?.reason] || '')
-const rows = computed(() => {
+const canEvaluate = computed(() => paused.value && Number.isInteger(session.value?.frame_id) && !acting.value && !loading.value)
+function variableRows(items, parent, depth = 0) {
   const result = []
-  function visit(items, depth, parent) {
-    items.forEach((item, index) => {
+  function visit(values, depth, parent) {
+    values.forEach((item, index) => {
       const key = `${parent}/${index}:${item.name}`
       result.push({ ...item, depth, key, open: Object.hasOwn(expanded.value, key) })
       if (Object.hasOwn(expanded.value, key)) visit(expanded.value[key], depth + 1, key)
     })
   }
-  visit(session.value?.variables || [], 0, 'locals')
+  visit(items, depth, parent)
   return result
-})
+}
+const rows = computed(() => variableRows(session.value?.variables || [], 'locals'))
+const evaluationRows = computed(() => evaluation.value ? variableRows([{ ...evaluation.value, name: evaluation.value.expression, value: evaluation.value.result }], 'evaluation') : [])
+const watchRows = computed(() => watches.value.flatMap(item => variableRows([{
+  ...item.result, name: item.expression, value: item.result?.result ?? (item.loading ? '求值中…' : paused.value ? '等待求值' : '暂停后求值'),
+  watchId: item.id, evaluationError: item.error, isWatch: true,
+}], `watch:${item.id}`)))
 
 function valid(seq, projectId = props.projectId) { return !disposed && generation === seq && props.projectId === projectId }
 function report(exc) {
@@ -48,14 +57,17 @@ function applyState(next) {
   if (!next) return
   const previous = session.value
   if (previous?.id === next.id && Number(next.seq) < Number(previous.seq)) return
-  if (!previous || previous.id !== next.id || previous.pause_seq !== next.pause_seq || previous.frame_id !== next.frame_id || next.status !== 'paused') {
+  const contextChanged = !previous || previous.id !== next.id || previous.pause_seq !== next.pause_seq || previous.frame_id !== next.frame_id || previous.status !== next.status
+  if (contextChanged || next.status !== 'paused') {
     expanded.value = {}
     variableLoading.value = {}
   }
+  if (contextChanged) invalidateEvaluation()
   const consoleRows = previous?.id === next.id ? previous.console || [] : []
   const existing = new Set(consoleRows.map(item => item.seq))
   next.console = [...consoleRows, ...(next.console || []).filter(item => !existing.has(item.seq))].slice(-500)
   session.value = next
+  if (contextChanged && next.status === 'paused' && Number.isInteger(next.frame_id)) void refreshWatches()
   if (next.error) error.value = next.error
   if (next.console_seq !== previous?.console_seq) nextTick(() => { if (consoleHost.value) consoleHost.value.scrollTop = consoleHost.value.scrollHeight })
 }
@@ -80,6 +92,7 @@ async function loadProject() {
   projectReady = new Promise(resolve => { finishReady = resolve })
   clearTimeout(timer)
   meta.value = null; session.value = null; expanded.value = {}; error.value = ''; loading.value = false; acting.value = false
+  invalidateEvaluation(); watches.value = []; expression.value = ''
   refreshing = false; updatingBreakpoints = false; breakpointVersion++
   path.value = currentPath.value; cwd.value = ''; argsText.value = '[]'; language.value = 'auto'
   javaRequest.value = 'launch'; mainClass.value = ''; projectName.value = ''; attachHost.value = '127.0.0.1'; attachPort.value = '5005'; stopOnEntry.value = true
@@ -155,7 +168,73 @@ async function action(command) {
 async function stop() { return action('stop') }
 async function selectFrame(frame) {
   if (frame.path) emit('open-file', { path: frame.path, line: frame.line, column: frame.column || 1 })
+  if (session.value?.frame_id === frame.id) return
   await refresh({ frameId: frame.id })
+}
+function invalidateEvaluation() {
+  evaluationEpoch++
+  evaluation.value = null; evaluationError.value = ''; evaluating.value = false
+  for (const item of watches.value) { item.result = null; item.error = ''; item.loading = false }
+}
+function evaluationContext() {
+  if (!paused.value || !Number.isInteger(session.value?.frame_id)) return null
+  const current = session.value
+  return { epoch: evaluationEpoch, generation, projectId: props.projectId, id: current.id, frameId: current.frame_id, pauseSeq: current.pause_seq }
+}
+function evaluationCurrent(context) {
+  return context && valid(context.generation, context.projectId) && context.epoch === evaluationEpoch && paused.value
+    && session.value?.id === context.id && session.value.frame_id === context.frameId && session.value.pause_seq === context.pauseSeq
+}
+function expressionValue() {
+  const value = expression.value.trim()
+  if (!value || value.length > 8192 || value.includes('\0')) { evaluationError.value = '请输入不超过 8192 个字符的表达式'; return null }
+  return value
+}
+async function evaluateExpression() {
+  if (!canEvaluate.value || evaluating.value) return
+  const value = expressionValue(), context = evaluationContext()
+  if (!value || !context) return
+  evaluating.value = true; evaluationError.value = ''; evaluation.value = null
+  expanded.value = Object.fromEntries(Object.entries(expanded.value).filter(([key]) => !key.startsWith('evaluation/')))
+  try {
+    const result = await debugClient.evaluate(context.projectId, context.id, { expression: value, frame_id: context.frameId, pause_seq: context.pauseSeq, context: 'repl' })
+    if (evaluationCurrent(context)) evaluation.value = result
+  } catch (exc) { if (evaluationCurrent(context)) evaluationError.value = exc?.message || String(exc) }
+  finally { if (evaluationCurrent(context)) evaluating.value = false }
+}
+async function evaluateWatch(item) {
+  const context = evaluationContext()
+  if (!context || item.loading) return
+  item.loading = true; item.error = ''
+  expanded.value = Object.fromEntries(Object.entries(expanded.value).filter(([key]) => !key.startsWith(`watch:${item.id}/`)))
+  const current = () => evaluationCurrent(context) && watches.value.some(watch => watch.id === item.id)
+  try {
+    const result = await debugClient.evaluate(context.projectId, context.id, { expression: item.expression, frame_id: context.frameId, pause_seq: context.pauseSeq, context: 'watch' })
+    if (current()) item.result = result
+  } catch (exc) { if (current()) { item.result = null; item.error = exc?.message || String(exc) } }
+  finally { if (current()) item.loading = false }
+}
+async function refreshWatches() {
+  // A normal state poll must never repeat a watch that may execute user code.
+  const context = evaluationContext()
+  for (const item of [...watches.value]) {
+    if (!evaluationCurrent(context)) return
+    await evaluateWatch(item)
+  }
+}
+async function addWatch() {
+  const value = expressionValue()
+  if (!value || !props.projectId) return
+  if (watches.value.some(item => item.expression === value)) { evaluationError.value = '该表达式已在监视列表中'; return }
+  if (watches.value.length >= 24) { evaluationError.value = '最多添加 24 个监视表达式'; return }
+  evaluationError.value = ''
+  const id = ++watchSequence
+  watches.value.push({ id, expression: value, result: null, error: '', loading: false })
+  await evaluateWatch(watches.value.find(item => item.id === id))
+}
+function removeWatch(id) {
+  watches.value = watches.value.filter(item => item.id !== id)
+  expanded.value = Object.fromEntries(Object.entries(expanded.value).filter(([key]) => !key.startsWith(`watch:${id}/`)))
 }
 async function toggleVariable(row) {
   if (!row.variablesReference || !paused.value || variableLoading.value[row.key]) return
@@ -267,6 +346,15 @@ defineExpose({ start, stop, refresh, isPaused: () => paused.value, continue: () 
             <template v-for="scope in session.scopes" :key="scope.variablesReference"><div v-for="item in expanded[`scope:${scope.variablesReference}`] || []" :key="item.name" class="debug-variable"><span>{{ item.name }}</span><code>{{ item.value }}</code></div></template>
           </details>
         </section>
+        <section class="debug-section debug-watches">
+          <h4>监视表达式 <span>{{ watches.length }}/24</span><button type="button" :disabled="!canEvaluate || !watches.length || watches.some(item => item.loading)" title="重新计算所有监视表达式" @click="refreshWatches">刷新</button></h4>
+          <div v-for="row in watchRows" :key="row.key" class="debug-variable debug-watch" :style="{ paddingLeft: `${8 + row.depth * 14}px` }">
+            <button class="debug-expand" :disabled="!row.variablesReference || variableLoading[row.key]" :aria-label="`${row.open ? '收起' : '展开'}监视 ${row.name}`" @click="toggleVariable(row)">{{ row.variablesReference ? variableLoading[row.key] ? '…' : row.open ? '▾' : '▸' : '·' }}</button>
+            <span class="debug-watch-name" :title="row.name">{{ row.name }}</span><code :class="{ 'evaluation-error': row.evaluationError }" :title="row.evaluationError || row.type || row.value">{{ row.evaluationError || row.value }}</code>
+            <button v-if="row.isWatch" class="debug-watch-remove" type="button" :aria-label="`移除监视 ${row.name}`" @click="removeWatch(row.watchId)">×</button>
+          </div>
+          <p v-if="!watches.length" class="debug-empty">在右侧输入表达式，点击“添加监视”</p>
+        </section>
         <section v-if="languageBreakpoints.length" class="debug-section debug-breakpoints">
           <h4>断点</h4>
           <div v-for="bp in languageBreakpoints" :key="`${bp.path}:${bp.line}`" class="debug-breakpoint">
@@ -277,6 +365,21 @@ defineExpose({ start, stop, refresh, isPaused: () => paused.value, continue: () 
       </div>
       <section class="debug-section debug-console">
         <h4>调试控制台 <span v-if="session?.exit_code != null">退出码 {{ session.exit_code }}</span></h4>
+        <div class="debug-evaluator">
+          <form class="debug-expression-form" @submit.prevent="evaluateExpression">
+            <label for="debug-expression">表达式</label>
+            <input id="debug-expression" v-model="expression" maxlength="8192" autocomplete="off" spellcheck="false" aria-label="调试表达式" :placeholder="paused ? '在当前栈帧求值，例如 number + 1' : '输入表达式，暂停后求值'" />
+            <button type="submit" :disabled="!canEvaluate || evaluating || !expression.trim()">{{ evaluating ? '求值中…' : '求值' }}</button>
+            <button type="button" :disabled="!props.projectId || !expression.trim() || watches.length >= 24" title="每次暂停或切换栈帧求值一次；函数调用可能改变程序状态" @click="addWatch">添加监视</button>
+          </form>
+          <p v-if="evaluationError" class="debug-evaluation-error" role="alert">{{ evaluationError }}</p>
+          <div v-if="evaluationRows.length" class="debug-evaluation-result" aria-live="polite">
+            <div v-for="row in evaluationRows" :key="row.key" class="debug-variable" :style="{ paddingLeft: `${8 + row.depth * 14}px` }">
+              <button class="debug-expand" :disabled="!row.variablesReference || variableLoading[row.key]" :aria-label="`${row.open ? '收起' : '展开'}求值 ${row.name}`" @click="toggleVariable(row)">{{ row.variablesReference ? variableLoading[row.key] ? '…' : row.open ? '▾' : '▸' : '·' }}</button>
+              <span class="debug-watch-name" :title="row.name">{{ row.name }}</span><code :title="row.value">{{ row.value }}</code><small v-if="row.type" class="debug-value-type">{{ row.type }}</small>
+            </div>
+          </div>
+        </div>
         <div ref="consoleHost" class="debug-output" role="log" aria-live="off"><pre v-for="item in session?.console || []" :key="item.seq" :class="item.category">{{ item.output }}</pre><p v-if="!session?.console?.length" class="debug-empty">程序输出显示在这里</p></div>
       </section>
     </div>
@@ -302,5 +405,16 @@ defineExpose({ start, stop, refresh, isPaused: () => paused.value, continue: () 
 .debug-variable { display: flex; align-items: baseline; gap: 5px; padding: 3px 8px; min-width: 0; }.debug-expand { padding: 0 !important; flex: 0 0 12px; }.debug-variable-name { color: var(--accent); flex-shrink: 0; }.debug-variable code { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; }.debug-global { padding: 6px 10px; color: var(--muted); }.debug-global summary { cursor: pointer; }
 .debug-breakpoint { display: flex; align-items: center; padding: 2px 5px; }.debug-location { flex: 1; min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; text-align: left; }.debug-location span { color: var(--err); opacity: .45; }.debug-location span.verified { opacity: 1; }
 .debug-console { display: flex; flex-direction: column; min-width: 0; min-height: 0; }.debug-output { flex: 1; overflow: auto; padding: 8px 10px; }.debug-output pre { margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; font: 12px/1.6 var(--font-mono, monospace); }.debug-output pre.stderr { color: var(--err); }
+.debug-evaluator { flex: none; padding: 8px; border-bottom: 1px solid var(--border); background: var(--panel-soft); }
+.debug-expression-form { display: flex; align-items: center; flex-wrap: wrap; gap: 5px; }
+.debug-expression-form label { color: var(--muted); font-size: 11px; }
+.debug-expression-form input { flex: 1 1 150px; min-width: 0; width: 0; min-height: 28px; border: 1px solid var(--border); border-radius: 4px; padding: 4px 6px; color: var(--text); background: var(--panel); font: 12px var(--font-mono, monospace); }
+.debug-expression-form button { flex: none; border-color: var(--border); background: var(--panel); }
+.debug-evaluation-result { max-height: 160px; overflow: auto; padding-top: 6px; }
+.debug-evaluation-error { margin: 5px 0 0; color: var(--err); overflow-wrap: anywhere; }
+.debug-watch-name { min-width: 0; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--accent); }
+.debug-watch-remove { margin-left: auto; flex: none; }.debug-watch code { flex: 1; }.debug-watch .evaluation-error { color: var(--err); }
+.debug-value-type { color: var(--muted); flex: none; }.debug-watches h4 { align-items: center; }.debug-watches h4 button { padding: 0 4px; font-size: 11px; color: var(--accent); }
+.debug-panel :is(button, input):focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 @media (max-width: 720px) { .debug-body { grid-template-columns: minmax(150px, 45%) 1fr; }.debug-toolbar { gap: 6px; padding: 6px 8px; }.debug-actions { width: 100%; margin-left: 0; }.debug-launch { gap: 6px; }.debug-launch label { flex-basis: 100%; } }
 </style>

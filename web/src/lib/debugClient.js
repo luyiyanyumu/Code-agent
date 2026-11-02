@@ -60,4 +60,5 @@ export const debugClient = {
   action: (projectId, id, action) => request(projectId, `${sessionPath(id)}/action`, { method: 'POST', body: { action } }),
   breakpoints: (projectId, id, breakpoints) => request(projectId, `${sessionPath(id)}/breakpoints`, { method: 'POST', body: { breakpoints } }),
   variables: (projectId, id, reference, pauseSeq) => request(projectId, `${sessionPath(id)}/variables?reference=${reference}&pause_seq=${pauseSeq}`),
+  evaluate: (projectId, id, body) => request(projectId, `${sessionPath(id)}/evaluate`, { method: 'POST', body }),
 }

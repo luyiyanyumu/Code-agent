@@ -114,7 +114,10 @@ async def run_git(
     命令**一律 argv 直传**，不经 shell：分支名/远端名里带空格或分号时，拼 shell 就是注入面。
     """
     argv = ["git", "-C", str(Path(root).resolve()), *args]
-    creationflags = subprocess.CREATE_NEW_PROCESS_GROUP if platform.system() == "Windows" else 0
+    creationflags = (
+        subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        if platform.system() == "Windows" else 0
+    )
     env = git_env(ssh_key)
     env.update(extra_env or {})
     proc = await asyncio.create_subprocess_exec(
@@ -161,6 +164,7 @@ async def _kill_tree(proc: asyncio.subprocess.Process) -> None:
             killer = await asyncio.create_subprocess_exec(
                 "taskkill", "/F", "/T", "/PID", str(proc.pid),
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW,
             )
             await killer.wait()
     else:

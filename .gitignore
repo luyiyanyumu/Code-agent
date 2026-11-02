@@ -45,3 +45,6 @@ logs/
 /npm/release.json
 /*.tgz
 /node_modules/
+/Code-agent Launcher.exe
+/dist/installers/
+/code_agent/harness/node/node_modules/

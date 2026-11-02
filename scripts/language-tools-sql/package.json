@@ -1,0 +1,22 @@
+{
+  "name": "code-agent-bundled-sql-build",
+  "version": "1.0.0",
+  "private": true,
+  "license": "MIT",
+  "description": "Locked dependencies for the pinned upstream Node 24 SQL LSP source build.",
+  "dependencies": {
+    "@google-cloud/bigquery": "9.1.0",
+    "ajv": "8.17.1",
+    "cardinal": "2.1.1",
+    "esbuild": "0.28.2",
+    "js-yaml": "4.1.0",
+    "log4js": "6.9.1",
+    "mysql2": "3.24.0",
+    "pg": "8.23.0",
+    "ssh2": "1.17.0",
+    "vscode-languageserver": "10.1.1",
+    "vscode-languageserver-textdocument": "1.0.12",
+    "vscode-languageserver-types": "3.18.3",
+    "yargs": "17.7.2"
+  }
+}

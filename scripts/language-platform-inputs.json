@@ -1,0 +1,132 @@
+{
+  "swift": {
+    "version": "6.4.0",
+    "installer": {
+      "url": "https://download.swift.org/swift-6.4.0-release/windows10/swift-6.4.0-RELEASE/swift-6.4.0-RELEASE-windows10.exe",
+      "sha256": "76169a85bcba82854a0cd8f9655ffb74b3758d60c35a245457510095f2823c03"
+    },
+    "container": {
+      "size": 2096591258,
+      "sha512": "d8a56e697a592222c27801499d3b7a679a9104f3dc9ea47cda70f235f3143f0dfdf79f07a802ab360f18c5284f607bc8f1895b50ca975cea86596abdf6c72c42"
+    },
+    "payloads": [
+      {
+        "name": "bld.asserts.msi",
+        "containerName": "a0",
+        "sha512": "9305df93be034b4e7698bf9f334f1c0c7a9ac53709a6b178ac4ca03c0e9d645383415811015315a486027f8bc871acf04329d24128372e1fc01b4ec83e81f3f3",
+        "sha256": "39952ac584acc898c0b43df7fb8f65d8992925b1b74662322cb7a882b10e4561",
+        "bytes": 669981
+      },
+      {
+        "name": "cli.asserts.msi",
+        "containerName": "a2",
+        "sha512": "f6217f63d43325253bccff12d04d5dd57d64ee497283e6d64fa3c9423430c2b17fd71d73ac56c415fee2902f8d2654e993d79dad034ad8e67f81a81d3a1ec674",
+        "sha256": "3f99b8abfaf7aadbf237773a46ea64466ebe49e004a0560e6bf1025cee16fffd",
+        "bytes": 503808
+      },
+      {
+        "name": "ide.asserts.msi",
+        "containerName": "a7",
+        "sha512": "88576dedd3a15b58f09b4ea339264bafa73905b994c3b6478bf173635e6cc06c993cd66f9f627e953c0852bcc2ebcfb8f7572ca73bf552e81d1378662eb23a2a",
+        "sha256": "ce88bb01d610b49ea4b94a4ed8f05d4f722eabefc1bfb6b90292fa6eeacec353",
+        "bytes": 446464
+      },
+      {
+        "name": "res.msi",
+        "containerName": "a9",
+        "sha512": "5da9ecdbb70f72998aa13f8546a44954c93ba79d6aa00a8521ceb8c03ee63de8c22a72986b29229c8f3a41d72d4a547d0e8cf84f9c1484ed6d9a9a68d7f6d5d1",
+        "sha256": "6a9bae6ebefcbbfa09641e54cf7724431bbc7dac4a99cce1e82ba0152526fe16",
+        "bytes": 36864
+      },
+      {
+        "name": "rtl.amd64.msi",
+        "containerName": "a10",
+        "sha512": "cb8d7d58d8246f3ab7622ec8cb9f7bc98bea1696eb202faad6143bdf3fda5fcac17c6810faf5ef8bcac51b642bab7d5a778757f6c69795c17c76ba9a8abe21de",
+        "sha256": "88cee76368abd4f5fa2a572a1ec011574edde0a276cdeb8723d42de765e472fa",
+        "bytes": 450560
+      },
+      {
+        "name": "windows.msi",
+        "containerName": "a12",
+        "sha512": "c9a19dd2db81e193b2b57f50708dff124f4db8df9c660ba380eab6e38f0dd9726aed0c5cef16762a340aad176be08291050328ce03d4fe42356b3c2023b68146",
+        "sha256": "b2e5a36e313fff9bc2936434fb8c92984ae316ee4df02b21acec29253fed3902",
+        "bytes": 601202
+      },
+      {
+        "name": "bld.asserts.cab",
+        "containerName": "a13",
+        "sha512": "2a9574da212a9c532975ef876d6c357e8f1e49fbe3b87658a0016631c519882497ca10de556d2ab7b1b99e4d5ffe4a842d3526c410329b3b24c7995a36d8282c",
+        "sha256": "0d6c1b2fb5be404dffeef47c34574f632191a3e6a658db2d13bf9bf983771a26",
+        "bytes": 450926576
+      },
+      {
+        "name": "cli.asserts.cab",
+        "containerName": "a15",
+        "sha512": "6f8830fe4f51fec98c97c2bf7b3ed83f75838d5716228301553180a31b2a94e5431d5af725e84380276119064f5471dba4ea6e59fdacb03cb3d9f832a933913d",
+        "sha256": "d35111cec92927d2e5ca8a37fcde7f7a0694d7edcc4496d98a425067ffabc36c",
+        "bytes": 173082205
+      },
+      {
+        "name": "ide.asserts.cab",
+        "containerName": "a20",
+        "sha512": "ace9f61ea29c8c4407c5fa2cd708801d22147ae59416feecf2aa196a6b94e89acc9b09f2d9c873b5c4374e82110537558c174d4404e649fbce74d4127fc060ee",
+        "sha256": "07dde3b7fd34e6e876c7d5779b493789ffeb3418ec732ab27498a152ceb56ffb",
+        "bytes": 70838783
+      },
+      {
+        "name": "res.cab",
+        "containerName": "a22",
+        "sha512": "4ebf497361a2a99242a6df0f5fcff0bc0cfe9bbac51731ea7cb38a9e29e143f362a748549765c9bb43314391345efbc96dfc1e941eeb7bc947bcdccc9133379e",
+        "sha256": "73ee992e343b88291f384983329690b9883012f6c24945241c5e90dba7c733cf",
+        "bytes": 13736
+      },
+      {
+        "name": "rtl.amd64.cab",
+        "containerName": "a23",
+        "sha512": "8e4a63d838246e47e4c06d5fb24bdc080c32b24dfa4cee89206f6a76002da07c0e8745e892b30da25cf52053b7957fde00be76a7ad9db1e2e29091f4ba93807e",
+        "sha256": "51d1f310912c5d1aad155e8583042ef155a92c69bb14c3893afd2f6617de6e98",
+        "bytes": 37273685
+      },
+      {
+        "name": "windows.cab",
+        "containerName": "a29",
+        "sha512": "cf1fa1ef7f16ba295d3fc369038ddfb14f9a3be3ebfe74b4298f8dcf0bdd792789449cbb54d3d8b6750f81a48cfd3378610d7d9e7b576c52feb2d1b398fc983b",
+        "sha256": "effc3b4106a97c414c9e962401aa84c369c33e94f2e751628c2e30ef23b0697a",
+        "bytes": 42605442
+      },
+      {
+        "name": "sdk.windows.arm64.cab",
+        "containerName": "a30",
+        "sha512": "ab7ca6103d29c3d71518ecd569bc8941f1ecb64a0cf23c1de37c3521857f5ca13ac2e640c0b27b24461374f9d43443ceeb6f638da7b6546b588423a07da31863",
+        "sha256": "514ab95bef2f487c7112d7d7b5a55bcd65f48bbb9d4c52dfd585db9cdeb83be1",
+        "bytes": 70691881
+      },
+      {
+        "name": "sdk.windows.x64.cab",
+        "containerName": "a31",
+        "sha512": "292e7b45f010a65fa2c552b24eb07fa765872c03065420e281fd1ce52fd01e91b413a7642dcdae24e1d965a4e9c014232559a57501ea54e71d01dd3a8f597d2d",
+        "sha256": "f9f7c544c3c819f7d3071f0d023b75a1eca1025a6de896b9e2931f205bff6e8f",
+        "bytes": 72703009
+      },
+      {
+        "name": "sdk.windows.x86.cab",
+        "containerName": "a32",
+        "sha512": "53d71479417c362e4aec4c12609424cc9b2101dff4a04194b154fce712d3361abc07826cada0e57a819ee959486b695b6f05a725e4f2b39ae4628b8abeaf73d8",
+        "sha256": "c4a6bd02214ffee19e0455b2724b2c8558b61ea67bfe61255bc5764d2e074c8f",
+        "bytes": 69872329
+      }
+    ],
+    "provenance": "Payload SHA512 read from bootstrapper manifest extracted by WiX4 from SHA256-pinned and Apple-signed official installer; each original cached payload matched before copying."
+  },
+  "php": {
+    "version": "8.5.12-1",
+    "name": "php-8.5.12-1-nts-Win32-vs17-x64.zip",
+    "url": "https://downloads.php.net/~windows/releases/archives/php-8.5.12-1-nts-Win32-vs17-x64.zip",
+    "sha256": "2a36a2edcb7a5b9252f638fd5e4cf84d7f6e066092654220dc0b63e5cf4e9723"
+  },
+  "phpantom": {
+    "lock": "language-phpantom-inputs.json",
+    "sha256": "49309527c2fd85e8e2f6da1fb93ae3da0421198886da479b1929aeedb7155bd6",
+    "launcherSha256": "46c0bbbb382bc95dc745014ddcdd9f6256b81c90d895650a72c3a4d31470b7a8"
+  }
+}

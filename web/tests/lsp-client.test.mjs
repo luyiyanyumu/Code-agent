@@ -4,6 +4,8 @@ import test from 'node:test'
 import vm from 'node:vm'
 import { hoverMarkdownStrings, normalizeHoverDocumentation } from '../src/lib/hoverDocumentation.js'
 import { getTokenHover, rememberSemanticTokens, clearSemanticTokens, notifyHoverDocumentationUpdated } from '../src/lib/tokenHover.js'
+import { compactSymbolHover } from '../src/lib/compactSymbolHover.js'
+import { completionLabel, completionPresentation } from '../src/lib/completionPresentation.js'
 
 const clone = value => JSON.parse(JSON.stringify(value))
 const tick = () => new Promise(setImmediate)
@@ -63,7 +65,7 @@ async function setup(t, options = {}, capabilities = allCapabilities, hoverHelpe
     receive(message) { this.onmessage?.({ data: JSON.stringify(message) }) }
   }
   const source = (await readFile(new URL('../src/lib/lspClient.js', import.meta.url), 'utf8')).replace(/^import .*\r?\n/gm, '').replace(/^export default .*\r?\n/gm, '').replace(/^export /gm, '')
-  const context = vm.createContext({ monaco, hoverMarkdownStrings, normalizeHoverDocumentation,
+  const context = vm.createContext({ monaco, hoverMarkdownStrings, normalizeHoverDocumentation, compactSymbolHover, completionLabel, completionPresentation,
     getTokenHover: hoverHelpers.getTokenHover || getTokenHover,
     registerTokenHoverSource: source => {
       const registration = { source, disposed: false, dispose() { this.disposed = true } }
@@ -502,6 +504,50 @@ test('completion supports InsertReplaceEdit and itemDefaults without losing data
   const resolved = p.resolveCompletionItem(item); assert.deepEqual(h.sent().at(-1).params.data, { shared: 1 }); h.respond({ label: 'function', detail: 'default resolved' }); assert.equal((await resolved).detail, 'default resolved')
 })
 
+test('completion without native server resolve still forwards the translation ticket and preserves opaque completion data', async t => {
+  const h = await setup(t, {}, { completionProvider: { resolveProvider: false } }), provider = h.provider('CompletionItem')
+  assert.equal(typeof provider.resolveCompletionItem, 'function')
+  const pending = provider.provideCompletionItems(h.a, pos, {})
+  const raw = { label: 'read', kind: 3, insertText: 'read(${1:token})', insertTextFormat: 2,
+    documentation: 'Returns the current session.', documentation_translation: { status: 'untranslated' },
+    _code_agent_original: { _completion_context: 'opaque-context-ticket' }, data: { _code_agent_original: { server_owned: true } } }
+  h.respond([raw]); const item = (await pending).suggestions[0]
+  const resolve = provider.resolveCompletionItem(item)
+  const request = h.sent().at(-1)
+  assert.equal(request.method, 'completionItem/resolve')
+  assert.equal(request.params._code_agent_original._completion_context, 'opaque-context-ticket')
+  assert.deepEqual(clone(request.params.data), raw.data)
+  h.respond({ ...raw, documentation: '返回当前会话。', documentation_translation: { status: 'ready' } })
+  const localized = await resolve
+  assert.equal(localized.insertText, raw.insertText)
+  assert.equal(localized.insertTextRules, 4)
+  assert.match(localized.documentation.value, /返回当前会话/)
+  assert.doesNotMatch(localized.documentation.value, /Returns the current|待准备/)
+})
+
+test('Chinese completion and parameter Markdown share hover image and trust protections', async t => {
+  const h = await setup(t), completion = h.provider('CompletionItem')
+  const document = { kind: 'markdown', value: '读取内容。\n\n![示意图](https://example.invalid/tracker.png)\n\n`![literal](https://example.invalid/code.png)`\n\n[运行](command:untrusted)', isTrusted: true, supportHtml: true }
+  const pending = completion.provideCompletionItems(h.a, pos, {})
+  h.respond([{ label: 'read', documentation: document }])
+  const popup = (await pending).suggestions[0].documentation
+  assert.match(popup.value, /读取内容/)
+  assert.doesNotMatch(popup.value, /!\[示意图\]/)
+  assert.match(popup.value, /`!\[literal\]/)
+  assert.equal(popup.isTrusted, false)
+  assert.equal(popup.supportHtml, false)
+  const pendingHints = h.provider('SignatureHelp').provideSignatureHelp(h.a, pos, undefined, {})
+  h.respond({ signatures: [{ label: 'read(value)', documentation: document, parameters: [{ label: 'value', documentation: document }] }] })
+  const hints = await pendingHints
+  for (const value of [hints.value.signatures[0].documentation, hints.value.signatures[0].parameters[0].documentation]) {
+    assert.match(value.value, /读取内容/)
+    assert.doesNotMatch(value.value, /!\[示意图\]/)
+    assert.match(value.value, /`!\[literal\]/)
+    assert.equal(value.isTrusted, false); assert.equal(value.supportHtml, false)
+  }
+  hints.dispose()
+})
+
 test('provider cancellation passes token to transport; stale completion resolve does not modify existing suggestion or request server', async t => {
   const h = await setup(t), p = h.provider('CompletionItem'), token = cancellation()
   const cancelled = p.provideCompletionItems(h.a, pos, {}, token); const id = h.sent().at(-1).id; token.cancel()
@@ -531,6 +577,7 @@ test('full hover view retains typed documentation and safe signatures for readon
   h.respond({ contents: [signature, doc], range: range(0, 1, 0, 4) })
   const result = await pending
   assert.deepEqual(clone(result.sections.slice(-2)), [{ kind: 'code', language: 'java', value: signature.value }, doc])
+  assert.ok(result.sections.some(section => section.kind === 'code' && section.value === signature.value))
   assert.match(result.sections[0].value, /语言：.*Python/)
   assert.equal(result.contents[1].isTrusted, false)
   assert.equal(result.contents[1].supportHtml, false)
@@ -561,13 +608,45 @@ test('native and full documentation share structured LSP details and retain tran
     const full = h.client.hover(uriA, pos); h.respond(response)
     const native = h.provider('Hover').provideHover(h.a, pos); h.respond(response)
     const fullResult = await full, nativeResult = await native
-    assert.deepEqual(clone(nativeResult), clone(fullResult))
+    assert.deepEqual(clone({ ...nativeResult, contents: undefined }), clone({ ...fullResult, contents: undefined }))
+    assert.notDeepEqual(clone(nativeResult.contents), clone(fullResult.contents), 'only Monaco presentation is compacted')
+    assert.match(nativeResult.contents.map(item => item.value).join('\n'), /根据提供的值读取内容/)
+    assert.doesNotMatch(nativeResult.contents.map(item => item.value).join('\n'), /文档中文翻译|作用依据|识别依据/)
     assert.equal(fullResult.symbol.name, 'foo')
     assert.equal(fullResult.symbol.language, lang)
     assert.equal(fullResult.symbol.purpose, '根据提供的值读取内容。')
     assert.equal(fullResult.documentation_translation.status, 'ready')
     assert.deepEqual(clone(fullResult._code_agent_original), response._code_agent_original)
   }
+})
+
+test('non-Java native hover hides provenance and isolated package lines while full documentation retains them', async t => {
+  const h = await setup(t, { lang: 'python' }, { hoverProvider: true })
+  const response = {
+    contents: [
+      { language: 'python', value: 'def foo(value: str) -> str:' },
+      { kind: 'markdown', value: '读取提供的值。' },
+      { language: 'python', value: 'com' },
+      { kind: 'markdown', value: '来源：sky-server' },
+    ],
+    documentation_translation: { language: 'zh-CN', source: 'configured-model', status: 'ready' },
+    _code_agent_original: { contents: 'Reads the supplied value.' },
+  }
+  const fullPending = h.client.hover(uriA, pos); h.respond(response)
+  const full = await fullPending
+  const nativePending = h.provider('Hover').provideHover(h.a, pos); h.respond(response)
+  const native = await nativePending
+  const compact = native.contents.map(item => item.value).join('\n')
+  assert.match(compact, /foo|读取提供的值/)
+  assert.ok(native.contents.every(item => item.isTrusted === false && item.supportHtml === false && item.supportThemeIcons === false))
+  assert.doesNotMatch(compact, /文档中文翻译|作用依据|识别依据|sky-server|(?:^|\n)com(?:\n|$)/)
+  assert.deepEqual(clone(native.sections), clone(full.sections))
+  assert.deepEqual(clone(native.originalSections), clone(full.originalSections))
+  assert.ok(full.sections.some(section => section.value === 'com'))
+  assert.ok(full.sections.some(section => section.value.includes('sky-server')))
+  assert.ok(full.sections.some(section => section.value.includes('文档中文翻译')))
+  assert.deepEqual(clone(native.documentation_translation), clone(full.documentation_translation))
+  assert.deepEqual(clone(native._code_agent_original), clone(full._code_agent_original))
 })
 
 test('background documentation updates target live URI/version without cancelling same-draft in-flight hovers', async t => {
@@ -600,6 +679,25 @@ test('background documentation updates target live URI/version without cancellin
     h.sockets[0].receive({ method: 'code-agent/documentationUpdated', params: { uri: uriA, version: 1 } })
     assert.equal(h.documentationUpdates.length, 8)
     assert.equal(h.client.documentationVersions.has(uriA), false)
+  }
+})
+
+test('translation retry is explicit, keeps the queried position and cannot revive cancelled or edited hover results', async t => {
+  for (const lang of ['python', 'java']) {
+    const h = await setup(t, { lang }, { hoverProvider: true })
+    const pending = h.client.hover(uriA, pos, undefined, { retryTranslation: true })
+    assert.deepEqual(clone(h.sent().at(-1).params), { textDocument: { uri: uriA }, position: { line: 0, character: 3 }, codeAgentRetryTranslation: true })
+    h.respond({ contents: '读取内容。', documentation_translation: { language: 'zh-CN', source: 'configured-model', status: 'ready' } })
+    assert.equal((await pending).documentation_translation.status, 'ready')
+    const normal = h.client.hover(uriA, pos)
+    assert.equal(h.sent().at(-1).params.codeAgentRetryTranslation, undefined)
+    h.respond({ contents: '读取内容。' }); await normal
+    const token = cancellation(), cancelled = h.client.hover(uriA, pos, token, { retryTranslation: true })
+    const rejected = assert.rejects(cancelled, error => error.name === 'CancellationError')
+    token.cancel(); h.respond({ contents: '旧的翻译。' }); await rejected
+    const stale = h.client.hover(uriA, pos, undefined, { retryTranslation: true })
+    const staleRejected = assert.rejects(stale, error => error.name === 'CancellationError')
+    h.a.set('later source'); h.respond({ contents: '旧的翻译。' }); await staleRejected
   }
 })
 
@@ -661,7 +759,8 @@ test('real Java enhancer combines validated semantic kinds and modifiers with co
   assert.match(result.sections[0].value, /接口/)
   assert.match(result.sections[0].value, /public/)
   assert.match(result.sections[0].value, /抽象/)
-  assert.deepEqual(clone(result.sections.slice(-2)), [{ kind: 'code', language: 'java', value: signature.value }, doc])
+  assert.deepEqual(clone(result.originalSections), [{ kind: 'code', language: 'java', value: signature.value }, doc])
+  assert.ok(result.sections.some(section => section.kind === 'code' && section.value === signature.value))
   assert.equal(result.range.startColumn, 1)
   assert.equal(result.range.endColumn, 4)
   assert.equal(result.contents.every(item => item.isTrusted === false && item.supportHtml === false), true)
@@ -732,7 +831,7 @@ test('format/range formatting return local undoable edits; readonly checks suppr
   const format = h.provider('DocumentFormattingEdit').provideDocumentFormattingEdits(h.a, { tabSize: 2, insertSpaces: true }); h.respond([{ range: range(), newText: 'formatted' }]); assert.equal((await format)[0].text, 'formatted'); assert.equal(h.a.text, 'foo'); assert.equal(h.edits.length, 0)
   const rangeFormat = h.provider('DocumentRangeFormattingEdit').provideDocumentRangeFormattingEdits(h.a, { startLineNumber: 1, startColumn: 1, endLineNumber: 1, endColumn: 4 }, { tabSize: 4 }); assert.equal(h.sent().at(-1).method, 'textDocument/rangeFormatting'); h.respond([]); await rangeFormat
   writable = false; const count = h.sent().length; assert.equal((await h.provider('CompletionItem').provideCompletionItems(h.a, pos, {})).suggestions.length, 0); assert.equal((await h.provider('DocumentFormattingEdit').provideDocumentFormattingEdits(h.a, {})).length, 0); assert.equal(h.sent().length, count)
-  const hover = h.provider('Hover').provideHover(h.a, pos); h.respond({ contents: 'readable' }); assert.equal((await hover).contents.at(-1).value, 'readable')
+  const hover = h.provider('Hover').provideHover(h.a, pos); h.respond({ contents: 'readable' }); assert.equal((await hover).originalSections.at(-1).value, 'readable')
   writable = true; const late = h.client.formatDocument(uriA); writable = false; h.respond([{ range: range(), newText: 'late' }]); await assert.rejects(late, /只读/)
 })
 

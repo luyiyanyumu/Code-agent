@@ -4,7 +4,7 @@ import test from 'node:test'
 import vm from 'node:vm'
 import { computed, nextTick, ref, watch } from 'vue'
 import { usePreferences } from '../src/lib/preferences.js'
-import { SETTINGS_SECTIONS, WORKSPACE_SHORTCUTS, searchSettings } from '../src/lib/settingsCatalog.js'
+import { SETTINGS_GROUPS, SETTINGS_SECTIONS, WORKSPACE_SHORTCUTS, searchSettings } from '../src/lib/settingsCatalog.js'
 
 const defaults = { task_tokens: 0, task_seconds: 0, team_tokens: 0, team_seconds: 0 }
 async function setup({ role = 'admin', failLoad = false, failSave = false, deferSave = false } = {}) {
@@ -12,7 +12,7 @@ async function setup({ role = 'admin', failLoad = false, failSave = false, defer
   let resolveSave
   const source = await readFile(new URL('../src/views/SettingsView.vue', import.meta.url), 'utf8')
   const script = source.match(/<script setup>([\s\S]*?)<\/script>/)[1].replace(/^import .*\r?\n/gm, '')
-  const context = vm.createContext({ computed, nextTick, ref, watch, usePreferences, SETTINGS_SECTIONS, WORKSPACE_SHORTCUTS, searchSettings,
+  const context = vm.createContext({ computed, nextTick, ref, watch, usePreferences, SETTINGS_GROUPS, SETTINGS_SECTIONS, WORKSPACE_SHORTCUTS, searchSettings,
     defineAsyncComponent: loader => ({ loader }), defineEmits: () => () => {}, defineProps: () => ({ user: { role } }), onMounted() {}, useDialog: () => ({}),
     api: { settings: {
       agentTeamBudgets: async () => { calls.push({ method: 'GET' }); if (failLoad) throw new Error('预算读取失败'); return { ...config } },

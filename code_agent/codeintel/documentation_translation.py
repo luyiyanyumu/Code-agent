@@ -21,6 +21,26 @@ from code_agent.codeintel.documentation_translation_store import DocumentationTr
 _MAX_INPUT = 32_000
 _MAX_INFLIGHT = 32
 _FAILURE_COOLDOWN = 20.0
+_STATE_ERRORS = {
+    "provider_unavailable": "翻译服务未就绪，请检查模型设置后重试。",
+    "queue_full": "翻译队列繁忙，请稍后重试。",
+    "timeout": "翻译超时，请重试。",
+    "invalid_response": "翻译结果未通过校验，请重试。",
+    "provider_error": "翻译请求失败，请检查模型服务后重试。",
+    "input_too_large": "说明内容过长，暂时无法翻译。",
+}
+
+
+def _hover_state(result, status, error_code=None, *, required=True):
+    output = copy.deepcopy(result)
+    output["documentation_translation"] = {"language": "zh-CN", "source": "configured-model", "status": status,
+        "required": required}
+    if not required:
+        output["documentation_translation"]["retryable"] = False
+    if error_code in _STATE_ERRORS:
+        output["documentation_translation"].update(error_code=error_code,
+            message=_STATE_ERRORS[error_code], retryable=error_code != "input_too_large")
+    return output
 _CJK = re.compile(r"[\u3400-\u9fff]")
 _WORDS = re.compile(r"\b[A-Za-z]{2,}\b")
 _MARKUP = re.compile(r"[\r\n`*_[\]|~<>]")
@@ -322,6 +342,8 @@ class DocumentationTranslator:
         self.timeout = max(0.001, float(timeout))
         self._cache: OrderedDict[str, Any] = OrderedDict()
         self._failures: OrderedDict[str, float] = OrderedDict()
+        self._failure_reasons: OrderedDict[str, str] = OrderedDict()
+        self._foreground_sources: OrderedDict[str, bool] = OrderedDict()
         self._inflight: dict[str, asyncio.Task] = {}
         self._fragment_futures: dict[str, asyncio.Future] = {}
         self._owners: dict[str, dict[str, asyncio.Future]] = {}
@@ -349,8 +371,28 @@ class DocumentationTranslator:
         result = await self._translate_hover({"contents": contents}, identifiers=identifiers, single_words=single_words)
         return result["contents"]
 
+    async def cached_contents(self, contents, *, scope='', identifiers=(), single_words=False):
+        """Read existing translations without constructing a provider or queueing work.
+
+        Completion lists use this path. Each complete document can reuse its
+        cache hit independently; an uncached candidate does not hide its
+        neighbours' already translated prose.
+        """
+        result = await self._translate_hover({"contents": contents}, identifiers=identifiers,
+                                             single_words=single_words, cache_only=True)
+        return result["contents"]
+
     async def translate_hover(self, result, *, scope='', identifiers=()):
         return await self._translate_hover(result, identifiers=identifiers)
+
+    async def project_hover(self, result, *, scope='', identifiers=(), retry=False):
+        """Return cached prose/state now and start only uncached paragraphs."""
+        return await self._translate_hover(result, identifiers=identifiers,
+            stateful=True, background=True, retry=retry)
+
+    async def translate_hover_state(self, result, *, scope='', identifiers=()):
+        """Wait on a projected hover's shared jobs, reporting a terminal state."""
+        return await self._translate_hover(result, identifiers=identifiers, stateful=True)
 
     def stats(self) -> dict:
         try:
@@ -360,16 +402,17 @@ class DocumentationTranslator:
         return {**self._counts, "cache_entries": len(self._cache), "inflight": len(self._inflight),
                 "pending_fragments": len(self._fragment_futures), "stored": stored}
 
-    async def _translate_hover(self, result, *, identifiers=(), single_words=False):
+    async def _translate_hover(self, result, *, identifiers=(), single_words=False, cache_only=False,
+                               stateful=False, background=False, retry=False):
         if self._closing or not isinstance(result, dict) or "contents" not in result:
             return result
-        if (result.get("documentation_translation") or {}).get("language") == "zh-CN":
+        if not stateful and (result.get("documentation_translation") or {}).get("language") == "zh-CN":
             return result
         contents = result["contents"]
         try:
             serialized = json.dumps(contents, ensure_ascii=False, sort_keys=True)
             if len(serialized) > _MAX_INPUT:
-                return result
+                return _hover_state(result, "failed", "input_too_large") if stateful else result
             prepared, documents = {}, []
             names = _code_identifiers(contents)
             names.update(value for value in list(identifiers)[:256]
@@ -388,9 +431,9 @@ class DocumentationTranslator:
                         layout.append(piece)
                 documents.append((position, kind, layout))
             if not prepared:
-                return result
+                return _hover_state(result, "untranslated", required=False) if stateful else result
             if len(prepared) > 128:
-                return result
+                return _hover_state(result, "failed", "input_too_large") if stateful else result
             translated = {}
             for key in prepared:
                 if key in self._cache:
@@ -413,35 +456,53 @@ class DocumentationTranslator:
                 except Exception:
                     self._counts["storage_errors"] += 1
             missing = {key: part for key, part in missing.items() if key not in translated}
-            if missing:
-                provider = self.provider_factory() if callable(self.provider_factory) else None
+            if missing and not cache_only:
+                try:
+                    provider = self.provider_factory() if callable(self.provider_factory) else None
+                except Exception:
+                    return _hover_state(result, "failed", "provider_unavailable") if stateful else result
                 if provider is None or str(getattr(provider, "name", "")).lower() == "offline":
-                    return result
+                    return _hover_state(result, "failed", "provider_unavailable") if stateful else result
                 identity = [str(getattr(provider, name, "") or "") for name in ("name", "base_url", "model")]
                 provider_key = hashlib.sha256(json.dumps(identity).encode("utf-8")).hexdigest()
                 for key in missing:
+                    if stateful:
+                        self._remember(self._foreground_sources, key + provider_key, True)
                     expiry = self._failures.get(key + provider_key)
-                    if key not in self._fragment_futures and expiry is not None and expiry > self.clock():
-                        return result
+                    if retry:
+                        # Retry only these source paragraphs' failures. Valid
+                        # successes in memory/SQLite remain permanently reusable.
+                        self._failures.pop(key + provider_key, None)
+                        self._failure_reasons.pop(key + provider_key, None)
+                    elif key not in self._fragment_futures and expiry is not None and (
+                            stateful or key + provider_key in self._foreground_sources or expiry > self.clock()):
+                        return (_hover_state(result, "failed", self._failure_reasons.get(key + provider_key, "provider_error"))
+                                if stateful else result)
                 owned = {key: part for key, part in missing.items() if key not in self._fragment_futures}
                 if owned:
                     if len(self._inflight) >= _MAX_INFLIGHT:
-                        return result
+                        return _hover_state(result, "failed", "queue_full") if stateful else result
                     loop = asyncio.get_running_loop()
                     owner_futures = {key: loop.create_future() for key in owned}
                     self._fragment_futures.update(owner_futures)
                     batch_key = hashlib.sha256("".join(sorted(owned)).encode("ascii")).hexdigest()
                     self._owners[batch_key] = owner_futures
                     self._inflight[batch_key] = asyncio.create_task(self._run(batch_key, provider, owned, provider_key))
+                if background:
+                    return _hover_state(result, "pending")
                 # Each waiter is cancellation-isolated; a request for another
                 # document can reuse the same pending paragraph's translation.
                 values = await asyncio.gather(*(asyncio.shield(self._fragment_futures[key]) for key in missing))
                 if any(value is None for value in values):
-                    return result
+                    reason = next((self._failure_reasons[key + provider_key] for key in missing
+                                   if key + provider_key in self._failure_reasons), "provider_error")
+                    return _hover_state(result, "failed", reason) if stateful else result
                 translated.update(zip(missing, values))
             output = copy.deepcopy(result)
             rewritten = copy.deepcopy(contents)
             for position, kind, layout in documents:
+                if any(isinstance(piece, tuple) and piece[0] not in translated for piece in layout):
+                    continue
                 value = "".join(translated[piece[0]] if isinstance(piece, tuple) else piece for piece in layout)
                 if position is None:
                     if kind == "string":
@@ -452,17 +513,20 @@ class DocumentationTranslator:
                     rewritten[position] = value
                 else:
                     rewritten[position]["value"] = value
+            if rewritten == contents:
+                return _hover_state(result, "ready") if stateful else result
             output["contents"] = rewritten
-            output["documentation_translation"] = {"language": "zh-CN", "source": "configured-model"}
-            return output
+            return _hover_state(output, "ready") if stateful else {**output,
+                "documentation_translation": {"language": "zh-CN", "source": "configured-model"}}
         except asyncio.CancelledError:
             raise
         except Exception:
-            return result
+            return _hover_state(result, "failed", "provider_error") if stateful else result
 
     async def _run(self, key: str, provider: Any, prepared: dict, provider_key: str) -> None:
         translated = {}
         cancelled = False
+        failure = "invalid_response"
         try:
             translated = await asyncio.wait_for(self._translate(provider, prepared), timeout=self.timeout)
             if translated:
@@ -473,8 +537,10 @@ class DocumentationTranslator:
         except asyncio.CancelledError:
             cancelled = True
             raise
+        except asyncio.TimeoutError:
+            failure = "timeout"
         except Exception:
-            pass
+            failure = "provider_error"
         finally:
             owned = self._owners.pop(key, {})
             for part_key, future in owned.items():
@@ -483,6 +549,7 @@ class DocumentationTranslator:
                     self._remember(self._cache, part_key, text)
                 elif not cancelled:
                     self._remember(self._failures, part_key + provider_key, self.clock() + _FAILURE_COOLDOWN)
+                    self._remember(self._failure_reasons, part_key + provider_key, failure)
                     self._counts["failed_fragments"] += 1
                 if not future.done():
                     if cancelled:

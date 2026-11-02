@@ -138,164 +138,30 @@ def events(loop, kind):
     return [event for event in loop.transcript.replay(loop.session_id) if event.type == kind]
 
 
-def edit_cap(request):
-    schema = next(tool for tool in request["tools"] if tool.get("name") == "edit_many")
-    return schema["parameters"]["properties"]["edits"]["maxItems"]
-
-
-def test_truncated_annotation_edit_recovers_once_with_small_schema_and_real_delivery(annotation_workspace):
+def test_explicit_annotation_edit_and_validation_deliver_without_extra_model_round(annotation_workspace):
     loop, provider, validation, _ = make_loop(annotation_workspace, [
-        read_turn(), truncated_edit("discard-first-truncated-edit"), edit_turn(),
-        tool_turn("bash", command=f"python -m py_compile {TARGET}"), done_turn(),
+        read_turn(), edit_turn(), tool_turn("bash", command=f"python -m py_compile {TARGET}"), done_turn(),
     ])
-
-    result = asyncio.run(loop.run(f"给 {TARGET} 的函数加中文注释并验证"))
-
-    assert result.stop_reason == "end_turn" and provider.calls == 5
-    assert [edit_cap(request) for request in provider.requests] == [5, 5, 1, 5, 5]
-    assert all(request["tools"] for request in provider.requests)
+    result = asyncio.run(loop.run(f"给 {TARGET} 加中文注释并验证"))
+    assert result.stop_reason == "end_turn" and provider.calls == 4
     assert validation.commands == [f"python -m py_compile {TARGET}"]
     assert len(validation.validated) == 1
-    assert (annotation_workspace / TARGET).read_text(encoding="utf-8") == SOURCE.replace(DECLARATION, ANNOTATED)
-    executed = [event.payload["call"] for event in events(loop, EventType.tool_use)]
-    assert [call["name"] for call in executed] == ["read_file", "edit_many", "bash"]
-    assert "discard-first-truncated-edit" not in {call["id"] for call in executed}
-    assert loop.task_progress.ready_to_finish
-    assert not loop.task_progress.compact_editing
-    notices = [event for event in events(loop, EventType.error)
-               if event.payload.get("code") == "edit_output_truncated"]
-    assert len(notices) == 1 and notices[0].payload["discarded_tool_calls"] == 1
-    assert result.usage == TokenUsage(input_tokens=55, output_tokens=35, cached_tokens=15)
+    assert (annotation_workspace / TARGET).read_text(encoding="utf8") == SOURCE.replace(DECLARATION, ANNOTATED)
+    assert [event.payload["call"]["name"] for event in events(loop, EventType.tool_use)] == ["read_file", "edit_many", "bash"]
 
 
-def test_second_truncated_annotation_response_stops_without_executing_or_replaying_partial_calls(annotation_workspace):
-    loop, provider, validation, _ = make_loop(annotation_workspace, [
-        read_turn(), truncated_edit("first-incomplete"), truncated_edit("second-incomplete"), edit_turn(),
-    ])
-
-    result = asyncio.run(loop.run(f"给 {TARGET} 加中文注释"))
-
-    assert result.stop_reason == "max_tokens" and provider.calls == 3
-    assert [edit_cap(request) for request in provider.requests] == [5, 5, 1]
-    assert (annotation_workspace / TARGET).read_text(encoding="utf-8") == SOURCE
-    assert not validation.commands
-    assert [event.payload["call"]["name"] for event in events(loop, EventType.tool_use)] == ["read_file"]
-    terminal = events(loop, EventType.done)
-    assert len(terminal) == 1 and terminal[0].payload["stop_reason"] == "max_tokens"
-    assert terminal[0].payload["discarded_tool_calls"] == 1
-    assert len(provider._script) == 1, "The second truncation must not replay or consume a normal edit"
-
-
-def test_segment_continuation_keeps_the_single_output_recovery_budget(annotation_workspace):
-    loop, provider, validation, _ = make_loop(annotation_workspace, [
-        read_turn(), truncated_edit("before-segment-boundary"),
-        truncated_edit("after-segment-boundary"), edit_turn(),
-    ], max_turns=2)
-
-    async def scenario():
-        first = await loop.run(f"给 {TARGET} 加中文注释")
-        assert first.stop_reason == "max_turns" and first.segment_boundary
-        assert loop._output_repair_used and loop.task_progress.compact_editing
-        progress = loop.task_progress
-        loop.max_turns = 4
-        second = await loop.run("继续执行未完成任务", context_meta={"auto": True, "continuation": 1})
-        assert second.stop_reason == "max_tokens"
-        assert loop.task_progress is progress
-
-    asyncio.run(scenario())
-    assert provider.calls == 3 and len(provider._script) == 1
-    assert [edit_cap(request) for request in provider.requests] == [5, 5, 1]
-    assert (annotation_workspace / TARGET).read_text(encoding="utf-8") == SOURCE
+def test_truncated_annotation_stops_without_automatic_retry_or_partial_execution(annotation_workspace):
+    loop, provider, validation, _ = make_loop(annotation_workspace, [read_turn(), truncated_edit("partial-edit")])
+    result = asyncio.run(loop.run(f"给 {TARGET} 添加中文注释"))
+    assert result.stop_reason == "max_tokens" and provider.calls == 2
+    assert (annotation_workspace / TARGET).read_text(encoding="utf8") == SOURCE
     assert not validation.commands
     assert [event.payload["call"]["name"] for event in events(loop, EventType.tool_use)] == ["read_file"]
 
 
-def test_annotation_scope_and_implementation_phase_block_discovery_but_allow_edit_recovery(annotation_workspace):
-    other = annotation_workspace / "other.py"
-    other.write_text("def unrelated():\n    return 10\n", encoding="utf-8")
-    original_other = other.read_bytes()
-    loop, provider, validation, grep = make_loop(annotation_workspace, [
-        read_turn(), read_turn(offset=1, limit=5),
-        tool_turn("edit_many", call_id="outside-task-target", edits=[{
-            "path": "other.py", "old_string": "return 10", "new_string": "return 20",
-        }]),
-        tool_turn("grep", call_id="late-investigation", path=".", pattern="def"),
-        read_turn(call_id="late-full-read"),
-        tool_turn("edit_file", call_id="failed-exact-edit", path=TARGET,
-                  old_string="def add_with_wrong_name(left, right):", new_string=ANNOTATED),
-        read_turn(call_id="bounded-error-recovery", offset=1, limit=5),
-        edit_turn(), tool_turn("bash", command=f"python -m py_compile {TARGET}"), done_turn(),
-    ])
-
-    result = asyncio.run(loop.run(f"只给 {TARGET} 加中文注释并验证"))
-
-    assert result.stop_reason == "end_turn" and provider.calls == 10
-    assert other.read_bytes() == original_other
-    assert grep.executions == 0, "The implementation phase must refuse investigation before tool dispatch"
-    results = {event.payload["call_id"]: event.payload["result"]
-               for event in events(loop, EventType.tool_result)}
-    assert "[task scope]" in results["outside-task-target"] and "超出本次目标范围" in results["outside-task-target"]
-    assert "[task scope]" in results["late-investigation"] and "实施阶段" in results["late-investigation"]
-    assert "[task scope]" in results["late-full-read"] and "不再重读已知源码" in results["late-full-read"]
-    assert results["failed-exact-edit"].startswith("[tool error]")
-    assert "[tool error]" not in results["bounded-error-recovery"]
-    assert len(validation.validated) == 1 and loop.task_progress.ready_to_finish
-    assert (annotation_workspace / TARGET).read_text(encoding="utf-8") == SOURCE.replace(DECLARATION, ANNOTATED)
-    assert not loop._edit_failure
-
-
-def test_revalidating_delivered_version_does_not_mask_pending_file_but_new_version_can_be_verified(annotation_workspace):
-    second = "other_arithmetic.py"
-    (annotation_workspace / second).write_text(SOURCE, encoding="utf-8")
-    both_reads = ModelTurn(tool_calls=[
-        ToolCall(name="read_file", arguments={"path": TARGET}),
-        ToolCall(name="read_file", arguments={"path": second}),
-    ], stop_reason="tool_use", usage=USAGE)
-    revised_docstring = ANNOTATED.replace("保持输入相加的行为", "支持整数、负数与小数相加")
-    turns = [
-        both_reads, edit_turn(),
-        tool_turn("bash", call_id="first-a-validation", command=f"python -m py_compile {TARGET}"),
-        *[tool_turn("bash", call_id=f"duplicate-a-validation-{index}",
-                    command=f"python -m py_compile {TARGET}") for index in range(1, 4)],
-        tool_turn("edit_file", call_id="new-a-version", path=TARGET,
-                  old_string=ANNOTATED, new_string=revised_docstring),
-        tool_turn("bash", call_id="new-a-validation", command=f"python -m py_compile {TARGET}"),
-        tool_turn("edit_many", edits=[{
-            "path": second, "old_string": DECLARATION, "new_string": ANNOTATED,
-        }]),
-        tool_turn("bash", call_id="b-validation", command=f"python -m py_compile {second}"),
-        done_turn(),
-    ]
-    loop, provider, validation, _ = make_loop(annotation_workspace, turns)
-    progress_before_requests = []
-    provider_chat = provider.chat
-
-    async def snapshot_chat(messages, tools):
-        progress_before_requests.append(copy.deepcopy(loop.task_progress.state()))
-        return await provider_chat(messages, tools)
-
-    provider.chat = snapshot_chat
-    result = asyncio.run(loop.run(f"给 {TARGET} 和 {second} 的函数加中文注释并验证"))
-
-    assert result.stop_reason == "end_turn" and provider.calls == 11
-    results = {event.payload["call_id"]: event.payload
-               for event in events(loop, EventType.tool_result)}
-    first_receipt = results["first-a-validation"]["execution_effects"]["verified_paths"]
-    new_receipt = results["new-a-validation"]["execution_effects"]["verified_paths"]
-    assert first_receipt == new_receipt and len(first_receipt) == 1
-    assert first_receipt[0].replace("\\", "/").lower().endswith("/" + TARGET)
-    for index in range(1, 4):
-        duplicate = results[f"duplicate-a-validation-{index}"]
-        assert duplicate["result"].startswith("exit_code=0"), "The duplicate check actually ran successfully"
-        assert "execution_effects" not in duplicate, "An unchanged verified version is not new delivery"
-        # Snapshot on the following model request includes finish_turn's count.
-        state = progress_before_requests[3 + index]
-        assert state["turns_without_delivery"] == index
-        assert not state["ready_to_finish"], "File B remains unfinished while A is repeatedly checked"
-        assert any(path.endswith("/" + second) for path in state["active"])
-    assert progress_before_requests[7]["turns_without_delivery"] == 0, "A real new edit resets the delivery budget"
-    assert results["new-a-version"]["execution_effects"]["changed_paths"]
-    assert len(validation.validated) == 6, "Each successful check inspects the actual temporary file"
-    assert loop.task_progress.ready_to_finish
-    assert (annotation_workspace / TARGET).read_text(encoding="utf-8") == SOURCE.replace(DECLARATION, revised_docstring)
-    assert (annotation_workspace / second).read_text(encoding="utf-8") == SOURCE.replace(DECLARATION, ANNOTATED)
+def test_natural_annotation_answer_does_not_manufacture_repair_round(annotation_workspace):
+    loop, provider, validation, _ = make_loop(annotation_workspace, [ModelTurn(text="尚未修改，缺少所需信息。")])
+    result = asyncio.run(loop.run(f"给 {TARGET} 添加中文注释"))
+    assert result.text == "尚未修改，缺少所需信息。" and provider.calls == 1
+    assert (annotation_workspace / TARGET).read_text(encoding="utf8") == SOURCE
+    assert not validation.commands and not events(loop, EventType.tool_use)

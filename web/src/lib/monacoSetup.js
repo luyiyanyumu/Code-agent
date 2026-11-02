@@ -14,6 +14,7 @@ import { conf as htmlConfiguration, language as htmlLanguage } from 'monaco-edit
 import { editorTheme, currentEditorTheme, followEditorTheme } from './editorTheme.js'
 import { vueLanguage } from './vueLanguage.js'
 import { installTokenHoverProvider } from './tokenHover.js'
+import { installCompletionLocale } from './completionLocale.js'
 import EditorWorker from 'monaco-editor/editor/editor.worker?worker'
 import JsonWorker from 'monaco-editor/language/json/json.worker?worker'
 import CssWorker from 'monaco-editor/language/css/css.worker?worker'
@@ -23,6 +24,7 @@ import TsWorker from 'monaco-editor/language/typescript/ts.worker?worker'
 let configured = false
 
 export function ensureMonaco() {
+  installCompletionLocale()
   if (configured) return monaco
   configured = true
   self.MonacoEnvironment = {
